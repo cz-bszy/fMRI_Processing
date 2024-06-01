@@ -1,0 +1,29 @@
+#!/bin/bash
+
+subj=$1
+working_dir=$2
+fsf_type=$3
+
+subjects_file="${working_dir}/subjects.txt"
+
+
+result_file="${working_dir}/${subj}/func/rest_res2standard.nii.gz"
+target_dir="${working_dir}/${fsf_type}"
+target_file="${target_dir}/${subj}_${fsf_type}.nii.gz"
+
+
+mkdir -p "${target_dir}"
+
+
+if [ -f "${result_file}" ]; then
+    cp "${result_file}" "${target_file}"
+    echo "File ${result_file} copied to ${target_file}"
+else
+    echo "Source file ${result_file} does not exist!"
+fi
+
+
+
+
+
+

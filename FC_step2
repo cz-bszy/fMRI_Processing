@@ -1,0 +1,105 @@
+#!/bin/tcsh
+
+echo "All arguments: $argv"
+
+if ( $#argv != 7 ) then
+    echo "Usage: $0 subj_id num_threads working_dir FWHM sigma highp lowp"
+    exit 1
+endif
+
+set subj_id = $argv[1]
+set num_threads = $argv[2]
+set working_dir = $argv[3]
+set FWHM = $argv[4]
+set sigma = $argv[5]
+set highp = $argv[6]
+set lowp = $argv[7]
+
+setenv OMP_NUM_THREADS $num_threads
+
+set topdir = $working_dir
+
+echo "preprocessing $subj_id"
+
+cd $topdir
+cd $subj_id
+cd func
+
+set nifti_file = `find . -name '*task-rest_bold*.nii*'`
+
+if ( "$nifti_file" == "" ) then
+    echo "No matching NIfTI file found"
+    exit 1
+endif
+
+echo "Found NIfTI file: $nifti_file"
+
+if ( ! -e $nifti_file ) then
+    echo "Error: File $nifti_file does not exist"
+    exit 1
+endif
+
+# 输出文件详细信息
+ls -l $nifti_file
+
+set nTRs = `3dinfo -nt $nifti_file`
+@ nTRs_minus_one = $nTRs - 1
+
+echo "Number of TRs: $nTRs"
+echo "Number of TRs minus one: $nTRs_minus_one"
+
+echo "Dropping first TRs"
+3dcalc -a "${nifti_file}[0..$nTRs_minus_one]" -expr 'a' -prefix rest_dr.nii.gz
+
+if ( ! -e rest_dr.nii.gz ) then
+    echo "Error: rest_dr.nii.gz not created"
+    exit 1
+endif
+
+## 2. Deoblique
+echo "Deobliquing $subj_id"
+3drefit -deoblique rest_dr.nii.gz
+
+## 3. Reorient into fsl friendly space (what AFNI calls RPI)
+echo "Reorienting $subj_id"
+3dresample -orient RPI -inset rest_dr.nii.gz -prefix rest_ro.nii.gz
+
+## 4. Motion correct to average of timeseries
+echo "Motion correcting $subj_id"
+3dTstat -mean -prefix rest_ro_mean.nii.gz rest_ro.nii.gz
+3dvolreg -Fourier -twopass -base rest_ro_mean.nii.gz -zpad 4 -prefix rest_mc.nii.gz -1Dfile rest_mc.1D rest_ro.nii.gz
+
+## 5. Remove skull/edge detect
+echo "Skull stripping $subj_id"
+3dAutomask -prefix rest_mask.nii.gz -dilate 1 rest_mc.nii.gz
+3dcalc -a rest_mc.nii.gz -b rest_mask.nii.gz -expr 'a*b' -prefix rest_ss.nii.gz
+
+## 6. Get eighth image for use in registration
+echo "Getting example_func for registration for $subj_id"
+3dcalc -a rest_ss.nii.gz'[7]' -expr 'a' -prefix example_func.nii.gz
+
+## 7. Spatial smoothing
+echo "Smoothing $subj_id"
+fslmaths rest_ss.nii.gz -kernel gauss $sigma -fmean -mas rest_mask.nii.gz rest_sm.nii.gz
+
+## 8. Grand-mean scaling
+echo "Grand-mean scaling $subj_id"
+fslmaths rest_sm.nii.gz -ing 10000 rest_gms.nii.gz -odt float
+
+## 9. Temporal filtering
+echo "Band-pass filtering $subj_id"
+3dTproject -input rest_gms.nii.gz -prefix rest_filt.nii.gz -passband $lowp $highp -polort 2
+
+## 10. Detrending
+echo "Removing linear and quadratic trends for $subj_id"
+3dTstat -mean -prefix rest_filt_mean.nii.gz rest_filt.nii.gz
+3dcalc -a rest_filt_mean.nii.gz -b rest_filt.nii.gz -expr 'a+b' -prefix rest_pp.nii.gz
+
+## 11. Create Mask
+echo "Generating mask of preprocessed data for $subj_id"
+3dAutomask -prefix rest_pp_mask.nii.gz rest_pp.nii.gz
+
+cd ..
+cd ..
+
+echo "Finished FC_Funpreproc_step2 for subject: $subj_id"

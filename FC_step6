@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+
+subj_id=$1
+num_threads=$2
+working_dir=$3
+template_dir=$4
+TR=$5
+TE=$6
+n_vols=$7
+fsf_type=$8
+
+
+export OMP_NUM_THREADS=$num_threads
+
+dir=$working_dir
+subj=$dir/$subj_id
+anat_dir=${subj}/anat
+func_dir=${subj}/func
+reg_dir=${subj}/func/reg_dir
+segment_dir=${subj}/func/seg
+nuisance_dir=${subj}/func/nuisance
+regstandard_path=$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz
+
+
+if [ "$fsf_type" == "NO_GRD" ]; then
+    nuisance_template=$template_dir/nuisance_N.fsf
+elif [ "$fsf_type" == "Retain_GRS" ]; then
+    nuisance_template=$template_dir/nuisance_R.fsf
+else
+    echo "Invalid fsf_type. Please use NO_GRD or Retain_GRS."
+    exit 1
+fi
+
+echo "preprocessing $subj_id"
+
+echo "Splitting up $subj_id motion parameters"
+awk '{print $1}' ${func_dir}/rest_mc.1D > ${nuisance_dir}/mc1.1D
+awk '{print $2}' ${func_dir}/rest_mc.1D > ${nuisance_dir}/mc2.1D
+awk '{print $3}' ${func_dir}/rest_mc.1D > ${nuisance_dir}/mc3.1D
+awk '{print $4}' ${func_dir}/rest_mc.1D > ${nuisance_dir}/mc4.1D
+awk '{print $5}' ${func_dir}/rest_mc.1D > ${nuisance_dir}/mc5.1D
+awk '{print $6}' ${func_dir}/rest_mc.1D > ${nuisance_dir}/mc6.1D
+
+# Extract signal for global, csf, and wm
+## 3. Global
+echo "Extracting global signal for ${subj_id}"
+3dmaskave -mask ${segment_dir}/global_mask.nii.gz -quiet ${func_dir}/rest_pp.nii.gz > ${nuisance_dir}/global.1D
+
+## 4. csf
+echo "Extracting signal from csf for ${subj_id}"
+3dmaskave -mask ${segment_dir}/csf_mask.nii.gz -quiet ${func_dir}/rest_pp.nii.gz > ${nuisance_dir}/csf.1D
+
+## 5. wm
+echo "Extracting signal from white matter for ${subj_id}"
+3dmaskave -mask ${segment_dir}/wm_mask.nii.gz -quiet ${func_dir}/rest_pp.nii.gz > ${nuisance_dir}/wm.1D
+
+## create fsf file
+echo "Modifying model file"
+if [ "$fsf_type" == "NO_GRD" ]; then
+##################====== nuisance Delete Global signal ======########################
+    sed -e s:nuisance_dir:"${nuisance_dir}":g <${nuisance_template} >${nuisance_dir}/temp1
+    sed -e s:nuisance_model_outputdir:"${nuisance_dir}/residuals.feat":g <${nuisance_dir}/temp1 >${nuisance_dir}/temp2
+    sed -e s:nuisance_model_TR:"${TR}":g <${nuisance_dir}/temp2 >${nuisance_dir}/temp3
+    sed -e s:nuisance_model_numTRs:"${n_vols}":g <${nuisance_dir}/temp3 >${nuisance_dir}/temp4
+    sed -e s:nuisance_model_input_data:"${func_dir}/rest_pp.nii.gz":g <${nuisance_dir}/temp4 >${nuisance_dir}/temp5
+    sed -e s:nuisance_model_TE:"${TE}":g <${nuisance_dir}/temp5 >${nuisance_dir}/temp6
+    sed -e s:standard_mni_2mm:"${regstandard_path}":g <${nuisance_dir}/temp5 >${nuisance_dir}/nuisance.fsf
+
+elif [ "$fsf_type" == "Retain_GRS" ]; then 
+##################====== nuisance remained Global signal ======########################
+    sed -e s:nuisance_output:"${nuisance_dir}/residuals.feat":g <${nuisance_template} >${nuisance_dir}/temp1
+    sed -e s:standard_mni_2mm:"${regstandard_path}":g <${nuisance_dir}/temp1 >${nuisance_dir}/temp2
+    sed -e s:feat_files_1:"${nuisance_dir}/rest_pp":g <${nuisance_dir}/temp2 >${nuisance_dir}/temp3
+    sed -e s:fmri_1:"${nuisance_dir}/csf.1D":g <${nuisance_dir}/temp3 >${nuisance_dir}/temp4
+    sed -e s:fmri_2:"${nuisance_dir}/wm.1D":g <${nuisance_dir}/temp4 >${nuisance_dir}/temp5
+    sed -e s:fmri_3:"${nuisance_dir}/mc1.1D":g <${nuisance_dir}/temp5 >${nuisance_dir}/temp6
+    sed -e s:fmri_4:"${nuisance_dir}/mc2.1D":g <${nuisance_dir}/temp6 >${nuisance_dir}/temp7
+    sed -e s:fmri_5:"${nuisance_dir}/mc3.1D":g <${nuisance_dir}/temp7 >${nuisance_dir}/temp8
+    sed -e s:fmri_6:"${nuisance_dir}/mc4.1D":g <${nuisance_dir}/temp8 >${nuisance_dir}/temp9
+    sed -e s:fmri_7:"${nuisance_dir}/mc5.1D":g <${nuisance_dir}/temp9 >${nuisance_dir}/temp10
+    sed -e s:nuisance_model_TR:"${TR}":g <${nuisance_dir}/temp10 >${nuisance_dir}/temp11
+    sed -e s:nuisance_model_numTRs:"${n_vols}":g <${nuisance_dir}/temp11 >${nuisance_dir}/temp12
+    sed -e s:nuisance_model_TE:"${TE}":g <${nuisance_dir}/temp12 >${nuisance_dir}/temp13
+    sed -e s:fmri_8:"${nuisance_dir}/mc6.1D":g <${nuisance_dir}/temp13 >${nuisance_dir}/nuisance.fsf
+
+fi
+
+rm ${nuisance_dir}/temp*
+
+echo "Running feat model"
+feat_model ${nuisance_dir}/nuisance
+
+minVal=$(3dBrickStat -min -mask ${func_dir}/rest_pp_mask.nii.gz ${func_dir}/rest_pp.nii.gz)
+
+## 7. Get residuals
+echo "Running film to get residuals"
+film_gls --rn=${nuisance_dir}/stats --noest --sa --ms=5 --in=${func_dir}/rest_pp.nii.gz --pd=${nuisance_dir}/nuisance.mat --thr=${minVal}
+
+## 8. Demeaning residuals and ADDING 100
+3dTstat -mean -prefix ${nuisance_dir}/stats/res4d_mean.nii.gz ${nuisance_dir}/stats/res4d.nii.gz
+3dcalc -a ${nuisance_dir}/stats/res4d.nii.gz -b ${nuisance_dir}/stats/res4d_mean.nii.gz -expr '(a-b)+100' -prefix ${func_dir}/rest_res.nii.gz
+
+## 9. Resampling residuals to MNI space
+flirt -ref ${reg_dir}/standard.nii.gz -in ${func_dir}/rest_res.nii.gz -out ${func_dir}/rest_res2standard.nii.gz -applyxfm -init ${reg_dir}/example_func2standard.mat -interp trilinear
+
+echo "Well done"

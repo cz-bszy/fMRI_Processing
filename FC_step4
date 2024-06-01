@@ -1,0 +1,95 @@
+#!/bin/tcsh
+
+echo "All arguments: $argv"
+
+if ( $#argv != 5) then
+    echo "Usage: $0 subj_id num_threads working_dir sigma tissuepriors_dir"
+    exit 1
+endif
+
+
+set subj_id = $argv[1]
+set num_threads = $argv[2]
+set working_dir = $argv[3]
+set sigma = $argv[4]
+set tissuepriors_dir = $argv[5]
+
+set topdir = $working_dir
+
+setenv OMP_NUM_THREADS $num_threads
+echo "preprocessing $subj_id"
+
+cd $topdir
+cd $subj_id
+cd func
+
+mkdir -p seg
+
+set anat_dir = $topdir/${subj_id}/anat
+set func_dir = $topdir/${subj_id}/func
+set reg_dir = $topdir/${subj_id}/func/reg_dir
+set segment_dir = $topdir/${subj_id}/func/seg
+
+cp ${func_dir}/rest_pp_mask.nii.gz ${segment_dir}/global_mask.nii.gz
+
+## CSF
+## 5. Register csf to native space
+echo "Registering $subj_id csf to native (functional) space"
+flirt -in $anat_dir/segment_prob_0.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/highres2example_func.mat -out $segment_dir/csf2func.nii.gz
+
+## 6. Smooth image to match smoothing on functional
+echo "Smoothing $subj_id csf"
+fslmaths $segment_dir/csf2func.nii.gz -kernel gauss ${sigma} -fmean $segment_dir/csf_sm.nii.gz
+
+## 7. register to standard
+echo "Registering $subj_id csf to standard space"
+flirt -in $segment_dir/csf_sm.nii.gz -ref $reg_dir/standard.nii.gz -applyxfm -init $reg_dir/example_func2standard.mat -out $segment_dir/csf2standard.nii.gz
+
+## 8. find overlap with prior
+echo "Finding overlap between $subj_id csf and prior"
+fslmaths $segment_dir/csf2standard.nii.gz -mas $tissuepriors_dir/3mm/avg152T1_csf_bin.nii.gz $segment_dir/csf_masked.nii.gz
+
+## 9. revert back to functional space
+echo "Registering $subj_id csf back to native space"
+flirt -in $segment_dir/csf_masked.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/standard2example_func.mat -out $segment_dir/csf_native.nii.gz
+
+## 10. Threshold and binarize probability map of csf
+echo "Threshold and binarize $subj_id csf probability map"
+fslmaths $segment_dir/csf_native.nii.gz -thr 0.4 -bin $segment_dir/csf_bin.nii.gz
+
+## 11. Mask again by the subject's functional
+echo "Mask csf image by $subj_id functional"
+fslmaths $segment_dir/csf_bin.nii.gz -mas $segment_dir/global_mask.nii.gz $segment_dir/csf_mask.nii.gz
+
+
+###WM
+# 12. Register white matter segmentation to native (functional) space
+echo "Registering $subj_id wm to native (functional) space"
+flirt -in $anat_dir/segment_prob_2.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/highres2example_func.mat -out $segment_dir/wm2func.nii.gz
+
+# 13. Smooth image to match smoothing on functional
+echo "Smoothing $subj_id wm"
+fslmaths $segment_dir/wm2func.nii.gz -kernel gauss $sigma -fmean $segment_dir/wm_sm.nii.gz
+
+# 14. Register to standard space
+echo "Registering $subj_id wm to standard space"
+flirt -in $segment_dir/wm_sm.nii.gz -ref $reg_dir/standard.nii.gz -applyxfm -init $reg_dir/example_func2standard.mat -out $segment_dir/wm2standard.nii.gz
+
+# 15. Find overlap with prior
+echo "Finding overlap between $subj_id wm and prior"
+fslmaths $segment_dir/wm2standard.nii.gz -mas $tissuepriors_dir/3mm/avg152T1_white_bin.nii.gz $segment_dir/wm_masked.nii.gz
+
+# 16. Revert back to functional space
+echo "Registering $subj_id wm back to native space"
+flirt -in $segment_dir/wm_masked.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/standard2example_func.mat -out $segment_dir/wm_native.nii.gz
+
+# 17. Threshold and binarize probability map of wm
+echo "Threshold and binarize $subj_id wm probability map"
+fslmaths $segment_dir/wm_native.nii.gz -thr 0.66 -bin $segment_dir/wm_bin.nii.gz
+
+# 18. Mask again by the subject's functional
+echo "Mask wm image by $subj_id functional"
+fslmaths $segment_dir/wm_bin.nii.gz -mas $segment_dir/global_mask.nii.gz $segment_dir/wm_mask.nii.gz
+
+cd ..
+cd ..

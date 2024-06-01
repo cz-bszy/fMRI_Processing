@@ -1,0 +1,55 @@
+#!/bin/tcsh
+
+echo "All arguments: $argv"
+
+if ( $#argv != 4) then
+    echo "Usage: subj_id num_threads working_dir standard_3mm"
+    exit 1
+endif
+
+set subj_id = $argv[1]
+set num_threads = $argv[2]
+set working_dir = $argv[3]
+set standard_3mm = $argv[4]
+
+set topdir = $working_dir
+
+setenv OMP_NUM_THREADS $num_threads
+
+echo "preprocessing $subj_id"
+
+cd $topdir
+cd $subj_id
+cd func
+
+mkdir -p reg_dir
+
+cp ${topdir}/${subj_id}/anat/Stru_Brain.nii.gz ./reg_dir/highres.nii.gz
+cp ${standard_3mm}/MNI152_T1_3mm_brain.nii.gz ./reg_dir/standard.nii.gz
+cp example_func.nii.gz ./reg_dir/
+
+cd reg_dir
+
+## 1. FUNC->T1
+## You may want to change some of the options
+flirt -ref highres -in example_func -out example_func2highres -omat example_func2highres.mat -cost corratio -dof 6 -interp trilinear
+# Create mat file for conversion from subject's anatomical to functional
+convert_xfm -inverse -omat highres2example_func.mat example_func2highres.mat
+
+## 2. T1->STANDARD
+## NOTE THAT THIS IS Linear registration, you may want to use FNIRT (non-linear)
+flirt -ref standard -in highres -out highres2standard -omat highres2standard.mat -cost corratio -searchcost corratio -dof 12 -interp trilinear
+## Create mat file for conversion from standard to high res
+convert_xfm -inverse -omat standard2highres.mat highres2standard.mat
+
+## 3. FUNC->STANDARD
+## Create mat file for registration of functional to standard
+convert_xfm -omat example_func2standard.mat -concat highres2standard.mat example_func2highres.mat
+## apply registration
+flirt -ref standard -in example_func -out example_func2standard -applyxfm -init example_func2standard.mat -interp trilinear
+## Create inverse mat file for registration of standard to functional
+convert_xfm -inverse -omat standard2example_func.mat example_func2standard.mat
+
+cd ..
+cd ..
+cd ..

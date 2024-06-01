@@ -1,0 +1,22 @@
+#!/bin/tcsh
+
+
+set subj_id = $argv[1]
+set num_threads = $argv[2]
+set working_dir = $argv[3]
+
+set topdir = $working_dir
+
+setenv OMP_NUM_THREADS $num_threads
+
+
+echo "preprocessing $subj_id"
+
+cd $topdir
+cd $subj_id
+cd func
+
+mkdir -p nuisance
+
+cd ..
+cd ..
