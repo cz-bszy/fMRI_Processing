@@ -1,7 +1,5 @@
 #!/bin/bash
 
-export OMP_NUM_THREADS=4
-
 parallel_jobs=1
 
 working_dir="/mnt/c/Users/bszyc/Desktop/Test/fMRI" 
