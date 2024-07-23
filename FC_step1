@@ -22,11 +22,10 @@ cd $subj_id
 cd anat
 
 echo "bet skull strip processing"
+#mri_convert brain.mgz Stru_Brain.nii.gz
+bet sub_*.nii Stru_Brain -f -0.5 -g -0.4
 
 echo "segmentation brain"
-
-mri_convert brain.mgz Stru_Brain.nii.gz
-
 fast -t 1 -g -p -o segment Stru_Brain.nii.gz
 
 cd ..
