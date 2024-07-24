@@ -6,8 +6,8 @@ working_dir="/mnt/c/Users/bszyc/Desktop/Test/fMRI"
 tissuepriors_dir="/mnt/c/Users/bszyc/Desktop/Test/fMRI/Code/tissuepriors"
 standard_3mm="/mnt/c/Users/bszyc/Desktop/Test/fMRI/Code/standard"
 template_dir="/mnt/c/Users/bszyc/Desktop/Test/fMRI/Code/template"
-ls -d $working_dir/sub-* | xargs -n 1 basename > $working_dir/subjects.txt
-subjects_file="$working_dir/subjects.txt"
+ls -d $working_dir/sub-* | xargs -n 1 basename > ./subjects.txt
+subjects_file="./subjects.txt"
 
 num_threads=4
 FWHM=6
@@ -19,13 +19,13 @@ TE=34
 vol=96
 fsf_type="Retain_GRS"
 
-mkdir -p "$working_dir/log"
+mkdir -p "./log"
 
 run_steps() {
   subj=$1
   echo "Processing subject: $subj ..."
   
-  log_file="${working_dir}/log/${subj}_log.txt"
+  log_file="./log/${subj}_log.txt"
   
   {
     echo "===== Running FC_step1 for subject: $subj ====="
