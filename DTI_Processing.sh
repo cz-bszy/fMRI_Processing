@@ -15,9 +15,6 @@ Glasser_dir=${src_dir}/Glasser_parcellations
 HCPpipeline_dir=${src_dir}/HCPpipelines-4.7.0
 mrtrixe3_dir=/opt/mrtrix3/share/mrtrix3/labelconvert
 
-recon_dir=/home/zhaochang/Desktop/recon_all
-[[ ! -e $recon_dir ]] && mkdir -p $recon_dir
-
 subjects=($(find $data_dir -maxdepth 1 -mindepth 1 -type d -exec basename {} \;))
 
 for subj in "${subjects[@]}"
@@ -51,7 +48,8 @@ do
         dwi2response tournier $output_dir/dwi_denoised_unringed_preproc.mif $output_dir/wm_response.txt -voxels $output_dir/voxels.mif -force
         dwi2fod csd -mask $output_dir/dwi_temp_mask.mif $output_dir/dwi_denoised_unringed_preproc.mif $output_dir/wm_response.txt $output_dir/fod.mif -nthreads $nthreads
 
-        export SUBJECTS_DIR=$recon_dir
+        [[ ! -e $subj_dir/$subj/recon_all ]] && mkdir -p $subj_dir/$subj/recon_all
+        export SUBJECTS_DIR=$subj_dir/$subj/recon_all
 
         recon-all -s $subj -i $anat_dir/*_T1w.nii.gz -all -openmp $nthreads
 
@@ -113,7 +111,8 @@ do
             dwi2response tournier $output_dir/dwi_denoised_unringed_preproc.mif $output_dir/wm_response.txt -voxels $output_dir/voxels.mif -force
             dwi2fod csd -mask $output_dir/dwi_temp_mask.mif $output_dir/dwi_denoised_unringed_preproc.mif $output_dir/wm_response.txt $output_dir/fod.mif -nthreads $nthreads
 
-            export SUBJECTS_DIR=$recon_dir
+            [[ ! -e $subj_dir/$subj/$sess/recon_all ]] && mkdir -p $subj_dir/$subj/$sess/recon_all
+            export SUBJECTS_DIR=$subj_dir/$subj/$sess/recon_all
 
             recon-all -s ${subj}_${sess} -i $anat_dir/*_T1w.nii.gz -all -openmp $nthreads
 
