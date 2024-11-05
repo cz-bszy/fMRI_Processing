@@ -10,13 +10,14 @@
 # ---------------------------- Usage Function --------------------------------
 
 usage() {
-    echo "Usage: $0 -s <subj_id> -c <session> -w <working_dir> -f <fsf_type> [-h]" >&2
+    echo "Usage: $0 -s <subj_id> -e <session> -w <working_dir> -f <fsf_type> -r <results_dir> [-h]" >&2
     echo ""
     echo "Options:"
     echo "  -s    Subject ID (required)"
-    echo "  -c    Session name (e.g., baseline, followup_1) (required)"
+    echo "  -e    Session name (e.g., baseline, followup_1) (required)"
     echo "  -w    Working directory (required)"
     echo "  -f    fsf_type: NoGRS or GRS (required)"
+    echo "  -r    results_dir"
     echo "  -h    Display this help message"
     exit 1
 }
@@ -29,11 +30,12 @@ SESSION=""
 WORKING_DIR=""
 FSF_TYPE=""
 
-while getopts ":s:c:w:f:h" opt; do
+while getopts ":s:e:w:f:r:h" opt; do
     case ${opt} in
         s ) SUBJ_ID="$OPTARG" ;;
-        c ) SESSION="$OPTARG" ;;
+        e ) SESSION="$OPTARG" ;;
         w ) WORKING_DIR="$OPTARG" ;;
+        r ) RESULTS_DIR="$OPTARG" ;;
         f ) FSF_TYPE="$OPTARG" ;;
         h ) usage ;;
         \? ) echo "Invalid Option: -$OPTARG" >&2; usage ;;
@@ -56,12 +58,11 @@ fi
 # ---------------------------- Setup ------------------------------------------
 
 # Define the path to the preprocessed result file
-result_file="${WORKING_DIR}/${SUBJ_ID}/${SESSION}/func/rest_res2standard.nii.gz"
+result_file="${WORKING_DIR}/rest_res2standard.nii.gz"
 
 # Define the target directory based on fsf_type, subject ID, and session
-target_dir="${WORKING_DIR}/results/${FSF_TYPE}/${SUBJ_ID}/${SESSION}"
+target_dir="${RESULTS_DIR}/${FSF_TYPE}"
 
-# Define the target file path
 target_file="${target_dir}/rest_res2standard.nii.gz"
 
 # Create the target directory

@@ -1,12 +1,12 @@
 #!/bin/bash
 
-parallel_jobs=1
+parallel_jobs=8
 
-working_dir="/mnt/c/Users/bszyc/Desktop/Test/fMRI" 
-tissuepriors_dir="/mnt/c/Users/bszyc/Desktop/Test/fMRI/Code/tissuepriors"
-standard_3mm="/mnt/c/Users/bszyc/Desktop/Test/fMRI/Code/standard"
-template_dir="/mnt/c/Users/bszyc/Desktop/Test/fMRI/Code/template"
-ls -d $working_dir/sub-* | xargs -n 1 basename > ./subjects.txt
+working_dir="/mnt/d/Projects/Data_Processing/ABIDE_Longitudinal/ABIDEII-UPSM_Long/" 
+tissuepriors_dir="/mnt/d/Projects/Data_Processing/fMRI_Processing-main/tissuepriors"
+standard_3mm="/mnt/d/Projects/Data_Processing/fMRI_Processing-main/standard"
+template_dir="/mnt/d/Projects/Data_Processing/fMRI_Processing-main/template"
+ls -d $working_dir/* | xargs -n 1 basename > ./subjects.txt
 subjects_file="./subjects.txt"
 
 num_threads=4
@@ -14,9 +14,9 @@ FWHM=6
 sigma=2.54798709
 highp=0.1
 lowp=0.005
-TR=2
-TE=34
-vol=96
+TR=1.5
+TE=25
+vol=200
 fsf_type="Retain_GRS"
 
 mkdir -p "./log"
@@ -29,7 +29,7 @@ run_steps() {
   
   {
     echo "===== Running FC_step1 for subject: $subj ====="
-    #./FC_step1 $subj $num_threads $working_dir
+    ./FC_step1 $subj $num_threads $working_dir
     echo "===== Completed FC_step1 for subject: $subj ====="
     
     echo "===== Running FC_step2 for subject: $subj ====="

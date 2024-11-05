@@ -1,95 +1,198 @@
-#!/bin/tcsh
+#!/bin/bash
 
-echo "All arguments: $argv"
+set -euo pipefail
 
-if ( $#argv != 5) then
-    echo "Usage: $0 subj_id num_threads working_dir sigma tissuepriors_dir"
+# =============================================================================
+# Script: Anatproc.sh
+# Description:
+#   Performs anatomical processing for a specific subject and session.
+#   Steps include:
+#     1. Register CSF and WM to functional and standard spaces.
+#     2. Smooth and threshold probability maps.
+#     3. Apply masks to functional data.
+# =============================================================================
+
+# ---------------------------- Configuration ----------------------------------
+
+SUBJ_ID=""
+SESSION=""
+NUM_THREADS=3
+FUNC_DIR=""
+ANAT_DIR=""
+tissuepriors_dir=""
+SIGMA=""
+LOG_FILE=""
+
+# ---------------------------- Usage Function --------------------------------
+
+usage() {
+    echo "Usage: $0 -s <subj_id> -e <session> -n <num_threads> -f <func_dir> -a <anat_dir> -t <tissuepriors_dir> -g <sigma> -l <log_file> [-h]" >&2
+    echo ""
+    echo "Options:"
+    echo "  -s    Subject ID (required)"
+    echo "  -e    Session ID (required)"
+    echo "  -n    Number of threads (default: $NUM_THREADS)"
+    echo "  -f    Functional directory (required)"
+    echo "  -a    Anatomical directory (required)"
+    echo "  -t    tissuepriors_dir (required)"
+    echo "  -g    Sigma value for Gaussian smoothing (required)"
+    echo "  -l    Log file path (required)"
+    echo "  -h    Display this help message"
     exit 1
-endif
+}
 
+# ---------------------------- Argument Parsing ------------------------------
 
-set subj_id = $argv[1]
-set num_threads = $argv[2]
-set working_dir = $argv[3]
-set sigma = $argv[4]
-set tissuepriors_dir = $argv[5]
+while getopts ":s:e:n:f:a:t:g:l:h" opt; do
+    case ${opt} in
+        s) SUBJ_ID="$OPTARG";;
+        e) SESSION="$OPTARG";;
+        n) NUM_THREADS="$OPTARG";;
+        f) FUNC_DIR="$OPTARG";;
+        a) ANAT_DIR="$OPTARG";;
+        t) tissuepriors_dir="$OPTARG";;
+        g) SIGMA="$OPTARG";;
+        l) LOG_FILE="$OPTARG";;
+        h) usage; exit;;
+        \?) echo "Invalid Option: -$OPTARG" >&2; usage; exit;;
+        :) echo "Option -$OPTARG requires an argument." >&2; usage; exit;;
+    esac
+done
 
-set topdir = $working_dir
+# ---------------------------- Validation -------------------------------------
 
-setenv OMP_NUM_THREADS $num_threads
-echo "preprocessing $subj_id"
+if [[ -z "$SUBJ_ID" || -z "$SESSION" || -z "$FUNC_DIR" || -z "$ANAT_DIR" || -z "$tissuepriors_dir" || -z "$SIGMA" || -z "$LOG_FILE" ]]; then
+    echo "ERROR: Missing required arguments." >&2
+    usage
+fi
 
-cd $topdir
-cd $subj_id
-cd func
+if ! [[ "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: Number of threads must be a positive integer." >&2
+    exit 1
+fi
 
-mkdir -p seg
+# ---------------------------- Setup ------------------------------------------
 
-set anat_dir = $topdir/${subj_id}/anat
-set func_dir = $topdir/${subj_id}/func
-set reg_dir = $topdir/${subj_id}/func/reg_dir
-set segment_dir = $topdir/${subj_id}/func/seg
+export OMP_NUM_THREADS="$NUM_THREADS"
 
-cp ${func_dir}/rest_pp_mask.nii.gz ${segment_dir}/global_mask.nii.gz
+# Redirect all output to log file
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-## CSF
-## 5. Register csf to native space
-echo "Registering $subj_id csf to native (functional) space"
-flirt -in $anat_dir/segment_prob_0.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/highres2example_func.mat -out $segment_dir/csf2func.nii.gz
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Anatproc for Subject: $SUBJ_ID | Session: $SESSION"
 
-## 6. Smooth image to match smoothing on functional
-echo "Smoothing $subj_id csf"
-fslmaths $segment_dir/csf2func.nii.gz -kernel gauss ${sigma} -fmean $segment_dir/csf_sm.nii.gz
+# Define directories
+REG_DIR="${FUNC_DIR}/reg_dir"
+SEGMENT_DIR="${FUNC_DIR}/seg"
 
-## 7. register to standard
-echo "Registering $subj_id csf to standard space"
-flirt -in $segment_dir/csf_sm.nii.gz -ref $reg_dir/standard.nii.gz -applyxfm -init $reg_dir/example_func2standard.mat -out $segment_dir/csf2standard.nii.gz
+# Create necessary directories
+mkdir -p "$SEGMENT_DIR"
 
-## 8. find overlap with prior
-echo "Finding overlap between $subj_id csf and prior"
-fslmaths $segment_dir/csf2standard.nii.gz -mas $tissuepriors_dir/3mm/avg152T1_csf_bin.nii.gz $segment_dir/csf_masked.nii.gz
+# Copy global mask
+if [ ! -f "${FUNC_DIR}/rest_pp_mask.nii.gz" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Functional mask '${FUNC_DIR}/rest_pp_mask.nii.gz' does not exist."
+    exit 1
+fi
 
-## 9. revert back to functional space
-echo "Registering $subj_id csf back to native space"
-flirt -in $segment_dir/csf_masked.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/standard2example_func.mat -out $segment_dir/csf_native.nii.gz
+cp "${FUNC_DIR}/rest_pp_mask.nii.gz" "${SEGMENT_DIR}/global_mask.nii.gz"
 
-## 10. Threshold and binarize probability map of csf
-echo "Threshold and binarize $subj_id csf probability map"
-fslmaths $segment_dir/csf_native.nii.gz -thr 0.4 -bin $segment_dir/csf_bin.nii.gz
+# ---------------------------- Processing CSF --------------------------------
 
-## 11. Mask again by the subject's functional
-echo "Mask csf image by $subj_id functional"
-fslmaths $segment_dir/csf_bin.nii.gz -mas $segment_dir/global_mask.nii.gz $segment_dir/csf_mask.nii.gz
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering CSF to functional space."
 
+# 5. Register CSF to native (functional) space
+flirt -in "${ANAT_DIR}/segment_prob_0.nii.gz" \
+      -ref "${REG_DIR}/example_func.nii.gz" \
+      -applyxfm \
+      -init "${REG_DIR}/highres2example_func.mat" \
+      -out "${SEGMENT_DIR}/csf2func.nii.gz"
 
-###WM
-# 12. Register white matter segmentation to native (functional) space
-echo "Registering $subj_id wm to native (functional) space"
-flirt -in $anat_dir/segment_prob_2.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/highres2example_func.mat -out $segment_dir/wm2func.nii.gz
+# 6. Smooth CSF image to match functional smoothing
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Smoothing CSF image with sigma=$SIGMA."
 
-# 13. Smooth image to match smoothing on functional
-echo "Smoothing $subj_id wm"
-fslmaths $segment_dir/wm2func.nii.gz -kernel gauss $sigma -fmean $segment_dir/wm_sm.nii.gz
+fslmaths "${SEGMENT_DIR}/csf2func.nii.gz" -kernel gauss "$SIGMA" -fmean "${SEGMENT_DIR}/csf_sm.nii.gz"
 
-# 14. Register to standard space
-echo "Registering $subj_id wm to standard space"
-flirt -in $segment_dir/wm_sm.nii.gz -ref $reg_dir/standard.nii.gz -applyxfm -init $reg_dir/example_func2standard.mat -out $segment_dir/wm2standard.nii.gz
+# 7. Register CSF to standard space
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering CSF to standard space."
+
+flirt -in "${SEGMENT_DIR}/csf_sm.nii.gz" \
+      -ref "${REG_DIR}/standard.nii.gz" \
+      -applyxfm \
+      -init "${REG_DIR}/example_func2standard.mat" \
+      -out "${SEGMENT_DIR}/csf2standard.nii.gz"
+
+# 8. Find overlap with prior
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying tissue prior for CSF."
+
+fslmaths "${SEGMENT_DIR}/csf2standard.nii.gz" -mas "${tissuepriors_dir}/3mm/avg152T1_csf_bin.nii.gz" "${SEGMENT_DIR}/csf_masked.nii.gz"
+
+# 9. Revert back to functional space
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering CSF back to functional space."
+
+flirt -in "${SEGMENT_DIR}/csf_masked.nii.gz" \
+      -ref "${REG_DIR}/example_func.nii.gz" \
+      -applyxfm \
+      -init "${REG_DIR}/standard2example_func.mat" \
+      -out "${SEGMENT_DIR}/csf_native.nii.gz"
+
+# 10. Threshold and binarize probability map of CSF
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Thresholding and binarizing CSF map."
+
+fslmaths "${SEGMENT_DIR}/csf_native.nii.gz" -thr 0.4 -bin "${SEGMENT_DIR}/csf_bin.nii.gz"
+
+# 11. Mask again by the subject's functional
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying functional mask to CSF map."
+
+fslmaths "${SEGMENT_DIR}/csf_bin.nii.gz" -mas "${SEGMENT_DIR}/global_mask.nii.gz" "${SEGMENT_DIR}/csf_mask.nii.gz"
+
+# ---------------------------- Processing WM ---------------------------------
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering WM to functional space."
+
+# 12. Register White Matter (WM) segmentation to native (functional) space
+flirt -in "${ANAT_DIR}/segment_prob_2.nii.gz" \
+      -ref "${REG_DIR}/example_func.nii.gz" \
+      -applyxfm \
+      -init "${REG_DIR}/highres2example_func.mat" \
+      -out "${SEGMENT_DIR}/wm2func.nii.gz"
+
+# 13. Smooth WM image to match functional smoothing
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Smoothing WM image with sigma=$SIGMA."
+
+fslmaths "${SEGMENT_DIR}/wm2func.nii.gz" -kernel gauss "$SIGMA" -fmean "${SEGMENT_DIR}/wm_sm.nii.gz"
+
+# 14. Register WM to standard space
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering WM to standard space."
+
+flirt -in "${SEGMENT_DIR}/wm_sm.nii.gz" \
+      -ref "${REG_DIR}/standard.nii.gz" \
+      -applyxfm \
+      -init "${REG_DIR}/example_func2standard.mat" \
+      -out "${SEGMENT_DIR}/wm2standard.nii.gz"
 
 # 15. Find overlap with prior
-echo "Finding overlap between $subj_id wm and prior"
-fslmaths $segment_dir/wm2standard.nii.gz -mas $tissuepriors_dir/3mm/avg152T1_white_bin.nii.gz $segment_dir/wm_masked.nii.gz
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying tissue prior for WM."
+
+fslmaths "${SEGMENT_DIR}/wm2standard.nii.gz" -mas "${tissuepriors_dir}/3mm/avg152T1_white_bin.nii.gz" "${SEGMENT_DIR}/wm_masked.nii.gz"
 
 # 16. Revert back to functional space
-echo "Registering $subj_id wm back to native space"
-flirt -in $segment_dir/wm_masked.nii.gz -ref $reg_dir/example_func.nii.gz -applyxfm -init $reg_dir/standard2example_func.mat -out $segment_dir/wm_native.nii.gz
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering WM back to functional space."
 
-# 17. Threshold and binarize probability map of wm
-echo "Threshold and binarize $subj_id wm probability map"
-fslmaths $segment_dir/wm_native.nii.gz -thr 0.66 -bin $segment_dir/wm_bin.nii.gz
+flirt -in "${SEGMENT_DIR}/wm_masked.nii.gz" \
+      -ref "${REG_DIR}/example_func.nii.gz" \
+      -applyxfm \
+      -init "${REG_DIR}/standard2example_func.mat" \
+      -out "${SEGMENT_DIR}/wm_native.nii.gz"
+
+# 17. Threshold and binarize probability map of WM
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Thresholding and binarizing WM map."
+
+fslmaths "${SEGMENT_DIR}/wm_native.nii.gz" -thr 0.66 -bin "${SEGMENT_DIR}/wm_bin.nii.gz"
 
 # 18. Mask again by the subject's functional
-echo "Mask wm image by $subj_id functional"
-fslmaths $segment_dir/wm_bin.nii.gz -mas $segment_dir/global_mask.nii.gz $segment_dir/wm_mask.nii.gz
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying functional mask to WM map."
 
-cd ..
-cd ..
+fslmaths "${SEGMENT_DIR}/wm_bin.nii.gz" -mas "${SEGMENT_DIR}/global_mask.nii.gz" "${SEGMENT_DIR}/wm_mask.nii.gz"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Anatproc for Subject: $SUBJ_ID | Session: $SESSION"
+
+exit 0

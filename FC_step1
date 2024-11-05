@@ -1,36 +1,101 @@
-#!/bin/tcsh
+#!/bin/bash
 
-echo "All arguments: $argv"
+# =============================================================================
+# Script: Anatproc.sh
+# Description:
+#   Performs anatomical processing for a specific subject and session.
+#   Converts brain.mgz to Stru_Brain.nii.gz using mri_convert.
+#   The output is saved in the subject's session's anat directory.
+# =============================================================================
 
-if ( $#argv != 3 ) then
-    echo "Usage: $0 <subj_id> <num_threads> <working_dir>"
+# ---------------------------- Configuration ----------------------------------
+
+SUBJ_ID=""
+SESSION=""
+ANAT_DIR=""
+RECON_ALL_DIR=""
+
+# ---------------------------- Usage Function --------------------------------
+
+usage() {
+    echo "Usage: $0 -s <subj_id> -e <session> -n <num_threads> -a <anat_dir> -r <recon_all_dir>" >&2
+    echo ""
+    echo "Options:"
+    echo "  -s    Subject ID (required)"
+    echo "  -e    Session ID (required)"
+    echo "  -n    Number of threads"
+    echo "  -a    Working directory (required)"
+    echo "  -r    Recon-all output directory (required)"
+    echo "  -h    Display this help message"
     exit 1
-endif
+}
 
-set subj_id = $argv[1]
-set num_threads = $argv[2]
-set working_dir = $argv[3]
+# ---------------------------- Argument Parsing ------------------------------
 
-setenv OMP_NUM_THREADS $num_threads
+while getopts ":s:e:n:a:r:h" opt; do
+    case ${opt} in
+        s) SUBJ_ID="$OPTARG";;
+        e) SESSION="$OPTARG";;
+        n) NUM_THREADS="$OPTARG";;
+        a) ANAT_DIR="$OPTARG";;
+        r) RECON_ALL_DIR="$OPTARG";;
+        h) usage; exit;;
+        \?) echo "Invalid Option: -$OPTARG" >&2; usage;;
+        :) echo "Option -$OPTARG requires an argument." >&2; usage;;
+    esac
+done
 
-echo "Running Anatproc for subject: $subj_id "
+# ---------------------------- Validation -------------------------------------
 
-cd $working_dir
-cd $subj_id
+if [ -z "$SUBJ_ID" ] || [ -z "$SESSION" ] || [ -z "$ANAT_DIR" ] || [ -z "$RECON_ALL_DIR" ]; then
+    echo "ERROR: Missing required arguments." >&2
+    usage
+fi
+
+if ! [[ -z "$NUM_THREADS" || "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: Number of threads must be a positive integer." >&2
+    exit 1
+fi
+
+# ---------------------------- Setup ------------------------------------------
+
+export OMP_NUM_THREADS="$NUM_THREADS"
+
+echo "Processing Subject: $SUBJ_ID | Session: $SESSION" >&2
+
+RECON_ALL_SUBJ_SESS_DIR="${RECON_ALL_DIR}/${SUBJ_ID}/${SESSION}"
+
+if [ ! -d "$RECON_ALL_SUBJ_SESS_DIR" ]; then
+    echo "ERROR: Recon-all directory '$RECON_ALL_SUBJ_SESS_DIR' does not exist." >&2
+    exit 1
+fi
+
+ANAT_OUTPUT_DIR="$ANAT_DIR"
+mkdir -p "$ANAT_OUTPUT_DIR"  # Ensure the output directory exists
+
+MRI_DIR="${RECON_ALL_SUBJ_SESS_DIR}/mri"
+INPUT_FILE="${MRI_DIR}/brain.mgz"
+OUTPUT_FILE="${ANAT_OUTPUT_DIR}/Stru_Brain.nii.gz"
+
+# ---------------------------- Processing --------------------------------------
+
+if [ -f "$INPUT_FILE" ]; then
+    echo "Converting '$INPUT_FILE' to '$OUTPUT_FILE'..." >&2
+    # mri_convert "$INPUT_FILE" "$OUTPUT_FILE"
+    if [ $? -eq 0 ]; then
+        echo "Successfully converted to '$OUTPUT_FILE'." >&2
+    else
+        echo "ERROR: mri_convert failed for '$INPUT_FILE'." >&2
+        exit 1
+    fi
+else
+    echo "ERROR: Input file '$INPUT_FILE' does not exist." >&2
+    exit 1
+fi
+
+fast -t 1 -g -p -o "${ANAT_OUTPUT_DIR}/segment" "$OUTPUT_FILE"
 
 
-cd anat
+# ---------------------------- Summary ----------------------------------------
 
-echo "bet skull strip processing"
-#mri_convert brain.mgz Stru_Brain.nii.gz
-set T1w = `find . -name '*T1w*.nii*'`
-
-bet ${T1w} Stru_Brain -f 0.5 -g 0
-
-echo "segmentation brain"
-fast -t 1 -g -p -o segment Stru_Brain.nii.gz
-
-cd ..
-cd ..
-
-echo "Finished Anatproc for subject: $subj_id"
+echo "Anatomical processing completed for Subject: $SUBJ_ID | Session: $SESSION" >&2

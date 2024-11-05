@@ -1,105 +1,268 @@
-#!/bin/tcsh
+#!/bin/bash
 
-echo "All arguments: $argv"
+# =============================================================================
+# Script: fMRI_preproc.sh
+# Description:
+#   Performs fMRI preprocessing steps for a specific subject and session.
+#   Steps include:
+#     1. Dropping the first TR
+#     2. Deobliquing
+#     3. Reorienting to RPI
+#     4. Motion correction
+#     5. Skull stripping
+#     6. Extracting example functional image for registration
+#     7. Spatial smoothing
+#     8. Grand-mean scaling
+#     9. Temporal filtering
+#    10. Detrending
+#    11. Creating mask
+# =============================================================================
 
-if ( $#argv != 7 ) then
-    echo "Usage: $0 subj_id num_threads working_dir FWHM sigma highp lowp"
+# ---------------------------- Configuration ----------------------------------
+
+
+NUM_THREADS=
+WORKING_DIR=""
+FWHM=         
+SIGMA=  
+HIGHP=  
+LOWP=
+
+# ---------------------------- Usage Function --------------------------------
+
+usage() {
+    echo "Usage: $0 -s <subj_id> -n <num_threads> -f <functional_dir> -w <FWHM> -g <sigma> -h <highp> -l <lowp>" >&2
+    echo ""
+    echo "Options:"
+    echo "  -s    Subject ID (required)"
+    echo "  -n    Number of threads (default: $NUM_THREADS)"
+    echo "  -f    Working directory (required)"
+    echo "  -w    FWHM value for smoothing (default: $FWHM)"
+    echo "  -g    Sigma value for smoothing (default: $SIGMA)"
+    echo "  -h    High-pass filter frequency (default: $HIGHP)"
+    echo "  -l    Low-pass filter frequency (default: $LOWP)"
+    echo "  -u    Display this help message"
     exit 1
-endif
+}
 
-set subj_id = $argv[1]
-set num_threads = $argv[2]
-set working_dir = $argv[3]
-set FWHM = $argv[4]
-set sigma = $argv[5]
-set highp = $argv[6]
-set lowp = $argv[7]
+# ---------------------------- Argument Parsing ------------------------------
+while getopts ":s:e:n:f:w:g:h:l:u" opt; do
+    case ${opt} in
+        s ) SUBJ_ID="$OPTARG" ;;
+        n ) NUM_THREADS="$OPTARG" ;;
+        f ) WORKING_DIR="$OPTARG" ;;
+        w ) FWHM="$OPTARG" ;;
+        g ) SIGMA="$OPTARG" ;;
+        h ) HIGHP="$OPTARG" ;;
+        l ) LOWP="$OPTARG" ;;
+        u ) usage ;;
+        \? ) echo "Invalid Option: -$OPTARG" >&2; usage ;;
+        : ) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+    esac
+done
 
-setenv OMP_NUM_THREADS $num_threads
+# ---------------------------- Validation -------------------------------------
 
-set topdir = $working_dir
 
-echo "preprocessing $subj_id"
+if  [ -z "$SUBJ_ID" ] || [ -z "$WORKING_DIR" ]; then
+    echo "ERROR: Missing required arguments." >&2
+    usage
+fi
 
-cd $topdir
-cd $subj_id
-cd func
 
-set nifti_file = `find . -name '*task-rest_bold*.nii*'`
-
-if ( "$nifti_file" == "" ) then
-    echo "No matching NIfTI file found"
+if ! [[ "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: Number of threads must be a positive integer." >&2
     exit 1
-endif
+fi
 
-echo "Found NIfTI file: $nifti_file"
 
-if ( ! -e $nifti_file ) then
-    echo "Error: File $nifti_file does not exist"
+if ! [[ "$FWHM" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$SIGMA" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "ERROR: FWHM and sigma must be positive numbers." >&2
     exit 1
-endif
+fi
 
-# 输出文件详细信息
-ls -l $nifti_file
 
-set nTRs = `3dinfo -nt $nifti_file`
-@ nTRs_minus_one = $nTRs - 1
-
-echo "Number of TRs: $nTRs"
-echo "Number of TRs minus one: $nTRs_minus_one"
-
-echo "Dropping first TRs"
-3dcalc -a "${nifti_file}[0..$nTRs_minus_one]" -expr 'a' -prefix rest_dr.nii.gz
-
-if ( ! -e rest_dr.nii.gz ) then
-    echo "Error: rest_dr.nii.gz not created"
+if ! [[ "$HIGHP" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$LOWP" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "ERROR: High-pass and low-pass filter frequencies must be positive numbers." >&2
     exit 1
-endif
+fi
 
-## 2. Deoblique
-echo "Deobliquing $subj_id"
-3drefit -deoblique rest_dr.nii.gz
+if (( $(echo "$LOWP >= $HIGHP" | bc -l) )); then
+    echo "ERROR: Low-pass filter frequency must be less than high-pass filter frequency." >&2
+    exit 1
+fi
 
-## 3. Reorient into fsl friendly space (what AFNI calls RPI)
-echo "Reorienting $subj_id"
-3dresample -orient RPI -inset rest_dr.nii.gz -prefix rest_ro.nii.gz
+# ---------------------------- Setup ------------------------------------------
 
-## 4. Motion correct to average of timeseries
-echo "Motion correcting $subj_id"
+export OMP_NUM_THREADS="$NUM_THREADS"
+
+echo "Preprocessing subject: $SUBJ_ID" >&2
+
+SUBJECT_FUNC_DIR="${WORKING_DIR}"
+
+if [ ! -d "$SUBJECT_FUNC_DIR" ]; then
+    echo "ERROR: Functional directory '$SUBJECT_FUNC_DIR' does not exist." >&2
+    exit 1
+fi
+
+cd "$SUBJECT_FUNC_DIR" || { echo "ERROR: Cannot change directory to '$SUBJECT_FUNC_DIR'." >&2; exit 1; }
+
+# ---------------------------- Find NIfTI File ------------------------------
+
+nifti_file=$(find . -type f -name '*rest*.nii*' | head -n 1)
+
+if [ -z "$nifti_file" ]; then
+    echo "ERROR: No matching NIfTI file found for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
+echo "Found NIfTI file: $nifti_file" >&2
+
+if [ ! -e "$nifti_file" ]; then
+    echo "ERROR: File '$nifti_file' does not exist." >&2
+    exit 1
+fi
+
+ls -lh "$nifti_file" >&2
+
+# ---------------------------- Get Number of TRs ----------------------------
+
+nTRs=$(3dinfo -nt "$nifti_file")
+
+if [ -z "$nTRs" ]; then
+    echo "ERROR: Unable to retrieve number of TRs from '$nifti_file'." >&2
+    exit 1
+fi
+
+nTRs_minus_one=$((nTRs - 1))
+
+echo "Number of TRs: $nTRs" >&2
+echo "Number of TRs minus one: $nTRs_minus_one" >&2
+
+# ---------------------------- Step 1: Dropping First TR ---------------------
+
+echo "Dropping first TR for subject '$SUBJ_ID'." >&2
+3dcalc -a "${nifti_file}[0..$nTRs_minus_one]" -expr 'a' -prefix rest_dr.nii
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dcalc failed to drop first TR for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
+if [ ! -e rest_dr.nii ]; then
+    echo "ERROR: rest_dr.nii was not created." >&2
+    exit 1
+fi
+
+# ---------------------------- Step 2: Deoblique ----------------------------
+
+echo "Deobliquing for subject '$SUBJ_ID'." >&2
+3drefit -deoblique rest_dr.nii
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3drefit failed for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
+# ---------------------------- Step 3: Reorient -----------------------------
+
+echo "Reorienting to RPI for subject '$SUBJ_ID'." >&2
+3dresample -orient RPI -inset rest_dr.nii -prefix rest_ro.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dresample failed for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
+# ---------------------------- Step 4: Motion Correction ---------------------
+
+echo "Performing motion correction for subject '$SUBJ_ID'." >&2
 3dTstat -mean -prefix rest_ro_mean.nii.gz rest_ro.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dTstat failed to compute mean for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
 3dvolreg -Fourier -twopass -base rest_ro_mean.nii.gz -zpad 4 -prefix rest_mc.nii.gz -1Dfile rest_mc.1D rest_ro.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dvolreg failed for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
 
-## 5. Remove skull/edge detect
-echo "Skull stripping $subj_id"
+# ---------------------------- Step 5: Skull Stripping -----------------------
+
+echo "Skull stripping for subject '$SUBJ_ID'." >&2
 3dAutomask -prefix rest_mask.nii.gz -dilate 1 rest_mc.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dAutomask failed to create mask for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
 3dcalc -a rest_mc.nii.gz -b rest_mask.nii.gz -expr 'a*b' -prefix rest_ss.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dcalc failed to apply mask for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
 
-## 6. Get eighth image for use in registration
-echo "Getting example_func for registration for $subj_id"
+# ---------------------------- Step 6: Extract Example Functional Image -----
+
+echo "Extracting example functional image for registration for subject '$SUBJ_ID'." >&2
 3dcalc -a rest_ss.nii.gz'[7]' -expr 'a' -prefix example_func.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dcalc failed to extract example_func.nii.gz for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
 
-## 7. Spatial smoothing
-echo "Smoothing $subj_id"
-fslmaths rest_ss.nii.gz -kernel gauss $sigma -fmean -mas rest_mask.nii.gz rest_sm.nii.gz
+# ---------------------------- Step 7: Spatial Smoothing ----------------------
 
-## 8. Grand-mean scaling
-echo "Grand-mean scaling $subj_id"
+echo "Spatial smoothing for subject '$SUBJ_ID' with sigma=$SIGMA." >&2
+fslmaths rest_ss.nii.gz -kernel gauss "$SIGMA" -fmean -mas rest_mask.nii.gz rest_sm.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: fslmaths failed to perform spatial smoothing for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
+# ---------------------------- Step 8: Grand-mean Scaling ---------------------
+
+echo "Grand-mean scaling for subject '$SUBJ_ID'." >&2
 fslmaths rest_sm.nii.gz -ing 10000 rest_gms.nii.gz -odt float
+if [ $? -ne 0 ]; then
+    echo "ERROR: fslmaths failed to perform grand-mean scaling for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
 
-## 9. Temporal filtering
-echo "Band-pass filtering $subj_id"
-3dTproject -input rest_gms.nii.gz -prefix rest_filt.nii.gz -passband $lowp $highp -polort 2
+# ---------------------------- Step 9: Temporal Filtering ----------------------
 
-## 10. Detrending
-echo "Removing linear and quadratic trends for $subj_id"
+echo "Temporal filtering (band-pass) for subject '$SUBJ_ID' with lowp=$LOWP Hz and highp=$HIGHP Hz." >&2
+3dTproject -input rest_gms.nii.gz -prefix rest_filt.nii.gz -passband "$LOWP" "$HIGHP" -polort 2
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dTproject failed for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
+# ---------------------------- Step 10: Detrending -----------------------------
+
+echo "Detrending (removing linear and quadratic trends) for subject '$SUBJ_ID'." >&2
 3dTstat -mean -prefix rest_filt_mean.nii.gz rest_filt.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dTstat failed to compute mean for detrending for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
+
 3dcalc -a rest_filt_mean.nii.gz -b rest_filt.nii.gz -expr 'a+b' -prefix rest_pp.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dcalc failed to perform detrending for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
 
-## 11. Create Mask
-echo "Generating mask of preprocessed data for $subj_id"
+# ---------------------------- Step 11: Create Mask ---------------------------
+
+echo "Generating mask of preprocessed data for subject '$SUBJ_ID'." >&2
 3dAutomask -prefix rest_pp_mask.nii.gz rest_pp.nii.gz
+if [ $? -ne 0 ]; then
+    echo "ERROR: 3dAutomask failed to create preprocessed mask for subject '$SUBJ_ID'." >&2
+    exit 1
+fi
 
-cd ..
-cd ..
+# ---------------------------- Cleanup and Exit -----------------------------
 
-echo "Finished FC_Funpreproc_step2 for subject: $subj_id"
+echo "Finished fMRI_preproc_step2 for subject: $SUBJ_ID." >&2
+exit 0

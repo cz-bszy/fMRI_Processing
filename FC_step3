@@ -1,55 +1,146 @@
-#!/bin/tcsh
+#!/bin/bash
 
-echo "All arguments: $argv"
+set -euo pipefail
 
-if ( $#argv != 4) then
-    echo "Usage: subj_id num_threads working_dir standard_3mm"
+# =============================================================================
+# Script: fMRI_preproc.sh
+# Description:
+#   Performs fMRI preprocessing steps for a specific subject.
+#   Steps include:
+#     1. Register functional to anatomical
+#     2. Register anatomical to standard space
+#     3. Apply registrations to functional data
+# =============================================================================
+
+# ---------------------------- Configuration ----------------------------------
+
+NUM_THREADS=3
+FUNC_DIR=""
+ANAT_DIR=""
+STANDARD_DIR=""
+LOG_FILE=""
+
+# ---------------------------- Usage Function --------------------------------
+
+usage() {
+    echo "Usage: $0 -s <subj_id> -n <num_threads> -f <func_dir> -a <anat_dir> -m <standard_dir> -l <log_file> [-h]"
+    echo ""
+    echo "Options:"
+    echo "  -s    Subject ID (required)"
+    echo "  -n    Number of threads (default: $NUM_THREADS)"
+    echo "  -f    Functional directory (required)"
+    echo "  -a    Anatomy directory (required)"
+    echo "  -m    Standard directory (required)"
+    echo "  -l    Log file path (required)"
+    echo "  -h    Display this help message"
     exit 1
-endif
+}
 
-set subj_id = $argv[1]
-set num_threads = $argv[2]
-set working_dir = $argv[3]
-set standard_3mm = $argv[4]
+# ---------------------------- Argument Parsing ------------------------------
 
-set topdir = $working_dir
+while getopts ":s:n:f:a:m:l:h" opt; do
+    case ${opt} in
+        s ) SUBJ_ID="$OPTARG" ;;
+        n ) NUM_THREADS="$OPTARG" ;;
+        f ) FUNC_DIR="$OPTARG" ;;
+        a ) ANAT_DIR="$OPTARG" ;;
+        m ) STANDARD_DIR="$OPTARG" ;;
+        l ) LOG_FILE="$OPTARG" ;;
+        h ) usage ;;
+        \? ) echo "Invalid Option: -$OPTARG" >&2; usage ;;
+        : ) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+    esac
+done
 
-setenv OMP_NUM_THREADS $num_threads
+# ---------------------------- Validation -------------------------------------
 
-echo "preprocessing $subj_id"
+if [ -z "${SUBJ_ID:-}" ] || [ -z "${FUNC_DIR:-}" ] || [ -z "${ANAT_DIR:-}" ] || [ -z "${STANDARD_DIR:-}" ] || [ -z "${LOG_FILE:-}" ]; then
+    echo "ERROR: Missing required arguments." >&2
+    usage
+fi
 
-cd $topdir
-cd $subj_id
-cd func
+if ! [[ "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: Number of threads must be a positive integer." >&2
+    exit 1
+fi
 
-mkdir -p reg_dir
+# ---------------------------- Setup ------------------------------------------
 
-cp ${topdir}/${subj_id}/anat/Stru_Brain.nii.gz ./reg_dir/highres.nii.gz
-cp ${standard_3mm}/MNI152_T1_3mm_brain.nii.gz ./reg_dir/standard.nii.gz
-cp example_func.nii.gz ./reg_dir/
+export OMP_NUM_THREADS="$NUM_THREADS"
 
-cd reg_dir
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-## 1. FUNC->T1
-## You may want to change some of the options
-flirt -ref highres -in example_func -out example_func2highres -omat example_func2highres.mat -cost corratio -dof 6 -interp trilinear
-# Create mat file for conversion from subject's anatomical to functional
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Preprocessing subject: $SUBJ_ID"
+
+LOG_DIR="$FUNC_DIR/reg_dir/logs"
+mkdir -p "$LOG_DIR"
+
+for src in "$ANAT_DIR/Stru_Brain.nii.gz" "$STANDARD_DIR/MNI152_T1_3mm_brain.nii.gz" "$FUNC_DIR/example_func.nii.gz"; do
+    if [ ! -f "$src" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Source file '$src' does not exist."
+        exit 1
+    fi
+done
+
+# 复制文件
+cp "$ANAT_DIR/Stru_Brain.nii.gz" "$FUNC_DIR/reg_dir/highres.nii.gz"
+cp "$STANDARD_DIR/MNI152_T1_3mm_brain.nii.gz" "$FUNC_DIR/reg_dir/standard.nii.gz"
+cp "$FUNC_DIR/example_func.nii.gz" "$FUNC_DIR/reg_dir/"
+
+cd "$FUNC_DIR/reg_dir" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Cannot change directory to '$FUNC_DIR/reg_dir'."; exit 1; }
+
+# ---------------------------- Step 1: FUNC->T1 ------------------------------
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering functional to anatomical for subject '$SUBJ_ID'."
+flirt -ref highres.nii.gz -in example_func.nii.gz -out example_func2highres.nii.gz -omat example_func2highres.mat -cost corratio -dof 6 -interp trilinear
+if [ $? -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Registration FUNC->T1 failed."
+    exit 1
+fi
+
+# Create mat file for conversion from anatomical to functional
 convert_xfm -inverse -omat highres2example_func.mat example_func2highres.mat
+if [ $? -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Inverting transformation matrix example_func2highres.mat failed."
+    exit 1
+fi
 
-## 2. T1->STANDARD
-## NOTE THAT THIS IS Linear registration, you may want to use FNIRT (non-linear)
-flirt -ref standard -in highres -out highres2standard -omat highres2standard.mat -cost corratio -searchcost corratio -dof 12 -interp trilinear
-## Create mat file for conversion from standard to high res
+# ---------------------------- Step 2: T1->STANDARD ---------------------------
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering anatomical to standard for subject '$SUBJ_ID'."
+flirt -ref standard.nii.gz -in highres.nii.gz -out highres2standard.nii.gz -omat highres2standard.mat -cost corratio -dof 12 -interp trilinear
+if [ $? -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Registration T1->STANDARD failed."
+    exit 1
+fi
+
+# Create mat file for conversion from standard to anatomical
 convert_xfm -inverse -omat standard2highres.mat highres2standard.mat
+if [ $? -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Inverting transformation matrix highres2standard.mat failed."
+    exit 1
+fi
 
-## 3. FUNC->STANDARD
-## Create mat file for registration of functional to standard
+# ---------------------------- Step 3: FUNC->STANDARD -------------------------
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering functional to standard for subject '$SUBJ_ID'."
 convert_xfm -omat example_func2standard.mat -concat highres2standard.mat example_func2highres.mat
-## apply registration
-flirt -ref standard -in example_func -out example_func2standard -applyxfm -init example_func2standard.mat -interp trilinear
-## Create inverse mat file for registration of standard to functional
-convert_xfm -inverse -omat standard2example_func.mat example_func2standard.mat
+if [ $? -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Concatenating transformation matrices failed."
+    exit 1
+fi
 
-cd ..
-cd ..
-cd ..
+flirt -ref standard.nii.gz -in example_func.nii.gz -out example_func2standard.nii.gz -applyxfm -init example_func2standard.mat -interp trilinear
+if [ $? -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Applying registration to functional data failed."
+    exit 1
+fi
+
+# Create inverse mat file for registration of standard to functional
+convert_xfm -inverse -omat standard2example_func.mat example_func2standard.mat
+if [ $? -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Inverting transformation matrix example_func2standard.mat failed."
+    exit 1
+fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished preprocessing for subject: $SUBJ_ID."
