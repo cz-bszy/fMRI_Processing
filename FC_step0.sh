@@ -14,7 +14,7 @@ set -euo pipefail
 INPUT_DIR=""
 OUTPUT_DIR=""
 CORES_PER_SUBJECT=2
-# FREESURFER_SETUP="/opt/freesurfer/SetUpFreeSurfer.sh"  # 修改为您的 FreeSurfer 设置脚本路径
+# FREESURFER_SETUP="/opt/freesurfer/SetUpFreeSurfer.sh"  
 
 # ---------------------------- Usage Function --------------------------------
 
@@ -87,11 +87,11 @@ process_subject_session() {
     local anat_file="$3"
     local subj_sess_id
 
-    if [ "$session" != "None" ]; then
-        subj_sess_id="${subject_id}_${session}"
-    else
-        subj_sess_id="${subject_id}"
-    fi
+    # if [ "$session" != "None" ]; then
+    #     subj_sess_id="${subject_id}_${session}"
+    # else
+    #     subj_sess_id="${subject_id}"
+    # fi
     # source "$FREESURFER_SETUP"
 
     echo "----------------------------------------" >&2
@@ -103,7 +103,6 @@ process_subject_session() {
 
     local subject_output_dir="$OUTPUT_DIR/$subject_id"
 
-    # 检查是否存在输出目录
     if [[ -d "$subject_output_dir/$subj_sess_id" ]]; then
         echo "Subject-Session '$subj_sess_id' already exists. Skipping..." >&2
         return 0
@@ -112,13 +111,69 @@ process_subject_session() {
     mkdir -p "$subject_output_dir"
 
     if [[ -f "$anat_file" ]]; then
-        echo "Starting recon-all for $subj_sess_id (Subject: $subject_id)..." >&2
-        recon-all -s "$subj_sess_id" -i "$anat_file" -all -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
+        echo "Starting recon-all Step 1 for $subj_sess_id (Subject: $subject_id)..." >&2
+        recon-all -s "$subj_sess_id" -i "$anat_file" -autorecon1 -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
         if [ $? -eq 0 ]; then
-            echo "Completed recon-all for $subj_sess_id (Subject: $subject_id)." >&2
+            echo "Completed Step 1 for $subj_sess_id (Subject: $subject_id)." >&2
         else
-            echo "ERROR: recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            echo "ERROR: Step 1 recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            return 1
         fi
+
+        echo "Starting recon-all -gcareg for $subj_sess_id (Subject: $subject_id)..." >&2
+        recon-all -s "$subj_sess_id" -gcareg -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
+        if [ $? -eq 0 ]; then
+            echo "Completed -gcareg for $subj_sess_id (Subject: $subject_id)." >&2
+        else
+            echo "ERROR: -gcareg recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            return 1
+        fi
+
+        echo "Starting recon-all -canorm for $subj_sess_id (Subject: $subject_id)..." >&2
+        recon-all -s "$subj_sess_id" -canorm -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
+        if [ $? -eq 0 ]; then
+            echo "Completed -canorm for $subj_sess_id (Subject: $subject_id)." >&2
+        else
+            echo "ERROR: -canorm recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            return 1
+        fi
+
+        echo "Starting recon-all -careg for $subj_sess_id (Subject: $subject_id)..." >&2
+        recon-all -s "$subj_sess_id" -careg -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
+        if [ $? -eq 0 ]; then
+            echo "Completed -careg for $subj_sess_id (Subject: $subject_id)." >&2
+        else
+            echo "ERROR: -careg recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            return 1
+        fi
+
+        echo "Starting recon-all -careginv for $subj_sess_id (Subject: $subject_id)..." >&2
+        recon-all -s "$subj_sess_id" -careginv -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
+        if [ $? -eq 0 ]; then
+            echo "Completed -careginv for $subj_sess_id (Subject: $subject_id)." >&2
+        else
+            echo "ERROR: -careginv recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            return 1
+        fi
+
+        echo "Starting recon-all -calabel for $subj_sess_id (Subject: $subject_id)..." >&2
+        recon-all -s "$subj_sess_id" -calabel -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
+        if [ $? -eq 0 ]; then
+            echo "Completed -calabel for $subj_sess_id (Subject: $subject_id)." >&2
+        else
+            echo "ERROR: -calabel recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            return 1
+        fi
+
+        echo "Starting recon-all -normalization2 for $subj_sess_id (Subject: $subject_id)..." >&2
+        recon-all -s "$subj_sess_id" -normalization2 -openmp "$CORES_PER_SUBJECT" -sd "$subject_output_dir"
+        if [ $? -eq 0 ]; then
+            echo "Completed -normalization2 for $subj_sess_id (Subject: $subject_id)." >&2
+        else
+            echo "ERROR: -normalization2 recon-all failed for $subj_sess_id (Subject: $subject_id)." >&2
+            return 1
+        fi
+
     else
         echo "ERROR: Anatomical file '$anat_file' not found for Subject '$subject_id' Session '$session'." >&2
     fi
@@ -146,7 +201,7 @@ while IFS= read -r anat_file; do
             continue
         fi
     elif [ "$slash_count" -eq 2 ]; then
-        # 三级目录结构：subject/subdir/anat_file
+
         IFS='/' read -r subject_id subdir anat_filename <<< "$relative_path"
 
         if [[ -z "$subject_id" || -z "$subdir" || -z "$anat_filename" ]]; then

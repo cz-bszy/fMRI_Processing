@@ -6,41 +6,42 @@ set -euo pipefail
 # Script: process_all.sh
 # Description:
 #   Orchestrates the processing of multiple subjects and sessions.
-#   Executes steps: recon_all, Anatproc, fMRI_preproc in sequence for each subject-session pair.
+#   Executes steps: recon_all, Anatproc, fMRI_preproc, REGISTER, Processing_CW,
+#   Nuisance Regression, Extract Results in sequence for each subject-session pair.
 #   Utilizes GNU Parallel for parallel processing based on available CPU cores.
 # =============================================================================
 
 # ---------------------------- Configuration ----------------------------------
 
-INPUT_DIR="/mnt/d/Projects/Data_Processing/ABIDE_Longitudinal/ABIDEII-UPSM_Long"
-RECON_ALL_DIR="/mnt/d/Projects/Data_Processing/ABIDE_Longitudinal/Outputs/ABIDEII-UPSM_Long/recon_all"
-DATA_DIR="/mnt/d/Projects/Data_Processing/ABIDE_Longitudinal/Outputs/ABIDEII-UPSM_Long"
-STANDARD_DIR="/mnt/d/Projects/Data_Processing/fMRI_Processing-main/standard"
-tissuepriors_dir="/mnt/d/Projects/Data_Processing/fMRI_Processing-main/tissuepriors"
-template_dir="/mnt/d/Projects/Data_Processing/fMRI_Processing-main/template"
+INPUT_DIR="/mnt/ABIDE1/Caltech"
+RECON_ALL_DIR="/mnt/Output/Caltech/recon_all"
+DATA_DIR="/mnt/Output/Caltech"
+STANDARD_DIR="/mnt/Code/standard"
+tissuepriors_dir="/mnt/ode/tissuepriors"
+template_dir="/mnt/Code/template"
+RESULTS_DIR="/mnt/Output/Caltech/results"
 
+CORES_PER_TASK=2
 
-CORES_PER_TASK=6
-SESSIONS=("baseline" "followup_1")
-# RECON_SCRIPT="/path/to/recon.sh"       
-RECON_ALL_SCRIPT="./FC_step0.sh"
-ANATPROC_SCRIPT="./FC_step1"        
-FMRI_PREPROC_SCRIPT="./FC_step2" 
-REGISTER_SCRIPT="./FC_step3"
-Processing_CW="./FC_step4"
-NUISANCE_REGRESSION_SCRIPT="./FC_step5"
-Extract_SCRIPT="./test.sh"
+RECON_ALL_SCRIPT="/mnt/Code/FC_step0.sh"
+ANATPROC_SCRIPT="/mnt/Code/FC_step1"        
+FMRI_PREPROC_SCRIPT="/mnt/Code/FC_step2" 
+REGISTER_SCRIPT="/mnt/Code/FC_step3"
+Processing_CW_SCRIPT="/mnt/Code/FC_step4"
+NUISANCE_REGRESSION_SCRIPT="/mnt/Code/FC_step5"
+EXTRACT_RESULTS_SCRIPT="/mnt/Code/FC_step6"
 
 # ---------------------------- fMRI_preproc Configuration ----------------------
 
 FWHM=6
-SIGMA=2.54798709
+# SIGMA=2.54798709
+SIGMA=$(awk -v fwhm="$FWHM" 'BEGIN { print fwhm / (2 * sqrt(2 * log(2))) }')
 HIGHP=0.1
 LOWP=0.005
-# TR=2
-# TE=30
-# N_VOLS=200 
-# FSF_TYPE="Retain_GRS" ## or "Retain_GRS" "NO_GRD" 
+TR=2
+TE=30
+N_VOLS=240
+FSF_TYPE="Retain_GRS" # or "Retain_GRS" "No_GRS" 
 
 # ---------------------------- Usage Function --------------------------------
 
@@ -51,10 +52,6 @@ usage() {
     echo "  -i    Path to the input data directory (default: $INPUT_DIR)"
     echo "  -r    Path to the recon all directory (default: $RECON_ALL_DIR)"
     echo "  -c    Number of CPU cores to allocate per task (default: $CORES_PER_TASK)"
-    echo "  -s    Comma-separated list of sessions (default: baseline,followup_1)"
-    echo "  -a    Path to recon_all.sh script (default: $RECON_ALL_SCRIPT)"
-    echo "  -p    Path to Anatproc.sh script (default: $ANATPROC_SCRIPT)"
-    echo "  -q    Path to fMRI_preproc.sh script (default: $FMRI_PREPROC_SCRIPT)"
     echo "  -f    FWHM value for smoothing (default: $FWHM)"
     echo "  -g    Sigma value for smoothing (default: $SIGMA)"
     echo "  -k    High-pass filter frequency for fMRI_preproc.sh (default: $HIGHP)"
@@ -65,15 +62,11 @@ usage() {
 
 # ---------------------------- Argument Parsing ------------------------------
 
-while getopts ":i:r:c:s:a:p:q:f:g:k:l:h" opt; do
+while getopts ":i:r:c:f:g:k:l:h" opt; do
     case ${opt} in
         i) INPUT_DIR="$OPTARG";;
         r) RECON_ALL_DIR="$OPTARG";;
         c) CORES_PER_TASK="$OPTARG";;
-        s) IFS=',' read -r -a SESSIONS <<< "$OPTARG";;
-        a) RECON_ALL_SCRIPT="$OPTARG";;
-        p) ANATPROC_SCRIPT="$OPTARG";;
-        q) FMRI_PREPROC_SCRIPT="$OPTARG";;
         f) FWHM="$OPTARG";;
         g) SIGMA="$OPTARG";;
         k) HIGHP="$OPTARG";;
@@ -91,24 +84,18 @@ if [ ! -d "$INPUT_DIR" ]; then
     exit 1
 fi
 
-if [ ${#SESSIONS[@]} -eq 0 ]; then
-    echo "ERROR: At least one session must be specified." >&2
-    exit 1
-fi
-
 if ! [[ "$CORES_PER_TASK" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: Cores per task must be a positive integer." >&2
     exit 1
 fi
 
-for script in "$RECON_ALL_SCRIPT" "$ANATPROC_SCRIPT" "$FMRI_PREPROC_SCRIPT" "$REGISTER_SCRIPT"; do
+for script in "$RECON_ALL_SCRIPT" "$ANATPROC_SCRIPT" "$FMRI_PREPROC_SCRIPT" "$REGISTER_SCRIPT" "$Processing_CW_SCRIPT" "$NUISANCE_REGRESSION_SCRIPT" "$EXTRACT_RESULTS_SCRIPT"; do
     if [ ! -x "$script" ]; then
         echo "ERROR: Script '$script' does not exist or is not executable." >&2
         exit 1
     fi
 done
 
-# Validate fMRI_preproc parameters
 if ! [[ "$FWHM" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$SIGMA" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     echo "ERROR: FWHM and sigma must be positive numbers." >&2
     exit 1
@@ -128,7 +115,6 @@ fi
 
 MAIN_LOG_DIR="${DATA_DIR}/logs"
 mkdir -p "$MAIN_LOG_DIR"
-
 
 ERROR_LOG="${MAIN_LOG_DIR}/error_log.txt"
 > "$ERROR_LOG"
@@ -157,6 +143,7 @@ process_subject_session() {
     local fmripreproc_log="${subject_session_log_dir}/fMRI_preproc.log"
     local register_log="${subject_session_log_dir}/REGISTER.log"
     local nuisance_log="${subject_session_log_dir}/nuisance_regression.log"
+    local extract_log="${subject_session_log_dir}/extract_results.log"
 
     echo "----------------------------------------" >&2
     echo "Processing Subject: $subject_id | Session: $session" >&2
@@ -180,115 +167,119 @@ process_subject_session() {
 
     ## ------------------------ Step 0: Recon_all ----------------------------
 
-    # Uncomment and modify if recon_all step is needed
-    # echo "Starting recon_all for Subject: $subject_id | Session: $session" >&2
-    # bash "$RECON_ALL_SCRIPT" \
-    #     -s "$subject_id" \
-    #     -e "$session" \
-    #     -w "$OUTPUT_DIR" \
-    #     -o "$subject_output_dir" \
-    #     -c "$CORES_PER_TASK"
-    #
-    # if [ $? -ne 0 ]; then
-    #     echo "ERROR: recon_all failed for Subject: $subject_id | Session: $session" >&2
-    #     return 1
-    # fi
-    # echo "Completed recon_all for Subject: $subject_id | Session: $session" >&2
+    echo "Starting recon_all for Subject: $subject_id | Session: $session" >&2
+    bash "$RECON_ALL_SCRIPT" \
+        -i "$INPUT_DIR" \
+        -o "$RECON_ALL_DIR" \
+        -c "$CORES_PER_TASK" \
+        1> "${subject_session_log_dir}/recon_all.out" 2> "${subject_session_log_dir}/recon_all.err"
 
+    if [ $? -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: recon_all failed for Subject: $subject_id | Session: $session" >&2
+        echo "${subject_id},${session}" >> "$ERROR_LOG"
+        return 1
+    fi
+    echo "Completed recon_all for Subject: $subject_id | Session: $session" >&2
 
     ## ------------------------ Step 1: Anatproc ------------------------------
 
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Anatproc for Subject: $subject_id | Session: $session" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Anatproc for Subject: $subject_id | Session: $session" >&2
 
-    # bash "$ANATPROC_SCRIPT" \
-    #     -s "$subject_id" \
-    #     -e "$session" \
-    #     -n "$CORES_PER_TASK" \
-    #     -f "$functional_dir" \
-    #     -a "$structure_dir" \
-    #     -t "$RECON_ALL_DIR" \
-    #     -l "$anatproc_log"
+    bash "$ANATPROC_SCRIPT" \
+        -s "$subject_id" \
+        -e "$session" \
+        -n "$CORES_PER_TASK" \
+        -f "$functional_dir" \
+        -a "$structure_dir" \
+        -t "$RECON_ALL_DIR" \
+        -l "$anatproc_log" \
+        -d "$DATA_DIR" \
+        -s "$STANDARD_DIR"
 
-    # if [ $? -ne 0 ]; then
-    #     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Anatproc failed for Subject: $subject_id | Session: $session" >&2
-    #     echo "${subject_id},${session}" >> "$ERROR_LOG"
-    #     return 1
-    # fi
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Anatproc for Subject: $subject_id | Session: $session" >&2
+    if [ $? -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Anatproc failed for Subject: $subject_id | Session: $session" >&2
+        echo "${subject_id},${session}" >> "$ERROR_LOG"
+        return 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Anatproc for Subject: $subject_id | Session: $session" >&2
 
     ## ------------------------ Step 2: fMRI_preproc ---------------------------
+:<<EOF
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting fMRI_preproc for Subject: $subject_id | Session: $session" >&2
 
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting fMRI_preproc for Subject: $subject_id | Session: $session" >&2
+    bash "$FMRI_PREPROC_SCRIPT" \
+        -s "$subject_id" \
+        -e "$session" \
+        -n "$CORES_PER_TASK" \
+        -f "$functional_dir" \
+        -a "$structure_dir" \
+        -m "$STANDARD_DIR" \
+        -l "$fmripreproc_log" \
+        -g "$FWHM" \
+        -h "$SIGMA" \
+        -k "$HIGHP" \
+        -p "$LOWP" \
+        -t "$TR" \
+        -T "$TE" \
+        -v "$N_VOLS" \
+        -F "$FSF_TYPE"
 
-    # bash "$FMRI_PREPROC_SCRIPT" \
-    #     -s "$subject_id" \
-    #     -n "$CORES_PER_TASK" \
-    #     -f "$functional_dir" \
-    #     -a "$structure_dir" \
-    #     -m "$STANDARD_DIR" \
-    #     -l "$fmripreproc_log" \
-    #     -f "$FWHM" \
-    #     -g "$SIGMA" \
-    #     -k "$HIGHP" \
-    #     -l "$LOWP"
-
-    # if [ $? -ne 0 ]; then
-    #     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: fMRI_preproc failed for Subject: $subject_id | Session: $session" >&2
-    #     echo "${subject_id},${session}" >> "$ERROR_LOG"
-    #     return 1
-    # fi
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed fMRI_preproc for Subject: $subject_id | Session: $session" >&2
+    if [ $? -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: fMRI_preproc failed for Subject: $subject_id | Session: $session" >&2
+        echo "${subject_id},${session}" >> "$ERROR_LOG"
+        return 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed fMRI_preproc for Subject: $subject_id | Session: $session" >&2
 
     ## ------------------------ Step 3: REGISTER ------------------------------
 
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running REGISTER for Subject: $subject_id | Session: $session" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting REGISTER for Subject: $subject_id | Session: $session" >&2
 
-    # bash "$REGISTER_SCRIPT" \
-    #     -s "$subject_id" \
-    #     -n "$CORES_PER_TASK" \
-    #     -f "$functional_dir" \
-    #     -a "$structure_dir" \
-    #     -m "$STANDARD_DIR" \
-    #     -l "$register_log"
+    bash "$REGISTER_SCRIPT" \
+        -s "$subject_id" \
+        -e "$session" \
+        -n "$CORES_PER_TASK" \
+        -f "$functional_dir" \
+        -a "$structure_dir" \
+        -m "$STANDARD_DIR" \
+        -l "$register_log"
 
-    # if [ $? -ne 0 ]; then
-    #     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: REGISTER failed for Subject: $subject_id | Session: $session" >&2
-    #     echo "${subject_id},${session}" >> "$ERROR_LOG"
-    #     return 1
-    # fi
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed REGISTER for Subject: $subject_id | Session: $session" >&2
+    if [ $? -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: REGISTER failed for Subject: $subject_id | Session: $session" >&2
+        echo "${subject_id},${session}" >> "$ERROR_LOG"
+        return 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed REGISTER for Subject: $subject_id | Session: $session" >&2
 
+    ## ------------------------ Step 4: Processing_CW ---------------------------
 
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Anatproc for Subject: $subject_id | Session: $session" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Processing_CW for Subject: $subject_id | Session: $session" >&2
 
-    # bash "$Processing_CW" \
-    #     -s "$subject_id" \
-    #     -e "$session" \
-    #     -n "$CORES_PER_TASK" \
-    #     -f "$functional_dir" \
-    #     -a "$structure_dir" \
-    #     -t "$tissuepriors_dir" \
-    #     -g "$SIGMA" \
-    #     -l "$anatproc_log"
+    bash "$Processing_CW_SCRIPT" \
+        -s "$subject_id" \
+        -e "$session" \
+        -n "$CORES_PER_TASK" \
+        -f "$functional_dir" \
+        -a "$structure_dir" \
+        -t "$tissuepriors_dir" \
+        -g "$SIGMA" \
+        -l "$LOWP" \
+        -d "$DATA_DIR"
 
-    # if [ $? -ne 0 ]; then
-    #     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Anatproc failed for Subject: $subject_id | Session: $session" >&2
-    #     echo "${subject_id},${session}" >> "$ERROR_LOG"
-    #     return 1
-    # fi
-    # echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Anatproc for Subject: $subject_id | Session: $session" >&2
+    if [ $? -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Processing_CW failed for Subject: $subject_id | Session: $session" >&2
+        echo "${subject_id},${session}" >> "$ERROR_LOG"
+        return 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Processing_CW for Subject: $subject_id | Session: $session" >&2
 
-    ## ------------------------ Step 4: Nuisance Regression ----------------------
+    ## ------------------------ Step 5: Nuisance Regression ---------------------
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Nuisance Regression for Subject: $subject_id | Session: $session" >&2
 
-    local TR=2
-    local TE=30
-    local N_VOLS=200 
-    local FSF_TYPE="Retain_GRS"
-
     bash "$NUISANCE_REGRESSION_SCRIPT" \
         -s "$subject_id" \
+        -e "$session" \
         -n "$CORES_PER_TASK" \
         -w "$functional_dir" \
         -a "$structure_dir" \
@@ -306,8 +297,31 @@ process_subject_session() {
         return 1
     fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Nuisance Regression for Subject: $subject_id | Session: $session" >&2
-}
 
+    ## ------------------------ Step 6: Extract Results -------------------------
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting extraction of results for Subject: $subject_id | Session: $session" >&2
+
+    bash "$EXTRACT_RESULTS_SCRIPT" \
+        -s "$subject_id" \
+        -e "$session" \
+        -w "$functional_dir" \
+        -f "$FSF_TYPE" \
+        -r "$RESULTS_DIR" \
+        > "${subject_session_log_dir}/extract_results.out" 2> "${subject_session_log_dir}/extract_results.err"
+
+    if [ $? -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Extraction of results failed for Subject: $subject_id | Session: $session" >&2
+        echo "${subject_id},${session}" >> "$ERROR_LOG"
+        return 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed extraction of results for Subject: $subject_id | Session: $session" >&2
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] All processing steps completed successfully for Subject: $subject_id | Session: $session" >&2
+
+EOF
+
+}
 
 export -f process_subject_session
 export INPUT_DIR
@@ -315,10 +329,11 @@ export RECON_ALL_DIR
 export CORES_PER_TASK
 export RECON_ALL_SCRIPT
 export ANATPROC_SCRIPT
-export NUISANCE_REGRESSION_SCRIPT
 export FMRI_PREPROC_SCRIPT
 export REGISTER_SCRIPT
-export Processing_CW
+export Processing_CW_SCRIPT
+export NUISANCE_REGRESSION_SCRIPT
+export EXTRACT_RESULTS_SCRIPT
 export FWHM
 export SIGMA
 export HIGHP
@@ -327,6 +342,11 @@ export MAIN_LOG_DIR
 export ERROR_LOG
 export tissuepriors_dir
 export template_dir
+export RESULTS_DIR
+export TR
+export TE
+export N_VOLS
+export FSF_TYPE
 
 # ---------------------------- Main Execution ---------------------------------
 
@@ -334,10 +354,35 @@ tasks=()
 
 for subject_dir in "$INPUT_DIR"/*/; do
     subject_id=$(basename "$subject_dir")
-    for session in "${SESSIONS[@]}"; do
-        anat_file="${subject_dir}/${session}/anat_1/anat.nii.gz"
-        if [ -f "$anat_file" ]; then
-            tasks+=("$subject_id" "$session")
+
+    for session_dir in "$subject_dir"*/; do
+        relative_path="${session_dir#$INPUT_DIR/}"
+        slash_count=$(grep -o "/" <<< "$relative_path" | wc -l)
+
+        if [ "$slash_count" -eq 3 ]; then
+            IFS='/' read -r subject_id session subdir <<< "$relative_path"
+
+            if [[ -z "$subject_id" || -z "$session" || -z "$subdir" ]]; then
+                echo "WARNING: Skipping malformed path: $session_dir" >&2
+                continue
+            fi
+        elif [ "$slash_count" -eq 2 ]; then
+            IFS='/' read -r subject_id subdir <<< "$relative_path"
+
+            if [[ -z "$subject_id" || -z "$subdir" ]]; then
+                echo "WARNING: Skipping malformed path: $session_dir" >&2
+                continue
+            fi
+
+            session="None" 
+        else
+            echo "WARNING: Skipping malformed path: $session_dir" >&2
+            continue
+        fi
+
+        anat_file="${session_dir}/anat/*T1w.nii.gz"
+        if compgen -G "$anat_file" > /dev/null; then
+            tasks+=("$subject_id" "$session" "$anat_file")
             # echo "Added Task - Subject ID: $subject_id, Session: $session" >&2
         else
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: anat.nii.gz not found for Subject: $subject_id | Session: $session. Skipping." >&2
@@ -345,25 +390,24 @@ for subject_dir in "$INPUT_DIR"/*/; do
     done
 done
 
-total_tasks=$(( ${#tasks[@]} / 2 ))
+total_tasks=$(( ${#tasks[@]} / 3 ))
 
 task_list=()
-for ((i=0; i<${#tasks[@]}; i+=2)); do
-    task_list+=("${tasks[i]} ${tasks[i+1]}")
+for ((i=0; i<${#tasks[@]}; i+=3)); do
+    task_list+=("${tasks[i]} ${tasks[i+1]} ${tasks[i+2]}")
 done
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Constructed Task List: ${#task_list[@]} tasks found." >&2
 
 # ---------------------------- Run Tasks in Parallel ---------------------------
 
-
-printf "%s\n" "${task_list[@]}" | parallel -j "$MAX_JOBS" --colsep ' ' process_subject_session {1} {2}
+printf "%s\n" "${task_list[@]}" | parallel -j "$MAX_JOBS" --colsep ' ' process_subject_session {1} {2} {3}
 
 # ---------------------------- Summary ------------------------------------------
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] All tasks completed. Total tasks processed: $total_tasks" >&2
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Check '$MAIN_LOG_DIR' for individual log files."
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Check '$ERROR_LOG' for any errors encountered during processing."
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Check '$MAIN_LOG_DIR' for individual log files." >&2
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Check '$ERROR_LOG' for any errors encountered during processing." >&2
 
 # ---------------------------- Exit ---------------------------------------------
 

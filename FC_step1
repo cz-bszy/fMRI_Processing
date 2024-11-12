@@ -71,7 +71,7 @@ if [ ! -d "$RECON_ALL_SUBJ_SESS_DIR" ]; then
 fi
 
 ANAT_OUTPUT_DIR="$ANAT_DIR"
-mkdir -p "$ANAT_OUTPUT_DIR"  # Ensure the output directory exists
+mkdir -p "$ANAT_OUTPUT_DIR" 
 
 MRI_DIR="${RECON_ALL_SUBJ_SESS_DIR}/mri"
 INPUT_FILE="${MRI_DIR}/brain.mgz"
