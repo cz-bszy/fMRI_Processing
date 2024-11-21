@@ -3,412 +3,400 @@
 set -euo pipefail
 
 # =============================================================================
-# Script: process_all.sh
+# Script: process_pipeline.sh
 # Description:
-#   Orchestrates the processing of multiple subjects and sessions.
-#   Executes steps: recon_all, Anatproc, fMRI_preproc, REGISTER, Processing_CW,
-#   Nuisance Regression, Extract Results in sequence for each subject-session pair.
-#   Utilizes GNU Parallel for parallel processing based on available CPU cores.
+#   Enhanced fMRI processing pipeline with configurable FSF types
 # =============================================================================
 
 # ---------------------------- Configuration ----------------------------------
 
-INPUT_DIR="/mnt/ABIDE1/Caltech"
-RECON_ALL_DIR="/mnt/Output/Caltech/recon_all"
-DATA_DIR="/mnt/Output/Caltech"
-STANDARD_DIR="/mnt/Code/standard"
-tissuepriors_dir="/mnt/ode/tissuepriors"
-template_dir="/mnt/Code/template"
-RESULTS_DIR="/mnt/Output/Caltech/results"
+# Directory settings
+INPUT_DIR="/mnt/e/ABIDE/Data/Test"          # Raw data directory
+OUTPUT_DIR="/mnt/e/ABIDE/Outputs/Test1"     # Output directory
+STANDARD_DIR="./standard"                   # Standard brain templates
+TEMPLATE_DIR="./template"                   # FSF templates
 
-CORES_PER_TASK=2
+# Processing parameters
+NUM_THREADS=4                               # Number of CPU threads to use
+FWHM=6.0                                    # Full Width at Half Maximum for smoothing
+SIGMA=2.548                                # Sigma for smoothing (FWHM = 2.355 * SIGMA)
+HIGHP=0.1                                  # High-pass filter in Hz
+LOWP=0.01                                  # Low-pass filter in Hz
+TR=2.0                                     # Repetition Time
+TE=30                                      # Echo Time
+N_VOLS=200                                 # Number of volumes
 
-RECON_ALL_SCRIPT="/mnt/Code/FC_step0.sh"
-ANATPROC_SCRIPT="/mnt/Code/FC_step1"        
-FMRI_PREPROC_SCRIPT="/mnt/Code/FC_step2" 
-REGISTER_SCRIPT="/mnt/Code/FC_step3"
-Processing_CW_SCRIPT="/mnt/Code/FC_step4"
-NUISANCE_REGRESSION_SCRIPT="/mnt/Code/FC_step5"
-EXTRACT_RESULTS_SCRIPT="/mnt/Code/FC_step6"
+FSF_TYPES=("Retain_GRS")          # Default FSF types("NO_GRD" "Retain_GRS")
+FILE_PATTERN="*T1w.nii*" 
+PROCESSING_MODE="default" 
 
-# ---------------------------- fMRI_preproc Configuration ----------------------
+EXPERT_FILE=""                            # Expert options file for recon-all
+MAX_TIME=""                               # Maximum time per subject
 
-FWHM=6
-# SIGMA=2.54798709
-SIGMA=$(awk -v fwhm="$FWHM" 'BEGIN { print fwhm / (2 * sqrt(2 * log(2))) }')
-HIGHP=0.1
-LOWP=0.005
-TR=2
-TE=30
-N_VOLS=240
-FSF_TYPE="Retain_GRS" # or "Retain_GRS" "No_GRS" 
+# Processing flags
+SKIP_EXISTING=true                         # Skip if output exists
+DRY_RUN=false                             # Show commands without executing
+VERBOSE=true                              # Show detailed output
+
+# Error tracking configuration
+ERROR_LOG_DIR=""
+ERROR_SUBJECTS_FILE=""
+CURRENT_DATE=$(date +"%Y%m%d")
+LOG_DIR=""                                 # Will be set to $OUTPUT_DIR/logs
+
+
 
 # ---------------------------- Usage Function --------------------------------
 
 usage() {
+    echo "Enhanced fMRI Processing Pipeline"
     echo "Usage: $0 [options]" >&2
     echo ""
-    echo "Options:"
-    echo "  -i    Path to the input data directory (default: $INPUT_DIR)"
-    echo "  -r    Path to the recon all directory (default: $RECON_ALL_DIR)"
-    echo "  -c    Number of CPU cores to allocate per task (default: $CORES_PER_TASK)"
-    echo "  -f    FWHM value for smoothing (default: $FWHM)"
-    echo "  -g    Sigma value for smoothing (default: $SIGMA)"
-    echo "  -k    High-pass filter frequency for fMRI_preproc.sh (default: $HIGHP)"
-    echo "  -l    Low-pass filter frequency for fMRI_preproc.sh (default: $LOWP)"
+    echo "Optional Arguments:"
+    echo "  -f    FSF types (comma-separated, default: NO_GRD,Retain_GRS)"
+    echo "  -s    Skip existing (default: true)"
+    echo "  -d    Dry run (default: false)"
+    echo "  -v    Verbose output (default: true)"
     echo "  -h    Display this help message"
     exit 1
 }
 
-# ---------------------------- Argument Parsing ------------------------------
+# ---------------------------- Parse Arguments ------------------------------
 
-while getopts ":i:r:c:f:g:k:l:h" opt; do
+while getopts "f:sdvh" opt; do
     case ${opt} in
-        i) INPUT_DIR="$OPTARG";;
-        r) RECON_ALL_DIR="$OPTARG";;
-        c) CORES_PER_TASK="$OPTARG";;
-        f) FWHM="$OPTARG";;
-        g) SIGMA="$OPTARG";;
-        k) HIGHP="$OPTARG";;
-        l) LOWP="$OPTARG";;
-        h) usage;;
-        \?) echo "Invalid Option: -$OPTARG" >&2; usage;;
-        :) echo "Option -$OPTARG requires an argument." >&2; usage;;
+        f)  # Convert comma-separated string to array
+            IFS=',' read -r -a FSF_TYPES <<< "$OPTARG"
+            ;;
+        s) SKIP_EXISTING=true ;;
+        d) DRY_RUN=true ;;
+        v) VERBOSE=true ;;
+        h) usage ;;
+        \?) echo "Invalid Option: -$OPTARG" >&2; usage ;;
+        :) echo "Option -$OPTARG requires an argument." >&2; usage ;;
     esac
 done
 
-# ---------------------------- Validation -------------------------------------
-
-if [ ! -d "$INPUT_DIR" ]; then
-    echo "ERROR: Input directory '$INPUT_DIR' does not exist." >&2
-    exit 1
-fi
-
-if ! [[ "$CORES_PER_TASK" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: Cores per task must be a positive integer." >&2
-    exit 1
-fi
-
-for script in "$RECON_ALL_SCRIPT" "$ANATPROC_SCRIPT" "$FMRI_PREPROC_SCRIPT" "$REGISTER_SCRIPT" "$Processing_CW_SCRIPT" "$NUISANCE_REGRESSION_SCRIPT" "$EXTRACT_RESULTS_SCRIPT"; do
-    if [ ! -x "$script" ]; then
-        echo "ERROR: Script '$script' does not exist or is not executable." >&2
+# Validate FSF types
+for fsf_type in "${FSF_TYPES[@]}"; do
+    if [[ ! "$fsf_type" =~ ^(NO_GRD|Retain_GRS)$ ]]; then
+        log "ERROR" "Invalid FSF type: $fsf_type" 
+        log "Valid types are: NO_GRD, Retain_GRS"
         exit 1
     fi
 done
 
-if ! [[ "$FWHM" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$SIGMA" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    echo "ERROR: FWHM and sigma must be positive numbers." >&2
-    exit 1
-fi
+# Set up error tracking paths after OUTPUT_DIR is confirmed
+ERROR_LOG_DIR="${OUTPUT_DIR}/error_logs"
+ERROR_SUBJECTS_FILE="${ERROR_LOG_DIR}/failed_subjects.txt"
+# ---------------------------- Functions ------------------------------------
 
-if ! [[ "$HIGHP" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$LOWP" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    echo "ERROR: High-pass and low-pass filter frequencies must be positive numbers." >&2
-    exit 1
-fi
-
-if (( $(echo "$LOWP >= $HIGHP" | bc -l) )); then
-    echo "ERROR: Low-pass filter frequency must be less than high-pass filter frequency." >&2
-    exit 1
-fi
-
-# ---------------------------- Setup ------------------------------------------
-
-MAIN_LOG_DIR="${DATA_DIR}/logs"
-mkdir -p "$MAIN_LOG_DIR"
-
-ERROR_LOG="${MAIN_LOG_DIR}/error_log.txt"
-> "$ERROR_LOG"
-
-# ---------------------------- Determine CPU Resources -----------------------
-
-TOTAL_CORES=$(nproc)
-echo "Total CPU cores available: $TOTAL_CORES" >&2
-MAX_JOBS=$(( TOTAL_CORES / CORES_PER_TASK ))
-if [ "$MAX_JOBS" -lt 1 ]; then
-    MAX_JOBS=1
-fi
-echo "Cores per task: $CORES_PER_TASK" >&2
-echo "Maximum parallel tasks: $MAX_JOBS" >&2
-
-# ---------------------------- Processing Function ---------------------------
-
-process_subject_session() {
-    local subject_id="$1"
-    local session="$2"
-
-    local subject_session_log_dir="${MAIN_LOG_DIR}/${subject_id}_${session}"
-    mkdir -p "$subject_session_log_dir"
-
-    local anatproc_log="${subject_session_log_dir}/Anatproc.log"
-    local fmripreproc_log="${subject_session_log_dir}/fMRI_preproc.log"
-    local register_log="${subject_session_log_dir}/REGISTER.log"
-    local nuisance_log="${subject_session_log_dir}/nuisance_regression.log"
-    local extract_log="${subject_session_log_dir}/extract_results.log"
-
-    echo "----------------------------------------" >&2
-    echo "Processing Subject: $subject_id | Session: $session" >&2
-    echo "Logs are being saved to: $subject_session_log_dir" >&2
-    echo "----------------------------------------" >&2
-
-    local structure_dir="${INPUT_DIR}/${subject_id}/${session}/anat_1"
-    local functional_dir="${INPUT_DIR}/${subject_id}/${session}/rest_1"
-
-    if [ ! -d "$structure_dir" ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Anatomical directory '$structure_dir' does not exist." >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-
-    if [ ! -d "$functional_dir" ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Functional directory '$functional_dir' does not exist." >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-
-    ## ------------------------ Step 0: Recon_all ----------------------------
-
-    echo "Starting recon_all for Subject: $subject_id | Session: $session" >&2
-    bash "$RECON_ALL_SCRIPT" \
-        -i "$INPUT_DIR" \
-        -o "$RECON_ALL_DIR" \
-        -c "$CORES_PER_TASK" \
-        1> "${subject_session_log_dir}/recon_all.out" 2> "${subject_session_log_dir}/recon_all.err"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: recon_all failed for Subject: $subject_id | Session: $session" >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-    echo "Completed recon_all for Subject: $subject_id | Session: $session" >&2
-
-    ## ------------------------ Step 1: Anatproc ------------------------------
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Anatproc for Subject: $subject_id | Session: $session" >&2
-
-    bash "$ANATPROC_SCRIPT" \
-        -s "$subject_id" \
-        -e "$session" \
-        -n "$CORES_PER_TASK" \
-        -f "$functional_dir" \
-        -a "$structure_dir" \
-        -t "$RECON_ALL_DIR" \
-        -l "$anatproc_log" \
-        -d "$DATA_DIR" \
-        -s "$STANDARD_DIR"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Anatproc failed for Subject: $subject_id | Session: $session" >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Anatproc for Subject: $subject_id | Session: $session" >&2
-
-    ## ------------------------ Step 2: fMRI_preproc ---------------------------
-:<<EOF
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting fMRI_preproc for Subject: $subject_id | Session: $session" >&2
-
-    bash "$FMRI_PREPROC_SCRIPT" \
-        -s "$subject_id" \
-        -e "$session" \
-        -n "$CORES_PER_TASK" \
-        -f "$functional_dir" \
-        -a "$structure_dir" \
-        -m "$STANDARD_DIR" \
-        -l "$fmripreproc_log" \
-        -g "$FWHM" \
-        -h "$SIGMA" \
-        -k "$HIGHP" \
-        -p "$LOWP" \
-        -t "$TR" \
-        -T "$TE" \
-        -v "$N_VOLS" \
-        -F "$FSF_TYPE"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: fMRI_preproc failed for Subject: $subject_id | Session: $session" >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed fMRI_preproc for Subject: $subject_id | Session: $session" >&2
-
-    ## ------------------------ Step 3: REGISTER ------------------------------
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting REGISTER for Subject: $subject_id | Session: $session" >&2
-
-    bash "$REGISTER_SCRIPT" \
-        -s "$subject_id" \
-        -e "$session" \
-        -n "$CORES_PER_TASK" \
-        -f "$functional_dir" \
-        -a "$structure_dir" \
-        -m "$STANDARD_DIR" \
-        -l "$register_log"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: REGISTER failed for Subject: $subject_id | Session: $session" >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed REGISTER for Subject: $subject_id | Session: $session" >&2
-
-    ## ------------------------ Step 4: Processing_CW ---------------------------
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Processing_CW for Subject: $subject_id | Session: $session" >&2
-
-    bash "$Processing_CW_SCRIPT" \
-        -s "$subject_id" \
-        -e "$session" \
-        -n "$CORES_PER_TASK" \
-        -f "$functional_dir" \
-        -a "$structure_dir" \
-        -t "$tissuepriors_dir" \
-        -g "$SIGMA" \
-        -l "$LOWP" \
-        -d "$DATA_DIR"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Processing_CW failed for Subject: $subject_id | Session: $session" >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Processing_CW for Subject: $subject_id | Session: $session" >&2
-
-    ## ------------------------ Step 5: Nuisance Regression ---------------------
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Nuisance Regression for Subject: $subject_id | Session: $session" >&2
-
-    bash "$NUISANCE_REGRESSION_SCRIPT" \
-        -s "$subject_id" \
-        -e "$session" \
-        -n "$CORES_PER_TASK" \
-        -w "$functional_dir" \
-        -a "$structure_dir" \
-        -t "$template_dir" \
-        -p "$tissuepriors_dir" \
-        -r "$TR" \
-        -e "$TE" \
-        -v "$N_VOLS" \
-        -f "$FSF_TYPE" \
-        -l "$nuisance_log"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Nuisance Regression failed for Subject: $subject_id | Session: $session" >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Nuisance Regression for Subject: $subject_id | Session: $session" >&2
-
-    ## ------------------------ Step 6: Extract Results -------------------------
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting extraction of results for Subject: $subject_id | Session: $session" >&2
-
-    bash "$EXTRACT_RESULTS_SCRIPT" \
-        -s "$subject_id" \
-        -e "$session" \
-        -w "$functional_dir" \
-        -f "$FSF_TYPE" \
-        -r "$RESULTS_DIR" \
-        > "${subject_session_log_dir}/extract_results.out" 2> "${subject_session_log_dir}/extract_results.err"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Extraction of results failed for Subject: $subject_id | Session: $session" >&2
-        echo "${subject_id},${session}" >> "$ERROR_LOG"
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed extraction of results for Subject: $subject_id | Session: $session" >&2
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] All processing steps completed successfully for Subject: $subject_id | Session: $session" >&2
-
-EOF
-
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
 }
 
-export -f process_subject_session
-export INPUT_DIR
-export RECON_ALL_DIR
-export CORES_PER_TASK
-export RECON_ALL_SCRIPT
-export ANATPROC_SCRIPT
-export FMRI_PREPROC_SCRIPT
-export REGISTER_SCRIPT
-export Processing_CW_SCRIPT
-export NUISANCE_REGRESSION_SCRIPT
-export EXTRACT_RESULTS_SCRIPT
-export FWHM
-export SIGMA
-export HIGHP
-export LOWP
-export MAIN_LOG_DIR
-export ERROR_LOG
-export tissuepriors_dir
-export template_dir
-export RESULTS_DIR
-export TR
-export TE
-export N_VOLS
-export FSF_TYPE
+record_error() {
+    local step="$1"
+    local subject_id="$2"
+    local session="${3:-}"
+    local error_msg="$4"
+    
+    mkdir -p "$ERROR_LOG_DIR"
+    
+    local error_detail_file="${ERROR_LOG_DIR}/errors_${CURRENT_DATE}.log"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] Step ${step} - Subject ${subject_id}${session:+ Session ${session}} - ${error_msg}" >> "$error_detail_file"
+    
+    # Add to failed subjects list
+    if ! grep -q "^${subject_id}${session:+_${session}}$" "$ERROR_SUBJECTS_FILE" 2>/dev/null; then
+        echo "${subject_id}${session:+_${session}}" >> "$ERROR_SUBJECTS_FILE"
+    fi
+}
 
-# ---------------------------- Main Execution ---------------------------------
 
-tasks=()
-
-for subject_dir in "$INPUT_DIR"/*/; do
-    subject_id=$(basename "$subject_dir")
-
-    for session_dir in "$subject_dir"*/; do
-        relative_path="${session_dir#$INPUT_DIR/}"
-        slash_count=$(grep -o "/" <<< "$relative_path" | wc -l)
-
-        if [ "$slash_count" -eq 3 ]; then
-            IFS='/' read -r subject_id session subdir <<< "$relative_path"
-
-            if [[ -z "$subject_id" || -z "$session" || -z "$subdir" ]]; then
-                echo "WARNING: Skipping malformed path: $session_dir" >&2
-                continue
-            fi
-        elif [ "$slash_count" -eq 2 ]; then
-            IFS='/' read -r subject_id subdir <<< "$relative_path"
-
-            if [[ -z "$subject_id" || -z "$subdir" ]]; then
-                echo "WARNING: Skipping malformed path: $session_dir" >&2
-                continue
-            fi
-
-            session="None" 
-        else
-            echo "WARNING: Skipping malformed path: $session_dir" >&2
-            continue
-        fi
-
-        anat_file="${session_dir}/anat/*T1w.nii.gz"
-        if compgen -G "$anat_file" > /dev/null; then
-            tasks+=("$subject_id" "$session" "$anat_file")
-            # echo "Added Task - Subject ID: $subject_id, Session: $session" >&2
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: anat.nii.gz not found for Subject: $subject_id | Session: $session. Skipping." >&2
+setup_directories() {
+    local base_dir="$1"
+    
+    log "Setting up directories with proper permissions..."
+    
+    # Create all required directories
+    local dirs=(
+        "${base_dir}"
+        "${base_dir}/error_logs"
+        "${base_dir}/recon_all"
+        "${base_dir}/logs"
+        "${base_dir}/results"
+    )
+    
+    for dir in "${dirs[@]}"; do
+        if ! mkdir -p "$dir"; then
+            log "ERROR" "Failed to create directory: $dir"
+            return 1
         fi
     done
-done
+    
+    # Set permissions
+    if [ -w "${base_dir}" ]; then
+        chmod -R 777 "${base_dir}"
+    else
+        log "WARNING" "Cannot set permissions. Please run:"
+        log "sudo chmod -R 777 ${base_dir}"
+    fi
+    
+    # Verify directories are writable
+    for dir in "${dirs[@]}"; do
+        if [ ! -w "$dir" ]; then
+            log "ERROR" "Directory not writable: $dir"
+            return 1
+        fi
+    done
+    
+    return 0
+}
 
-total_tasks=$(( ${#tasks[@]} / 3 ))
 
-task_list=()
-for ((i=0; i<${#tasks[@]}; i+=3)); do
-    task_list+=("${tasks[i]} ${tasks[i+1]} ${tasks[i+2]}")
-done
+validate_parameters() {
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Constructed Task List: ${#task_list[@]} tasks found." >&2
+    for dir in "$INPUT_DIR" "$STANDARD_DIR" "$TEMPLATE_DIR"; do
+        if [ ! -d "$dir" ]; then
+            log "ERROR" "Directory does not exist: $dir"
+            return 1
+        fi
+    done
 
-# ---------------------------- Run Tasks in Parallel ---------------------------
+    # Check numeric parameters
+    local num_params=(
+        "NUM_THREADS:$NUM_THREADS"
+        "FWHM:$FWHM"
+        "SIGMA:$SIGMA"
+        "HIGHP:$HIGHP"
+        "LOWP:$LOWP"
+        "TR:$TR"
+        "TE:$TE"
+        "N_VOLS:$N_VOLS"
+    )
+    
+    for param in "${num_params[@]}"; do
+        local name="${param%%:*}"
+        local value="${param#*:}"
+        if ! [[ "$value" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+            log "ERROR" "Invalid $name: $value. Must be a positive number."
+            return 1
+        fi
+    done
 
-printf "%s\n" "${task_list[@]}" | parallel -j "$MAX_JOBS" --colsep ' ' process_subject_session {1} {2} {3}
+    return 0
+}
 
-# ---------------------------- Summary ------------------------------------------
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] All tasks completed. Total tasks processed: $total_tasks" >&2
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Check '$MAIN_LOG_DIR' for individual log files." >&2
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Check '$ERROR_LOG' for any errors encountered during processing." >&2
 
-# ---------------------------- Exit ---------------------------------------------
+run_step() {
+    local step="$1"
+    local cmd="$2"
+    local subject_id="$3"
+    local session="${4:-}"
+    
+    log "Starting Step $step for subject $subject_id${session:+ session $session}..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN: Would execute: $cmd"
+        return 0
+    fi
+    
+    # Run command and capture output
+    local temp_log=$(mktemp)
+    if ! eval "$cmd" 2>&1 | tee "$temp_log"; then
+        local error_msg=$(tail -n 5 "$temp_log")
+        record_error "$step" "$subject_id" "$session" "$error_msg"
+        rm "$temp_log"
+        log "Step $step failed for subject $subject_id${session:+ session $session}"
+        return 1
+    fi
+    rm "$temp_log"
+    
+    log "Step $step completed successfully for subject $subject_id${session:+ session $session}"
+    return 0
+}
 
-exit 0
+process_subject() {
+    local subject_id="$1"
+    local session="${2:-}"
+    
+    log "Processing subject $subject_id${session:+ session $session}..."
+    
+    [ "$DRY_RUN" = "true" ] && DRY_RUN_FLAG="-d" || DRY_RUN_FLAG=""
+    [ "$VERBOSE" = "true" ] && VERBOSE_FLAG="-v" || VERBOSE_FLAG=""
+    [ "$SKIP_EXISTING" = "true" ] && SKIP_EXISTING_FLAG="-x" || SKIP_EXISTING_FLAG=""
+    
+    # Step 0: ReconAll Processing
+    run_step "0" "bash FC_step0.sh \
+        -i \"$INPUT_DIR\" \
+        -o \"$OUTPUT_DIR/recon_all\" \
+        -c \"$NUM_THREADS\" \
+        -p \"$FILE_PATTERN\" \
+        ${PROCESSING_MODE:+-m \"$PROCESSING_MODE\"} \
+        -l \"$LOG_DIR\" \
+        ${EXPERT_FILE:+-e \"$EXPERT_FILE\"} \
+        ${MAX_TIME:+-t \"$MAX_TIME\"} \
+        $SKIP_EXISTING_FLAG \
+        $DRY_RUN_FLAG \
+        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+    
+    # Step 1: Anatomical Preprocessing
+    run_step "1" "bash FC_step1 \
+        -i \"$INPUT_DIR\" \
+        -o \"$OUTPUT_DIR\" \
+        -r \"$OUTPUT_DIR/recon_all\" \
+        -c \"$NUM_THREADS\" \
+        -l \"$LOG_DIR\" \
+        $SKIP_EXISTING_FLAG \
+        $DRY_RUN_FLAG \
+        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+    
+    
+    # Step 2: Functional Preprocessing
+    run_step "2" "bash FC_step2 \
+        -i \"$INPUT_DIR\" \
+        -o \"$OUTPUT_DIR\" \
+        -n \"$NUM_THREADS\" \
+        -w \"$FWHM\" \
+        -g \"$SIGMA\" \
+        -h \"$HIGHP\" \
+        -l \"$LOWP\" \
+        -d \"$LOG_DIR\" \
+        $SKIP_EXISTING_FLAG \
+        $DRY_RUN_FLAG \
+        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+    
+    # Step 3: Registration
+    run_step "3" "bash FC_step3 \
+        -i \"$INPUT_DIR\" \
+        -o \"$OUTPUT_DIR\" \
+        -s \"$STANDARD_DIR\" \
+        -n \"$NUM_THREADS\" \
+        -l \"$LOG_DIR\" \
+        $SKIP_EXISTING_FLAG \
+        $DRY_RUN_FLAG \
+        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+
+    # Step 4: Tissue Segmentation
+    run_step "4" "bash FC_step4 \
+        -i \"$INPUT_DIR\" \
+        -o \"$OUTPUT_DIR\" \
+        -s \"$STANDARD_DIR\" \
+        -n \"$NUM_THREADS\" \
+        -g \"$SIGMA\" \
+        -l \"$LOG_DIR\" \
+        $SKIP_EXISTING_FLAG \
+        $DRY_RUN_FLAG \
+        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+    
+    for fsf_type in "${FSF_TYPES[@]}"; do
+        run_step "5-${fsf_type}" "bash FC_step5 \
+            -i \"$INPUT_DIR\" \
+            -o \"$OUTPUT_DIR\" \
+            -t \"$TEMPLATE_DIR\" \
+            -r \"$TR\" \
+            -e \"$TE\" \
+            -v \"$N_VOLS\" \
+            -f \"$fsf_type\" \
+            $SKIP_EXISTING_FLAG \
+            $DRY_RUN_FLAG \
+            $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+    done
+
+    for fsf_type in "${FSF_TYPES[@]}"; do
+        local step_name="6-${fsf_type}"
+        run_step "$step_name" "bash FC_step6 \
+            -i \"$INPUT_DIR\" \
+            -o \"$OUTPUT_DIR\" \
+            -f \"$fsf_type\" \
+            -l \"$LOG_DIR\" \
+            $SKIP_EXISTING_FLAG \
+            $DRY_RUN_FLAG \
+            $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+    done
+
+
+    log "All steps completed for subject $subject_id${session:+ session $session}"
+    return 0
+}
+
+# ---------------------------- Main Pipeline --------------------------------
+main() {
+    # Create and verify output directory structure
+    mkdir -p "$OUTPUT_DIR" "$ERROR_LOG_DIR"
+    
+    # Initialize error log file
+    : > "$ERROR_SUBJECTS_FILE"
+
+    if [ -z "$LOG_DIR" ]; then
+        LOG_DIR="$OUTPUT_DIR/logs"
+    fi
+    mkdir -p "$LOG_DIR"
+    
+    if ! validate_parameters; then
+        exit 1
+    fi
+    # Verify directory permissions
+    if [ ! -w "$OUTPUT_DIR" ] || [ ! -w "$ERROR_LOG_DIR" ]; then
+        log "ERROR: Output directories not writable"
+        log "Please run: sudo chmod -R 777 $OUTPUT_DIR"
+        exit 1
+    fi
+    
+    # Create temporary file for subject list
+    temp_file=$(mktemp)
+    trap 'rm -f "$temp_file"' EXIT
+    
+    # Find subjects and sessions
+    log "Scanning input directory for subjects..."
+    while IFS= read -r dir; do
+        subject_dir=$(basename "$dir")
+        
+        if [[ -d "$dir/func" ]]; then
+            echo "$subject_dir \"\"" >> "$temp_file"
+        else
+            while IFS= read -r session_dir; do
+                session=$(basename "$session_dir")
+                if [[ -d "$session_dir/func" ]]; then
+                    echo "$subject_dir $session" >> "$temp_file"
+                fi
+            done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
+        fi
+    done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
+    
+    total_subjects=$(wc -l < "$temp_file")
+    log "Found $total_subjects subjects/sessions to process"
+    
+    if [ "$total_subjects" -eq 0 ]; then
+        log "ERROR: No subjects found"
+        exit 1
+    fi
+    
+    # Process each subject
+    while IFS= read -r line; do
+        read -r subject_id session <<< "$line"
+        process_subject "$subject_id" "$session"
+    done < "$temp_file"
+    
+    # Report results
+    local error_count=0
+    if [ -f "$ERROR_SUBJECTS_FILE" ]; then
+        error_count=$(wc -l < "$ERROR_SUBJECTS_FILE")
+    fi
+    
+    if [ "$error_count" -gt 0 ]; then
+        log "Processing completed with errors."
+        log "Failed subjects ($error_count):"
+        cat "$ERROR_SUBJECTS_FILE"
+        log "See detailed error logs in: $ERROR_LOG_DIR"
+        return 1
+    else
+        log "All processing steps completed successfully"
+        return 0
+    fi
+}
+
+# ---------------------------- Execute Main --------------------------------
+
+main
