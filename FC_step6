@@ -1,78 +1,190 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # =============================================================================
-# Script: extract_results.sh
+# Script: FC_step6
 # Description:
-#   Extracts preprocessed fMRI data and organizes it into a specified directory structure.
-#   The results are saved in 'results/NoGRS' and 'results/GRS' folders, organized by subject ID and session.
+#   Enhanced results extraction script that:
+#   1. Extracts preprocessed fMRI data
+#   2. Organizes results into NoGRS and GRS folders
+#   3. Supports both single-subject and batch processing
 # =============================================================================
+
+# ---------------------------- Configuration ----------------------------------
+
+INPUT_DIR=""
+OUTPUT_DIR=""
+FSF_TYPE=""
+LOG_DIR=""
+SKIP_EXISTING=false
+DRY_RUN=false
+VERBOSE=false
 
 # ---------------------------- Usage Function --------------------------------
 
 usage() {
-    echo "Usage: $0 -s <subj_id> -c <session> -w <working_dir> -f <fsf_type> [-h]" >&2
+    echo "Enhanced Results Extraction Script"
+    echo "Usage: $0 [options]" >&2
     echo ""
-    echo "Options:"
-    echo "  -s    Subject ID (required)"
-    echo "  -c    Session name (e.g., baseline, followup_1) (required)"
-    echo "  -w    Working directory (required)"
-    echo "  -f    fsf_type: NoGRS or GRS (required)"
+    echo "Required Arguments:"
+    echo "  -i    Input data directory"
+    echo "  -o    Output directory"
+    echo "  -f    FSF type (NoGRS or GRS)"
+    echo ""
+    echo "Optional Arguments:"
+    echo "  -l    Log directory (default: output_dir/logs)"
+    echo "  -x    Skip existing processed subjects"
+    echo "  -d    Dry run (show commands without executing)"
+    echo "  -v    Verbose output"
     echo "  -h    Display this help message"
     exit 1
 }
 
-# ---------------------------- Argument Parsing ------------------------------
+# ---------------------------- Functions -------------------------------------
 
-# Initialize variables
-SUBJ_ID=""
-SESSION=""
-WORKING_DIR=""
-FSF_TYPE=""
+log() {
+    local level="$1"
+    shift
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+    if [ ! -z "$LOG_DIR" ]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/extract_$(date +'%Y%m%d').log"
+    fi
+}
 
-while getopts ":s:c:w:f:h" opt; do
+validate_input() {
+    if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$FSF_TYPE" ]; then
+        log "ERROR" "Input directory, output directory, and FSF type must be specified."
+        usage
+    fi
+
+    if ! [[ "$FSF_TYPE" =~ ^(NoGRS|GRS)$ ]]; then
+        log "ERROR" "FSF type must be either NoGRS or GRS"
+        exit 1
+    fi
+
+    if [ ! -d "$INPUT_DIR" ]; then
+        log "ERROR" "Input directory '$INPUT_DIR' does not exist."
+        exit 1
+    fi
+}
+
+process_subject() {
+    local subject_id="$1"
+    local session="$2"
+    
+    # Source directory (from processed data)
+    local processed_dir="${OUTPUT_DIR}/${subject_id}"
+    [ ! -z "$session" ] && [ "$session" != "\"\"" ] && processed_dir="${processed_dir}/${session}"
+    
+    local source_file="${processed_dir}/func/rest_res2standard.nii.gz"
+    
+    # Modified target directory and filename
+    local target_dir="${OUTPUT_DIR}/results"
+    mkdir -p "$target_dir"
+    
+    # Create target filename based on presence of session
+    local target_filename
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+        target_filename="${subject_id}_${FSF_TYPE}.nii.gz"
+    else
+        target_filename="${subject_id}_${session}_${FSF_TYPE}.nii.gz"
+    fi
+    
+    local target_file="${target_dir}/${target_filename}"
+    
+    if [ ! -f "$source_file" ]; then
+        log "ERROR" "Source file not found: $source_file"
+        return 1
+    fi
+    
+    if [ "$SKIP_EXISTING" = true ] && [ -f "$target_file" ]; then
+        log "INFO" "Results already exist for $target_filename. Skipping."
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN" "Would copy $source_file to $target_file"
+        return 0
+    fi
+    
+    if ! cp "$source_file" "$target_file"; then
+        log "ERROR" "Failed to copy file for $target_filename"
+        return 1
+    fi
+    
+    log "SUCCESS" "Extracted results as $target_filename"
+    return 0
+}
+
+# ---------------------------- Main Script ----------------------------------
+
+# Process command line arguments
+while getopts "i:o:f:l:xdvh" opt; do
     case ${opt} in
-        s ) SUBJ_ID="$OPTARG" ;;
-        c ) SESSION="$OPTARG" ;;
-        w ) WORKING_DIR="$OPTARG" ;;
-        f ) FSF_TYPE="$OPTARG" ;;
-        h ) usage ;;
-        \? ) echo "Invalid Option: -$OPTARG" >&2; usage ;;
-        : ) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+        i) INPUT_DIR="$OPTARG";;
+        o) OUTPUT_DIR="$OPTARG";;
+        f) FSF_TYPE="$OPTARG";;
+        l) LOG_DIR="$OPTARG";;
+        x) SKIP_EXISTING=true;;
+        d) DRY_RUN=true;;
+        v) VERBOSE=true;;
+        h) usage;;
+        \?) log "ERROR" "Invalid Option: -$OPTARG"; usage;;
+        :) log "ERROR" "Option -$OPTARG requires an argument."; usage;;
     esac
 done
 
-# ---------------------------- Validation -------------------------------------
 
-if [[ -z "${SUBJ_ID}" || -z "${SESSION}" || -z "${WORKING_DIR}" || -z "${FSF_TYPE}" ]]; then
-    echo "ERROR: Missing required arguments." >&2
-    usage
+validate_input
+
+
+if [ -z "$LOG_DIR" ]; then
+    LOG_DIR="$OUTPUT_DIR/logs"
 fi
+mkdir -p "$LOG_DIR"
 
-if [[ "$FSF_TYPE" != "NoGRS" && "$FSF_TYPE" != "GRS" ]]; then
-    echo "ERROR: Invalid fsf_type. Please use NoGRS or GRS." >&2
+# Create temporary file for subject list
+temp_file=$(mktemp)
+trap 'rm -f "$temp_file"' EXIT
+
+# Find subjects and sessions
+log "INFO" "Scanning input directory for subjects..."
+while IFS= read -r dir; do
+    subject_dir=$(basename "$dir")
+    
+    if [[ -d "$dir/func" ]]; then
+        echo "$subject_dir \"\"" >> "$temp_file"
+    else
+        while IFS= read -r session_dir; do
+            session=$(basename "$session_dir")
+            if [[ -d "$session_dir/func" ]]; then
+                echo "$subject_dir $session" >> "$temp_file"
+            fi
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
+    fi
+done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
+
+total_subjects=$(wc -l < "$temp_file")
+log "INFO" "Found $total_subjects subject/session combinations to process"
+
+if [ "$total_subjects" -eq 0 ]; then
+    log "ERROR" "No subjects found in input directory"
     exit 1
 fi
 
-# ---------------------------- Setup ------------------------------------------
-
-# Define the path to the preprocessed result file
-result_file="${WORKING_DIR}/${SUBJ_ID}/${SESSION}/func/rest_res2standard.nii.gz"
-
-# Define the target directory based on fsf_type, subject ID, and session
-target_dir="${WORKING_DIR}/results/${FSF_TYPE}/${SUBJ_ID}/${SESSION}"
-
-# Define the target file path
-target_file="${target_dir}/rest_res2standard.nii.gz"
-
-# Create the target directory
-mkdir -p "${target_dir}"
-
-# ---------------------------- Copying the File ------------------------------
-
-if [ -f "${result_file}" ]; then
-    cp "${result_file}" "${target_file}"
-    echo "File ${result_file} copied to ${target_file}"
-else
-    echo "Source file ${result_file} does not exist!" >&2
-    exit 1
+if [ "$DRY_RUN" = true ]; then
+    log "DRY-RUN" "Would process the following subjects:"
+    cat "$temp_file"
+    exit 0
 fi
+
+# Process subjects
+export -f process_subject
+export -f log
+export INPUT_DIR OUTPUT_DIR FSF_TYPE LOG_DIR SKIP_EXISTING DRY_RUN VERBOSE
+
+parallel --progress --colsep ' ' \
+    process_subject {1} {2} < "$temp_file"
+
+log "SUCCESS" "All results extracted successfully"

@@ -3,196 +3,341 @@
 set -euo pipefail
 
 # =============================================================================
-# Script: Anatproc.sh
+# Script: FC_step4
 # Description:
-#   Performs anatomical processing for a specific subject and session.
-#   Steps include:
-#     1. Register CSF and WM to functional and standard spaces.
-#     2. Smooth and threshold probability maps.
-#     3. Apply masks to functional data.
+#   Enhanced tissue processing script that:
+#   1. Registers CSF and WM to functional and standard spaces
+#   2. Smooths and thresholds probability maps
+#   3. Applies masks to functional data
+#   4. Supports both single-subject and batch processing
 # =============================================================================
 
 # ---------------------------- Configuration ----------------------------------
 
-SUBJ_ID=""
-SESSION=""
-NUM_THREADS=3
-FUNC_DIR=""
-ANAT_DIR=""
-tissuepriors_dir=""
-SIGMA=""
-LOG_FILE=""
+INPUT_DIR=""
+OUTPUT_DIR=""
+STANDARD_DIR=""
+NUM_THREADS=4
+SIGMA=2.548
+LOG_DIR=""
+SKIP_EXISTING=false
+DRY_RUN=false
+VERBOSE=false
 
 # ---------------------------- Usage Function --------------------------------
 
 usage() {
-    echo "Usage: $0 -s <subj_id> -e <session> -n <num_threads> -f <func_dir> -a <anat_dir> -t <tissuepriors_dir> -g <sigma> -l <log_file> [-h]" >&2
+    echo "Enhanced Tissue Processing Script"
+    echo "Usage: $0 [options]" >&2
     echo ""
-    echo "Options:"
-    echo "  -s    Subject ID (required)"
-    echo "  -e    Session ID (required)"
+    echo "Required Arguments:"
+    echo "  -i    Input data directory"
+    echo "  -o    Output directory"
+    echo "  -s    Standard brain directory (containing tissue priors)"
+    echo ""
+    echo "Optional Arguments:"
     echo "  -n    Number of threads (default: $NUM_THREADS)"
-    echo "  -f    Functional directory (required)"
-    echo "  -a    Anatomical directory (required)"
-    echo "  -t    tissuepriors_dir (required)"
-    echo "  -g    Sigma value for Gaussian smoothing (required)"
-    echo "  -l    Log file path (required)"
+    echo "  -g    Sigma for smoothing (default: $SIGMA)"
+    echo "  -l    Log directory (default: output_dir/logs)"
+    echo "  -x    Skip existing processed subjects"
+    echo "  -d    Dry run (show commands without executing)"
+    echo "  -v    Verbose output"
     echo "  -h    Display this help message"
     exit 1
 }
 
-# ---------------------------- Argument Parsing ------------------------------
+# ---------------------------- Functions -------------------------------------
 
-while getopts ":s:e:n:f:a:t:g:l:h" opt; do
+log() {
+    local level="$1"
+    shift
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+    if [ ! -z "$LOG_DIR" ]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/tissue_$(date +'%Y%m%d').log"
+    fi
+}
+
+check_prerequisites() {
+    local missing_prereqs=()
+    
+    # Check for FSL tools
+    for cmd in flirt fslmaths; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_prereqs+=("FSL ($cmd)")
+        fi
+    done
+    
+    # Check for GNU Parallel
+    if ! command -v parallel >/dev/null 2>&1; then
+        missing_prereqs+=("GNU Parallel")
+    fi
+    
+    if [ ${#missing_prereqs[@]} -ne 0 ]; then
+        log "ERROR" "Missing prerequisites: ${missing_prereqs[*]}"
+        exit 1
+    fi
+}
+
+validate_input() {
+    if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$STANDARD_DIR" ]; then
+        log "ERROR" "Input, output, and standard directories must be specified."
+        usage
+    fi
+
+    local required_files=(
+        "$STANDARD_DIR/3mm/avg152T1_csf_bin.nii.gz"
+        "$STANDARD_DIR/3mm/avg152T1_white_bin.nii.gz"
+    )
+
+    for file in "${required_files[@]}"; do
+        if [ ! -f "$file" ]; then
+            log "ERROR" "Required standard file not found: $file"
+            exit 1
+        fi
+    done
+
+    if ! [[ "$SIGMA" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        log "ERROR" "Sigma must be a positive number."
+        exit 1
+    fi
+}
+
+process_tissue_maps() {
+    local subject_id="$1"
+    local session="$2"
+    
+    local output_dir
+    local func_dir
+    local anat_dir
+    
+    # Set up directory structure
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+        output_dir="${OUTPUT_DIR}/${subject_id}"
+        func_dir="${output_dir}/func"
+        anat_dir="${output_dir}/anat"
+    else
+        output_dir="${OUTPUT_DIR}/${subject_id}/${session}"
+        func_dir="${output_dir}/func"
+        anat_dir="${output_dir}/anat"
+    fi
+    
+    local reg_dir="${func_dir}/reg_dir"
+    local segment_dir="${func_dir}/seg"
+    mkdir -p "$segment_dir"
+    
+    log "INFO" "Processing tissue maps for subject $subject_id${session:+ session $session}"
+    
+    # Check required input files
+    local required_inputs=(
+        "$func_dir/rest_pp_mask.nii.gz"
+        "$reg_dir/example_func.nii.gz"
+        "$reg_dir/highres2example_func.mat"
+        "$reg_dir/example_func2standard.mat"
+        "$reg_dir/standard2example_func.mat"
+        "$anat_dir/segment_prob_0.nii.gz"
+        "$anat_dir/segment_prob_2.nii.gz"
+    )
+    
+    for file in "${required_inputs[@]}"; do
+        if [ ! -f "$file" ]; then
+            log "ERROR" "Required input file not found: $file"
+            return 1
+        fi
+    done
+    
+    # Skip if already processed
+    if [ "$SKIP_EXISTING" = true ] && [ -f "${segment_dir}/wm_mask.nii.gz" ] && [ -f "${segment_dir}/csf_mask.nii.gz" ]; then
+        log "INFO" "Tissue maps already processed for subject $subject_id${session:+ session $session}. Skipping."
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN" "Would process tissue maps for subject $subject_id${session:+ session $session}"
+        return 0
+    fi
+    
+    # Copy global mask
+    cp "${func_dir}/rest_pp_mask.nii.gz" "${segment_dir}/global_mask.nii.gz"
+    
+    # Process CSF
+    log "INFO" "Processing CSF maps..."
+    
+    # Register CSF to functional space
+    if ! flirt -in "${anat_dir}/segment_prob_0.nii.gz" \
+               -ref "${reg_dir}/example_func.nii.gz" \
+               -applyxfm -init "${reg_dir}/highres2example_func.mat" \
+               -out "${segment_dir}/csf2func.nii.gz"; then
+        log "ERROR" "Failed to register CSF to functional space"
+        return 1
+    fi
+    
+    # Smooth CSF
+    fslmaths "${segment_dir}/csf2func.nii.gz" \
+             -kernel gauss "$SIGMA" -fmean "${segment_dir}/csf_sm.nii.gz"
+    
+    # Register to standard space
+    flirt -in "${segment_dir}/csf_sm.nii.gz" \
+          -ref "${reg_dir}/standard.nii.gz" \
+          -applyxfm -init "${reg_dir}/example_func2standard.mat" \
+          -out "${segment_dir}/csf2standard.nii.gz"
+    
+    # Apply tissue prior
+    fslmaths "${segment_dir}/csf2standard.nii.gz" \
+             -mas "${STANDARD_DIR}/3mm/avg152T1_csf_bin.nii.gz" \
+             "${segment_dir}/csf_masked.nii.gz"
+    
+    # Back to functional space
+    flirt -in "${segment_dir}/csf_masked.nii.gz" \
+          -ref "${reg_dir}/example_func.nii.gz" \
+          -applyxfm -init "${reg_dir}/standard2example_func.mat" \
+          -out "${segment_dir}/csf_native.nii.gz"
+    
+    # Threshold and mask
+    fslmaths "${segment_dir}/csf_native.nii.gz" \
+             -thr 0.4 -bin "${segment_dir}/csf_bin.nii.gz"
+    
+    fslmaths "${segment_dir}/csf_bin.nii.gz" \
+             -mas "${segment_dir}/global_mask.nii.gz" \
+             "${segment_dir}/csf_mask.nii.gz"
+    
+    # Process WM
+    log "INFO" "Processing WM maps..."
+    
+    # Register WM to functional space
+    if ! flirt -in "${anat_dir}/segment_prob_2.nii.gz" \
+               -ref "${reg_dir}/example_func.nii.gz" \
+               -applyxfm -init "${reg_dir}/highres2example_func.mat" \
+               -out "${segment_dir}/wm2func.nii.gz"; then
+        log "ERROR" "Failed to register WM to functional space"
+        return 1
+    fi
+    
+    # Smooth WM
+    fslmaths "${segment_dir}/wm2func.nii.gz" \
+             -kernel gauss "$SIGMA" -fmean "${segment_dir}/wm_sm.nii.gz"
+    
+    # Register to standard space
+    flirt -in "${segment_dir}/wm_sm.nii.gz" \
+          -ref "${reg_dir}/standard.nii.gz" \
+          -applyxfm -init "${reg_dir}/example_func2standard.mat" \
+          -out "${segment_dir}/wm2standard.nii.gz"
+    
+    # Apply tissue prior
+    fslmaths "${segment_dir}/wm2standard.nii.gz" \
+             -mas "${STANDARD_DIR}/3mm/avg152T1_white_bin.nii.gz" \
+             "${segment_dir}/wm_masked.nii.gz"
+    
+    # Back to functional space
+    flirt -in "${segment_dir}/wm_masked.nii.gz" \
+          -ref "${reg_dir}/example_func.nii.gz" \
+          -applyxfm -init "${reg_dir}/standard2example_func.mat" \
+          -out "${segment_dir}/wm_native.nii.gz"
+    
+    # Threshold and mask
+    fslmaths "${segment_dir}/wm_native.nii.gz" \
+             -thr 0.66 -bin "${segment_dir}/wm_bin.nii.gz"
+    
+    fslmaths "${segment_dir}/wm_bin.nii.gz" \
+             -mas "${segment_dir}/global_mask.nii.gz" \
+             "${segment_dir}/wm_mask.nii.gz"
+    
+    # Verify outputs
+    local required_outputs=(
+        "${segment_dir}/csf_mask.nii.gz"
+        "${segment_dir}/wm_mask.nii.gz"
+    )
+    
+    for file in "${required_outputs[@]}"; do
+        if [ ! -f "$file" ]; then
+            log "ERROR" "Required output file not found: $file"
+            return 1
+        fi
+    done
+    
+    log "SUCCESS" "Tissue processing completed for subject $subject_id${session:+ session $session}"
+    return 0
+}
+
+# ---------------------------- Main Script ----------------------------------
+
+# Process command line arguments
+while getopts "i:o:s:n:g:l:xdvh" opt; do
     case ${opt} in
-        s) SUBJ_ID="$OPTARG";;
-        e) SESSION="$OPTARG";;
+        i) INPUT_DIR="$OPTARG";;
+        o) OUTPUT_DIR="$OPTARG";;
+        s) STANDARD_DIR="$OPTARG";;
         n) NUM_THREADS="$OPTARG";;
-        f) FUNC_DIR="$OPTARG";;
-        a) ANAT_DIR="$OPTARG";;
-        t) tissuepriors_dir="$OPTARG";;
         g) SIGMA="$OPTARG";;
-        l) LOG_FILE="$OPTARG";;
-        h) usage; exit;;
-        \?) echo "Invalid Option: -$OPTARG" >&2; usage; exit;;
-        :) echo "Option -$OPTARG requires an argument." >&2; usage; exit;;
+        l) LOG_DIR="$OPTARG";;
+        x) SKIP_EXISTING=true;;
+        d) DRY_RUN=true;;
+        v) VERBOSE=true;;
+        h) usage;;
+        \?) log "ERROR" "Invalid Option: -$OPTARG"; usage;;
+        :) log "ERROR" "Option -$OPTARG requires an argument."; usage;;
     esac
 done
 
-# ---------------------------- Validation -------------------------------------
+# Setup and validation
+check_prerequisites
+validate_input
 
-if [[ -z "$SUBJ_ID" || -z "$SESSION" || -z "$FUNC_DIR" || -z "$ANAT_DIR" || -z "$tissuepriors_dir" || -z "$SIGMA" || -z "$LOG_FILE" ]]; then
-    echo "ERROR: Missing required arguments." >&2
-    usage
+# Set up logging directory
+if [ -z "$LOG_DIR" ]; then
+    LOG_DIR="$OUTPUT_DIR/logs"
 fi
+mkdir -p "$LOG_DIR"
 
-if ! [[ "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: Number of threads must be a positive integer." >&2
+# Create temporary file for subject list
+temp_file=$(mktemp)
+trap 'rm -f "$temp_file"' EXIT
+
+# Find subjects and sessions
+log "INFO" "Scanning input directory for subjects..."
+while IFS= read -r dir; do
+    subject_dir=$(basename "$dir")
+    
+    if [[ -d "$dir/func" ]]; then
+        echo "$subject_dir \"\"" >> "$temp_file"
+    else
+        while IFS= read -r session_dir; do
+            session=$(basename "$session_dir")
+            if [[ -d "$session_dir/func" ]]; then
+                echo "$subject_dir $session" >> "$temp_file"
+            fi
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
+    fi
+done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
+
+total_subjects=$(wc -l < "$temp_file")
+log "INFO" "Found $total_subjects subject/session combinations to process"
+
+if [ "$total_subjects" -eq 0 ]; then
+    log "ERROR" "No subjects found in input directory"
     exit 1
 fi
 
-# ---------------------------- Setup ------------------------------------------
-
-export OMP_NUM_THREADS="$NUM_THREADS"
-
-# Redirect all output to log file
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Anatproc for Subject: $SUBJ_ID | Session: $SESSION"
-
-# Define directories
-REG_DIR="${FUNC_DIR}/reg_dir"
-SEGMENT_DIR="${FUNC_DIR}/seg"
-
-# Create necessary directories
-mkdir -p "$SEGMENT_DIR"
-
-# Copy global mask
-if [ ! -f "${FUNC_DIR}/rest_pp_mask.nii.gz" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Functional mask '${FUNC_DIR}/rest_pp_mask.nii.gz' does not exist."
-    exit 1
+if [ "$DRY_RUN" = true ]; then
+    log "DRY-RUN" "Would process the following subjects:"
+    cat "$temp_file"
+    exit 0
 fi
 
-cp "${FUNC_DIR}/rest_pp_mask.nii.gz" "${SEGMENT_DIR}/global_mask.nii.gz"
+# Process subjects in parallel
+export -f process_tissue_maps
+export -f log
+export OUTPUT_DIR LOG_DIR SKIP_EXISTING DRY_RUN VERBOSE STANDARD_DIR SIGMA
 
-# ---------------------------- Processing CSF --------------------------------
+# Set maximum parallel jobs based on available cores
+TOTAL_CORES=$(nproc)
+MAX_JOBS=$(( TOTAL_CORES / NUM_THREADS ))
+if [ "$MAX_JOBS" -lt 1 ]; then
+    MAX_JOBS=1
+fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering CSF to functional space."
+log "INFO" "Processing with maximum $MAX_JOBS parallel jobs"
 
-# 5. Register CSF to native (functional) space
-flirt -in "${ANAT_DIR}/segment_prob_0.nii.gz" \
-      -ref "${REG_DIR}/example_func.nii.gz" \
-      -applyxfm \
-      -init "${REG_DIR}/highres2example_func.mat" \
-      -out "${SEGMENT_DIR}/csf2func.nii.gz"
+parallel --progress --jobs "$MAX_JOBS" --colsep ' ' \
+    process_tissue_maps {1} {2} < "$temp_file"
 
-# 6. Smooth CSF image to match functional smoothing
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Smoothing CSF image with sigma=$SIGMA."
-
-fslmaths "${SEGMENT_DIR}/csf2func.nii.gz" -kernel gauss "$SIGMA" -fmean "${SEGMENT_DIR}/csf_sm.nii.gz"
-
-# 7. Register CSF to standard space
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering CSF to standard space."
-
-flirt -in "${SEGMENT_DIR}/csf_sm.nii.gz" \
-      -ref "${REG_DIR}/standard.nii.gz" \
-      -applyxfm \
-      -init "${REG_DIR}/example_func2standard.mat" \
-      -out "${SEGMENT_DIR}/csf2standard.nii.gz"
-
-# 8. Find overlap with prior
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying tissue prior for CSF."
-
-fslmaths "${SEGMENT_DIR}/csf2standard.nii.gz" -mas "${tissuepriors_dir}/3mm/avg152T1_csf_bin.nii.gz" "${SEGMENT_DIR}/csf_masked.nii.gz"
-
-# 9. Revert back to functional space
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering CSF back to functional space."
-
-flirt -in "${SEGMENT_DIR}/csf_masked.nii.gz" \
-      -ref "${REG_DIR}/example_func.nii.gz" \
-      -applyxfm \
-      -init "${REG_DIR}/standard2example_func.mat" \
-      -out "${SEGMENT_DIR}/csf_native.nii.gz"
-
-# 10. Threshold and binarize probability map of CSF
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Thresholding and binarizing CSF map."
-
-fslmaths "${SEGMENT_DIR}/csf_native.nii.gz" -thr 0.4 -bin "${SEGMENT_DIR}/csf_bin.nii.gz"
-
-# 11. Mask again by the subject's functional
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying functional mask to CSF map."
-
-fslmaths "${SEGMENT_DIR}/csf_bin.nii.gz" -mas "${SEGMENT_DIR}/global_mask.nii.gz" "${SEGMENT_DIR}/csf_mask.nii.gz"
-
-# ---------------------------- Processing WM ---------------------------------
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering WM to functional space."
-
-# 12. Register White Matter (WM) segmentation to native (functional) space
-flirt -in "${ANAT_DIR}/segment_prob_2.nii.gz" \
-      -ref "${REG_DIR}/example_func.nii.gz" \
-      -applyxfm \
-      -init "${REG_DIR}/highres2example_func.mat" \
-      -out "${SEGMENT_DIR}/wm2func.nii.gz"
-
-# 13. Smooth WM image to match functional smoothing
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Smoothing WM image with sigma=$SIGMA."
-
-fslmaths "${SEGMENT_DIR}/wm2func.nii.gz" -kernel gauss "$SIGMA" -fmean "${SEGMENT_DIR}/wm_sm.nii.gz"
-
-# 14. Register WM to standard space
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering WM to standard space."
-
-flirt -in "${SEGMENT_DIR}/wm_sm.nii.gz" \
-      -ref "${REG_DIR}/standard.nii.gz" \
-      -applyxfm \
-      -init "${REG_DIR}/example_func2standard.mat" \
-      -out "${SEGMENT_DIR}/wm2standard.nii.gz"
-
-# 15. Find overlap with prior
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying tissue prior for WM."
-
-fslmaths "${SEGMENT_DIR}/wm2standard.nii.gz" -mas "${tissuepriors_dir}/3mm/avg152T1_white_bin.nii.gz" "${SEGMENT_DIR}/wm_masked.nii.gz"
-
-# 16. Revert back to functional space
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Registering WM back to functional space."
-
-flirt -in "${SEGMENT_DIR}/wm_masked.nii.gz" \
-      -ref "${REG_DIR}/example_func.nii.gz" \
-      -applyxfm \
-      -init "${REG_DIR}/standard2example_func.mat" \
-      -out "${SEGMENT_DIR}/wm_native.nii.gz"
-
-# 17. Threshold and binarize probability map of WM
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Thresholding and binarizing WM map."
-
-fslmaths "${SEGMENT_DIR}/wm_native.nii.gz" -thr 0.66 -bin "${SEGMENT_DIR}/wm_bin.nii.gz"
-
-# 18. Mask again by the subject's functional
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Applying functional mask to WM map."
-
-fslmaths "${SEGMENT_DIR}/wm_bin.nii.gz" -mas "${SEGMENT_DIR}/global_mask.nii.gz" "${SEGMENT_DIR}/wm_mask.nii.gz"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed Anatproc for Subject: $SUBJ_ID | Session: $SESSION"
-
-exit 0
+log "SUCCESS" "All tissue processing completed"

@@ -1,210 +1,371 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
 
 # =============================================================================
-# Script: nuisance_regression.sh
+# Script: FC_step5
 # Description:
-#   Performs nuisance regression for a specific subject.
-#   Steps include:
-#     1. Splitting motion parameters
-#     2. Extracting signals (global, CSF, WM)
-#     3. Modifying .fsf file based on fsf_type
-#     4. Running FEAT model
-#     5. Getting residuals and processing
-#     6. Resampling residuals to MNI space
+#   Enhanced nuisance regression script that performs:
+#   1. Splits motion parameters
+#   2. Extracts signals (global, CSF, WM)
+#   3. Runs FEAT model based on FSF type
+#   4. Gets residuals and processes them
+#   5. Resamples residuals to MNI space
 # =============================================================================
 
-# ---------------------------- Usage Function --------------------------------
+# ---------------------------- Configuration ----------------------------------
 
-usage() {
-    echo "Usage: $0 -s <subj_id> -n <num_threads> -w <working_dir> -a <anat_dir> -t <template_dir> -p <tissuepriors_dir> -r <TR> -e <TE> -v <n_vols> -f <fsf_type> -l <log_file> [-h]" >&2
-    echo ""
-    echo "Options:"
-    echo "  -s    Subject ID (required)"
-    echo "  -n    Number of threads (default: 3)"
-    echo "  -w    Working directory (required)"
-    echo "  -a    Anatomy directory (required)"
-    echo "  -t    Template directory (required)"
-    echo "  -p    Tissue priors directory (required)"
-    echo "  -r    Repetition time TR (required)"
-    echo "  -e    Echo time TE (required)"
-    echo "  -v    Number of volumes n_vols (required)"
-    echo "  -f    fsf_type: NO_GRD or Retain_GRS (required)"
-    echo "  -l    Log file path (required)"
-    echo "  -h    Display this help message"
-    exit 1
-}
-
-# ---------------------------- Argument Parsing ------------------------------
-
-# Initialize variables
-SUBJ_ID=""
-NUM_THREADS=3
-WORKING_DIR=""
-ANAT_DIR=""
+INPUT_DIR=""
+OUTPUT_DIR=""
 TEMPLATE_DIR=""
-TISSUEPRIORS_DIR=""
+NUM_THREADS=4
 TR=""
 TE=""
 N_VOLS=""
 FSF_TYPE=""
-LOG_FILE=""
+LOG_DIR=""
+SKIP_EXISTING=false
+DRY_RUN=false
+VERBOSE=false
 
-while getopts ":s:n:w:a:t:p:r:e:v:f:l:h" opt; do
+# ---------------------------- Usage Function --------------------------------
+
+usage() {
+    echo "Enhanced Nuisance Regression Script"
+    echo "Usage: $0 [options]" >&2
+    echo ""
+    echo "Required Arguments:"
+    echo "  -i    Input data directory"
+    echo "  -o    Output directory"
+    echo "  -t    Template directory (containing FSF templates)"
+    echo "  -r    TR value"
+    echo "  -e    TE value"
+    echo "  -v    Number of volumes"
+    echo "  -f    FSF type (NO_GRD or Retain_GRS)"
+    echo ""
+    echo "Optional Arguments:"
+    echo "  -n    Number of threads (default: $NUM_THREADS)"
+    echo "  -l    Log directory (default: output_dir/logs)"
+    echo "  -x    Skip existing processed subjects"
+    echo "  -d    Dry run (show commands without executing)"
+    echo "  -b    Verbose output"
+    echo "  -h    Display this help message"
+    exit 1
+}
+
+# ---------------------------- Functions -------------------------------------
+
+log() {
+    local level="$1"
+    shift
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+    if [ ! -z "$LOG_DIR" ]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/nuisance_$(date +'%Y%m%d').log"
+    fi
+}
+
+check_prerequisites() {
+    local missing_prereqs=()
+    
+    # Check for AFNI tools
+    for cmd in 3dmaskave 3dTstat 3dcalc 3dBrickStat; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_prereqs+=("AFNI ($cmd)")
+        fi
+    done
+    
+    # Check for FSL tools
+    for cmd in feat_model film_gls flirt; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_prereqs+=("FSL ($cmd)")
+        fi
+    done
+    
+    if [ ${#missing_prereqs[@]} -ne 0 ]; then
+        log "ERROR" "Missing prerequisites: ${missing_prereqs[*]}"
+        exit 1
+    fi
+}
+
+validate_input() {
+    if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$TEMPLATE_DIR" ] || \
+       [ -z "$TR" ] || [ -z "$TE" ] || [ -z "$N_VOLS" ] || [ -z "$FSF_TYPE" ]; then
+        log "ERROR" "All required parameters must be specified."
+        usage
+    fi
+
+    if ! [[ "$FSF_TYPE" =~ ^(NO_GRD|Retain_GRS)$ ]]; then
+        log "ERROR" "FSF_TYPE must be either NO_GRD or Retain_GRS"
+        exit 1
+    fi
+
+    if ! [[ "$N_VOLS" =~ ^[0-9]+$ ]]; then
+        log "ERROR" "Number of volumes must be a positive integer"
+        exit 1
+    fi
+
+    if ! [[ "$TR" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$TE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        log "ERROR" "TR and TE must be positive numbers"
+        exit 1
+    fi
+
+    # Check FSF templates
+    if [ ! -f "${TEMPLATE_DIR}/nuisance_N.fsf" ] || [ ! -f "${TEMPLATE_DIR}/nuisance_R.fsf" ]; then
+        log "ERROR" "FSF templates not found in template directory"
+        exit 1
+    fi
+}
+
+process_nuisance() {
+    local subject_id="$1"
+    local session="$2"
+    
+    local output_dir
+    local func_dir
+    
+    # Set up directory structure
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+        output_dir="${OUTPUT_DIR}/${subject_id}"
+        func_dir="${output_dir}/func"
+    else
+        output_dir="${OUTPUT_DIR}/${subject_id}/${session}"
+        func_dir="${output_dir}/func"
+    fi
+    
+    local reg_dir="${func_dir}/reg_dir"
+    local segment_dir="${func_dir}/seg"
+    local nuisance_dir="${func_dir}/nuisance"
+
+    [ -d "$nuisance_dir" ] && rm -rf "$nuisance_dir"
+    
+    mkdir -p "$nuisance_dir"
+
+    log "INFO" "Processing nuisance regression for subject $subject_id${session:+ session $session}"
+    
+    # Check required input files
+    local required_inputs=(
+        "${func_dir}/rest_mc.1D"
+        "${func_dir}/rest_pp.nii.gz"
+        "${func_dir}/rest_pp_mask.nii.gz"
+        "${segment_dir}/global_mask.nii.gz"
+        "${segment_dir}/csf_mask.nii.gz"
+        "${segment_dir}/wm_mask.nii.gz"
+    )
+    
+    for file in "${required_inputs[@]}"; do
+        if [ ! -f "$file" ]; then
+            log "ERROR" "Required input file not found: $file"
+            return 1
+        fi
+    done
+    
+    # Skip if already processed
+    if [ "$SKIP_EXISTING" = true ] && [ -f "${func_dir}/rest_res2standard.nii.gz" ]; then
+        log "INFO" "Nuisance regression already completed for subject $subject_id${session:+ session $session}. Skipping."
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN" "Would process nuisance regression for subject $subject_id${session:+ session $session}"
+        return 0
+    fi
+    
+    # Split motion parameters
+    log "INFO" "Splitting motion parameters..."
+    for i in {1..6}; do
+        awk -v col=$i '{print $col}' "${func_dir}/rest_mc.1D" > "${nuisance_dir}/mc${i}.1D"
+    done
+    
+    # Extract signals
+    log "INFO" "Extracting tissue signals..."
+    3dmaskave -mask "${segment_dir}/global_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/global.1D"
+    3dmaskave -mask "${segment_dir}/csf_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/csf.1D"
+    3dmaskave -mask "${segment_dir}/wm_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/wm.1D"
+    
+    # Create FSF file
+    log "INFO" "Creating FSF file for $FSF_TYPE regression..."
+    
+    local regstandard_path="$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz"
+    
+    # Copy preprocessed data to nuisance directory
+    cp "${func_dir}/rest_pp.nii.gz" "${nuisance_dir}/"
+    
+    if [ "$FSF_TYPE" = "NO_GRD" ]; then
+        sed -e "s:nuisance_dir:${nuisance_dir}:g" \
+            -e "s:nuisance_model_outputdir:${nuisance_dir}/residuals.feat:g" \
+            -e "s:nuisance_model_TR:${TR}:g" \
+            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
+            -e "s:nuisance_model_input_data:${nuisance_dir}/rest_pp.nii.gz:g" \
+            -e "s:nuisance_model_TE:${TE}:g" \
+            -e "s:standard_mni_2mm:${regstandard_path}:g" \
+            "${TEMPLATE_DIR}/nuisance_N.fsf" > "${nuisance_dir}/nuisance.fsf"
+    else
+        sed -e "s:nuisance_output:${nuisance_dir}/residuals.feat:g" \
+            -e "s:standard_mni_2mm:${regstandard_path}:g" \
+            -e "s:feat_files_1:${nuisance_dir}/rest_pp:g" \
+            -e "s:fmri_1:${nuisance_dir}/csf.1D:g" \
+            -e "s:fmri_2:${nuisance_dir}/wm.1D:g" \
+            -e "s:fmri_3:${nuisance_dir}/mc1.1D:g" \
+            -e "s:fmri_4:${nuisance_dir}/mc2.1D:g" \
+            -e "s:fmri_5:${nuisance_dir}/mc3.1D:g" \
+            -e "s:fmri_6:${nuisance_dir}/mc4.1D:g" \
+            -e "s:fmri_7:${nuisance_dir}/mc5.1D:g" \
+            -e "s:nuisance_model_TR:${TR}:g" \
+            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
+            -e "s:nuisance_model_TE:${TE}:g" \
+            -e "s:fmri_8:${nuisance_dir}/mc6.1D:g" \
+            "${TEMPLATE_DIR}/nuisance_R.fsf" > "${nuisance_dir}/nuisance.fsf"
+    fi
+    
+    log "INFO" "Running FEAT model..."
+    feat_model "${nuisance_dir}/nuisance"
+    
+    # Get and format minimum value properly
+    local minVal
+    minVal=$(3dBrickStat -min -mask "${func_dir}/rest_pp_mask.nii.gz" "${func_dir}/rest_pp.nii.gz" | tr -d '[:space:]')
+    
+    log "INFO" "Running FILM GLM with threshold $minVal..."
+    
+    # Fixed stats directory path
+    if ! film_gls --rn="${nuisance_dir}/stats" \
+              --noest --sa --ms=5 \
+              --in="${nuisance_dir}/rest_pp.nii.gz" \
+              --pd="${nuisance_dir}/nuisance.mat" \
+              --thr="${minVal}"; then
+        log "ERROR" "FILM GLM failed"
+        return 1
+    fi
+
+    # Wait for file to be created
+    sleep 5
+    
+    # Fixed residuals file path
+    local res4d_file="${nuisance_dir}/stats/res4d.nii.gz"
+    
+    if [ -f "$res4d_file" ]; then
+        log "INFO" "Processing residuals..."
+        3dTstat -mean -prefix "${nuisance_dir}/stats/res4d_mean.nii.gz" \
+                "$res4d_file"
+        
+        3dcalc -a "$res4d_file" \
+               -b "${nuisance_dir}/stats/res4d_mean.nii.gz" \
+               -expr '(a-b)+100' \
+               -prefix "${func_dir}/rest_res.nii.gz"
+        
+        # Check if rest_res.nii.gz was created
+        if [ -f "${func_dir}/rest_res.nii.gz" ]; then
+            log "INFO" "Resampling to standard space..."
+            if ! flirt -ref "${reg_dir}/standard.nii.gz" \
+                      -in "${func_dir}/rest_res.nii.gz" \
+                      -out "${func_dir}/rest_res2standard.nii.gz" \
+                      -applyxfm -init "${reg_dir}/example_func2standard.mat" \
+                      -interp trilinear; then
+                log "ERROR" "Standard space resampling failed"
+                return 1
+            fi
+        else
+            log "ERROR" "Failed to create rest_res.nii.gz"
+            return 1
+        fi
+    else
+        log "ERROR" "FILM GLM did not produce res4d.nii.gz at expected location: $res4d_file"
+        return 1
+    fi
+    
+    # Verify final output
+    if [ ! -f "${func_dir}/rest_res2standard.nii.gz" ]; then
+        log "ERROR" "Failed to create final output file"
+        return 1
+    fi
+    
+    log "SUCCESS" "Nuisance regression completed for subject $subject_id${session:+ session $session}"
+    return 0
+}
+# ---------------------------- Main Script ----------------------------------
+
+# Process command line arguments
+while getopts "i:o:t:r:e:v:f:n:l:xdbh" opt; do
     case ${opt} in
-        s ) SUBJ_ID="$OPTARG" ;;
-        n ) NUM_THREADS="$OPTARG" ;;
-        w ) WORKING_DIR="$OPTARG" ;;
-        a ) ANAT_DIR="$OPTARG" ;;
-        t ) TEMPLATE_DIR="$OPTARG" ;;
-        p ) TISSUEPRIORS_DIR="$OPTARG" ;;
-        r ) TR="$OPTARG" ;;
-        e ) TE="$OPTARG" ;;
-        v ) N_VOLS="$OPTARG" ;;
-        f ) FSF_TYPE="$OPTARG" ;;
-        l ) LOG_FILE="$OPTARG" ;;
-        h ) usage ;;
-        \? ) echo "Invalid Option: -$OPTARG" >&2; usage ;;
-        : ) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+        i) INPUT_DIR="$OPTARG";;
+        o) OUTPUT_DIR="$OPTARG";;
+        t) TEMPLATE_DIR="$OPTARG";;
+        r) TR="$OPTARG";;
+        e) TE="$OPTARG";;
+        v) N_VOLS="$OPTARG";;
+        f) FSF_TYPE="$OPTARG";;
+        n) NUM_THREADS="$OPTARG";;
+        l) LOG_DIR="$OPTARG";;
+        x) SKIP_EXISTING=true;;
+        d) DRY_RUN=true;;
+        b) VERBOSE=true;;
+        h) usage;;
+        \?) log "ERROR" "Invalid Option: -$OPTARG"; usage;;
+        :) log "ERROR" "Option -$OPTARG requires an argument."; usage;;
     esac
 done
 
-# ---------------------------- Validation -------------------------------------
+# Setup and validation
+check_prerequisites
+validate_input
 
-if [[ -z "${SUBJ_ID}" || -z "${WORKING_DIR}" || -z "${ANAT_DIR}" || -z "${TEMPLATE_DIR}" || -z "${TISSUEPRIORS_DIR}" || -z "${TR}" || -z "${TE}" || -z "${N_VOLS}" || -z "${FSF_TYPE}" || -z "${LOG_FILE}" ]]; then
-    echo "ERROR: Missing required arguments." >&2
-    usage
+# Set up logging directory
+if [ -z "$LOG_DIR" ]; then
+    LOG_DIR="$OUTPUT_DIR/logs"
 fi
+mkdir -p "$LOG_DIR"
 
-if ! [[ "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: Number of threads must be a positive integer." >&2
-    exit 1
-fi
+# Create temporary file for subject list
+temp_file=$(mktemp)
+trap 'rm -f "$temp_file"' EXIT
 
-if [[ "$FSF_TYPE" != "NO_GRD" && "$FSF_TYPE" != "Retain_GRS" ]]; then
-    echo "ERROR: Invalid fsf_type. Please use NO_GRD or Retain_GRS." >&2
-    exit 1
-fi
-
-# ---------------------------- Setup ------------------------------------------
-
-export OMP_NUM_THREADS="$NUM_THREADS"
-
-# Redirect all output to log file
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Preprocessing subject: $SUBJ_ID"
-
-# Define directories
-anat_dir="$ANAT_DIR"
-func_dir="$WORKING_DIR"
-reg_dir="${func_dir}/reg_dir"
-segment_dir="${func_dir}/seg"
-nuisance_dir="${func_dir}/nuisance"
-regstandard_path="$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz"
-
-# Create necessary directories
-mkdir -p "$nuisance_dir"
-
-# Check if required files exist
-required_files=(
-    "${func_dir}/rest_mc.1D"
-    "${func_dir}/rest_pp.nii.gz"
-    "${segment_dir}/global_mask.nii.gz"
-    "${segment_dir}/csf_mask.nii.gz"
-    "${segment_dir}/wm_mask.nii.gz"
-    # "${TISSUEPRIORS_DIR}/3mm/avg152T1_csf_bin.nii.gz"
-    # "${TISSUEPRIORS_DIR}/3mm/avg152T1_white_bin.nii.gz"
-    "${TEMPLATE_DIR}/nuisance_N.fsf"
-    "${TEMPLATE_DIR}/nuisance_R.fsf"
-)
-
-for file in "${required_files[@]}"; do
-    if [ ! -f "$file" ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Required file '$file' does not exist."
-        exit 1
+# Find subjects and sessions
+log "INFO" "Scanning input directory for subjects..."
+while IFS= read -r dir; do
+    subject_dir=$(basename "$dir")
+    
+    if [[ -d "$dir/func" ]]; then
+        echo "$subject_dir \"\"" >> "$temp_file"
+    else
+        while IFS= read -r session_dir; do
+            session=$(basename "$session_dir")
+            if [[ -d "$session_dir/func" ]]; then
+                echo "$subject_dir $session" >> "$temp_file"
+            fi
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
     fi
-done
+done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
 
-# ---------------------------- Splitting Motion Parameters --------------------
+total_subjects=$(wc -l < "$temp_file")
+log "INFO" "Found $total_subjects subject/session combinations to process"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Splitting motion parameters for $SUBJ_ID"
-
-for i in {1..6}; do
-    awk -v col=$i '{print $col}' "${func_dir}/rest_mc.1D" > "${nuisance_dir}/mc${i}.1D"
-done
-
-# ---------------------------- Extracting Signals -----------------------------
-
-# Extract signal for global, CSF, and WM
-
-## 3. Global
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Extracting global signal for ${SUBJ_ID}"
-3dmaskave -mask "${segment_dir}/global_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/global.1D"
-
-## 4. CSF
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Extracting signal from CSF for ${SUBJ_ID}"
-3dmaskave -mask "${segment_dir}/csf_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/csf.1D"
-
-## 5. WM
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Extracting signal from White Matter for ${SUBJ_ID}"
-3dmaskave -mask "${segment_dir}/wm_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/wm.1D"
-
-# ---------------------------- Creating FSF File ------------------------------
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Modifying FSF file based on fsf_type: ${FSF_TYPE}"
-
-if [ "$FSF_TYPE" == "NO_GRD" ]; then
-    # Nuisance without Global signal
-    sed -e "s:nuisance_dir:${nuisance_dir}:g" \
-        -e "s:nuisance_model_outputdir:${nuisance_dir}/residuals.feat:g" \
-        -e "s:nuisance_model_TR:${TR}:g" \
-        -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
-        -e "s:nuisance_model_input_data:${func_dir}/rest_pp.nii.gz:g" \
-        -e "s:nuisance_model_TE:${TE}:g" \
-        -e "s:standard_mni_2mm:${regstandard_path}:g" \
-        "${TEMPLATE_DIR}/nuisance_N.fsf" > "${nuisance_dir}/nuisance.fsf"
-elif [ "$FSF_TYPE" == "Retain_GRS" ]; then 
-    # Nuisance with retained Global signal
-    sed -e "s:nuisance_output:${nuisance_dir}/residuals.feat:g" \
-        -e "s:standard_mni_2mm:${regstandard_path}:g" \
-        -e "s:feat_files_1:${nuisance_dir}/rest_pp:g" \
-        -e "s:fmri_1:${nuisance_dir}/csf.1D:g" \
-        -e "s:fmri_2:${nuisance_dir}/wm.1D:g" \
-        -e "s:fmri_3:${nuisance_dir}/mc1.1D:g" \
-        -e "s:fmri_4:${nuisance_dir}/mc2.1D:g" \
-        -e "s:fmri_5:${nuisance_dir}/mc3.1D:g" \
-        -e "s:fmri_6:${nuisance_dir}/mc4.1D:g" \
-        -e "s:fmri_7:${nuisance_dir}/mc5.1D:g" \
-        -e "s:nuisance_model_TR:${TR}:g" \
-        -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
-        -e "s:nuisance_model_TE:${TE}:g" \
-        -e "s:fmri_8:${nuisance_dir}/mc6.1D:g" \
-        "${TEMPLATE_DIR}/nuisance_R.fsf" > "${nuisance_dir}/nuisance.fsf"
+if [ "$total_subjects" -eq 0 ]; then
+    log "ERROR" "No subjects found in input directory"
+    exit 1
 fi
 
-# ---------------------------- Running FEAT Model ------------------------------
+if [ "$DRY_RUN" = true ]; then
+    log "DRY-RUN" "Would process the following subjects:"
+    cat "$temp_file"
+    exit 0
+fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running FEAT model for nuisance regression."
-feat_model "${nuisance_dir}/nuisance"
+# Process subjects in parallel
+export -f process_nuisance
+export -f log
+export OUTPUT_DIR LOG_DIR SKIP_EXISTING DRY_RUN VERBOSE
+export TEMPLATE_DIR TR TE N_VOLS FSF_TYPE
 
-# ---------------------------- Getting Residuals ------------------------------
+# Set maximum parallel jobs based on available cores
+TOTAL_CORES=$(nproc)
+MAX_JOBS=$(( TOTAL_CORES / NUM_THREADS ))
+if [ "$MAX_JOBS" -lt 1 ]; then
+    MAX_JOBS=1
+fi
 
-minVal=$(3dBrickStat -min -mask "${func_dir}/rest_pp_mask.nii.gz" "${func_dir}/rest_pp.nii.gz")
+log "INFO" "Processing with maximum $MAX_JOBS parallel jobs"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running FILM to get residuals."
-film_gls --rn=${nuisance_dir}/stats --noest --sa --ms=5 --in=${func_dir}/rest_pp.nii.gz --pd=${nuisance_dir}/nuisance.mat --thr=${minVal}
+# Fixed parallel command
+parallel --progress --jobs "$MAX_JOBS" --colsep ' ' \
+    process_nuisance {1} {2} < "$temp_file"
 
-# ---------------------------- Demeaning Residuals ----------------------------
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Demeaning residuals and adding 100."
-3dTstat -mean -prefix ${nuisance_dir}/stats/res4d_mean.nii.gz ${nuisance_dir}/stats/res4d.nii.gz
-3dcalc -a ${nuisance_dir}/stats/res4d.nii.gz -b ${nuisance_dir}/stats/res4d_mean.nii.gz -expr '(a-b)+100' -prefix ${func_dir}/rest_res.nii.gz
-
-# ---------------------------- Resampling Residuals --------------------------
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resampling residuals to MNI space."
-flirt -ref ${reg_dir}/standard.nii.gz -in ${func_dir}/rest_res.nii.gz -out ${func_dir}/rest_res2standard.nii.gz -applyxfm -init ${reg_dir}/example_func2standard.mat -interp trilinear
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Nuisance regression completed successfully for Subject: $SUBJ_ID."
+log "SUCCESS" "All nuisance regression processing completed"
