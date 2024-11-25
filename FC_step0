@@ -188,8 +188,8 @@ process_subject() {
     case "$PROCESSING_MODE" in
         "default")
             steps=(
-                # "-i \"$anat_file\" -autorecon1"
-                # "-gcareg"
+                "-i \"$anat_file\" -autorecon1"
+                "-gcareg"
                 "-canorm"
                 "-careg"
                 "-calabel"
