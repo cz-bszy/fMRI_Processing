@@ -40,8 +40,8 @@ usage() {
     echo "  -t    Template directory (containing FSF templates)"
     echo "  -r    TR value"
     echo "  -e    TE value"
-    echo "  -v    Number of volumes"
-    echo "  -f    FSF type (NO_GRD or Retain_GRS)"
+    echo "  -s    Number of volumes"
+    echo "  -f    FSF type (NoGRS or Retain_GRS)"
     echo ""
     echo "Optional Arguments:"
     echo "  -n    Number of threads (default: $NUM_THREADS)"
@@ -94,8 +94,8 @@ validate_input() {
         usage
     fi
 
-    if ! [[ "$FSF_TYPE" =~ ^(NO_GRD|Retain_GRS)$ ]]; then
-        log "ERROR" "FSF_TYPE must be either NO_GRD or Retain_GRS"
+    if ! [[ "$FSF_TYPE" =~ ^(NoGRS|Retain_GRS)$ ]]; then
+        log "ERROR" "FSF_TYPE must be either NoGRS or Retain_GRS"
         exit 1
     fi
 
@@ -136,8 +136,31 @@ process_nuisance() {
     local segment_dir="${func_dir}/seg"
     local nuisance_dir="${func_dir}/nuisance"
 
-    [ -d "$nuisance_dir" ] && rm -rf "$nuisance_dir"
+    # ------------------- Added Cleanup Section -------------------
+    # Delete previously generated files and directories to ensure a clean start
+    log "INFO" "Cleaning up previous outputs for subject $subject_id${session:+ session $session}"
     
+    # Remove nuisance directory if it exists
+    if [ -d "$nuisance_dir" ]; then
+        rm -rf "$nuisance_dir"
+        log "INFO" "Removed existing nuisance directory: $nuisance_dir"
+    fi
+
+    # Remove residual files if they exist
+    local residual_files=(
+        "${func_dir}/rest_res.nii.gz"
+        "${func_dir}/rest_res2standard.nii.gz"
+    )
+
+    for res_file in "${residual_files[@]}"; do
+        if [ -f "$res_file" ]; then
+            rm -f "$res_file"
+            log "INFO" "Removed existing file: $res_file"
+        fi
+    done
+    # ------------------- End of Cleanup Section -------------------
+
+    # Create necessary directories
     mkdir -p "$nuisance_dir"
 
     log "INFO" "Processing nuisance regression for subject $subject_id${session:+ session $session}"
@@ -190,7 +213,7 @@ process_nuisance() {
     # Copy preprocessed data to nuisance directory
     cp "${func_dir}/rest_pp.nii.gz" "${nuisance_dir}/"
     
-    if [ "$FSF_TYPE" = "NO_GRD" ]; then
+    if [ "$FSF_TYPE" = "NoGRS" ]; then
         sed -e "s:nuisance_dir:${nuisance_dir}:g" \
             -e "s:nuisance_model_outputdir:${nuisance_dir}/residuals.feat:g" \
             -e "s:nuisance_model_TR:${TR}:g" \
@@ -284,14 +307,14 @@ process_nuisance() {
 # ---------------------------- Main Script ----------------------------------
 
 # Process command line arguments
-while getopts "i:o:t:r:e:v:f:n:l:xdbh" opt; do
+while getopts "i:o:t:r:e:s:f:n:l:xdbh" opt; do
     case ${opt} in
         i) INPUT_DIR="$OPTARG";;
         o) OUTPUT_DIR="$OPTARG";;
         t) TEMPLATE_DIR="$OPTARG";;
         r) TR="$OPTARG";;
         e) TE="$OPTARG";;
-        v) N_VOLS="$OPTARG";;
+        s) N_VOLS="$OPTARG";;
         f) FSF_TYPE="$OPTARG";;
         n) NUM_THREADS="$OPTARG";;
         l) LOG_DIR="$OPTARG";;

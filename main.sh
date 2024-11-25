@@ -15,35 +15,37 @@ set -euo pipefail
 INPUT_DIR="/mnt/e/ABIDE/Data/Test"          # Raw data directory
 OUTPUT_DIR="/mnt/e/ABIDE/Outputs/Test1"     # Output directory
 STANDARD_DIR="./standard"                   # Standard brain templates
+TISSUES_DIR="./tissuepriors"
 TEMPLATE_DIR="./template"                   # FSF templates
 
 # Processing parameters
 NUM_THREADS=4                               # Number of CPU threads to use
 FWHM=6.0                                    # Full Width at Half Maximum for smoothing
-SIGMA=2.548                                # Sigma for smoothing (FWHM = 2.355 * SIGMA)
-HIGHP=0.1                                  # High-pass filter in Hz
-LOWP=0.01                                  # Low-pass filter in Hz
-TR=2.0                                     # Repetition Time
-TE=30                                      # Echo Time
-N_VOLS=200                                 # Number of volumes
+SIGMA=2.548                                 # Sigma for smoothing (FWHM = 2.355 * SIGMA)
+HIGHP=0.1                                   # High-pass filter in Hz
+LOWP=0.01                                   # Low-pass filter in Hz
+TR=2.0                                      # Repetition Time
+TE=30                                       # Echo Time
+N_VOLS=200                                  # Number of volumes
 
-FSF_TYPES=("Retain_GRS")                   # Default FSF types
+# FSF_TYPES=("NoGRS")
+FSF_TYPES=("Retain_GRS")            # Default FSF types "NoGRS" 
 FILE_PATTERN="*T1w.nii*"                   # Pattern for anatomical files
 PROCESSING_MODE="default"                   # Processing mode for recon-all
 
 # Additional parameters
 EXPERT_FILE=""                             # Expert options file for recon-all
 MAX_TIME=""                                # Maximum time per subject
-MAX_RETRIES=2                              # Maximum number of retries per step
+MAX_RETRIES=1                              # Maximum number of retries per step
 
 # Processing flags
 SKIP_EXISTING=true                         # Skip if output exists
-DRY_RUN=false                             # Show commands without executing
-VERBOSE=true                              # Show detailed output
+DRY_RUN=false                              # Show commands without executing
+VERBOSE=true                               # Show detailed output
 
 # Error tracking configuration
-ERROR_LOG_DIR="${OUTPUT_DIR}/error_logs"    # Will be created if not exists
-ERROR_SUBJECTS_FILE=""                      # Will be set in main
+ERROR_LOG_DIR="${OUTPUT_DIR}/error_logs"   # Will be created if not exists
+ERROR_SUBJECTS_FILE=""                     # Will be set in main
 LOG_DIR=""                                 # Will be set to $OUTPUT_DIR/logs
 CURRENT_DATE=$(date +"%Y%m%d")
 
@@ -58,7 +60,7 @@ log() {
     shift
     local message="[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*"
     echo "$message"
-    if [ ! -z "$LOG_DIR" ]; then
+    if [ -n "$LOG_DIR" ]; then
         echo "$message" >> "$LOG_DIR/pipeline_${CURRENT_DATE}.log"
     fi
 }
@@ -68,13 +70,13 @@ record_error() {
     local subject_id="$2"
     local session="${3:-}"
     local error_msg="$4"
-    
+
     mkdir -p "$ERROR_LOG_DIR"
-    
+
     local error_detail_file="${ERROR_LOG_DIR}/errors_${CURRENT_DATE}.log"
     local message="[$(date +'%Y-%m-%d %H:%M:%S')] Step ${step} - Subject ${subject_id}${session:+ Session ${session}} - ${error_msg}"
     echo "$message" >> "$error_detail_file"
-    
+
     if ! grep -q "^${subject_id}${session:+_${session}}$" "$ERROR_SUBJECTS_FILE" 2>/dev/null; then
         echo "${subject_id}${session:+_${session}}" >> "$ERROR_SUBJECTS_FILE"
     fi
@@ -88,33 +90,33 @@ setup_environment() {
         "3dcalc"       # AFNI
         "flirt"        # FSL registration
     )
-    
+
     for software in "${required_software[@]}"; do
         if ! command -v "$software" >/dev/null 2>&1; then
             log "ERROR" "Required software not found: $software"
             return 1
         fi
     done
-    
+
     # Check environment variables
     if [ -z "${FREESURFER_HOME:-}" ]; then
         log "ERROR" "FREESURFER_HOME is not set"
         return 1
     fi
-    
+
     if [ -z "${FSLDIR:-}" ]; then
         log "ERROR" "FSLDIR is not set"
         return 1
     fi
-    
+
     return 0
 }
 
 setup_directories() {
     local base_dir="$1"
-    
+
     log "INFO" "Setting up directories with proper permissions..."
-    
+
     local dirs=(
         "${base_dir}"
         "${base_dir}/error_logs"
@@ -122,13 +124,13 @@ setup_directories() {
         "${base_dir}/logs"
         "${base_dir}/results"
     )
-    
+
     for dir in "${dirs[@]}"; do
         if ! mkdir -p "$dir"; then
             log "ERROR" "Failed to create directory: $dir"
             return 1
         fi
-        
+
         if [ ! -w "$dir" ]; then
             log "ERROR" "Directory not writable: $dir"
             if ! chmod -R 777 "$dir" 2>/dev/null; then
@@ -137,19 +139,19 @@ setup_directories() {
             fi
         fi
     done
-    
+
     return 0
 }
 
 validate_parameters() {
     # Check directories
-    for dir in "$INPUT_DIR" "$STANDARD_DIR" "$TEMPLATE_DIR"; do
+    for dir in "$INPUT_DIR" "$STANDARD_DIR" "$TEMPLATE_DIR" "$TISSUES_DIR"; do
         if [ ! -d "$dir" ]; then
             log "ERROR" "Directory does not exist: $dir"
             return 1
         fi
     done
-    
+
     # Check numeric parameters
     local num_params=(
         "NUM_THREADS:$NUM_THREADS"
@@ -161,7 +163,7 @@ validate_parameters() {
         "TE:$TE"
         "N_VOLS:$N_VOLS"
     )
-    
+
     for param in "${num_params[@]}"; do
         local name="${param%%:*}"
         local value="${param#*:}"
@@ -170,16 +172,16 @@ validate_parameters() {
             return 1
         fi
     done
-    
+
     # Validate FSF types
     for fsf_type in "${FSF_TYPES[@]}"; do
-        if [[ ! "$fsf_type" =~ ^(NO_GRD|Retain_GRS)$ ]]; then
+        if [[ ! "$fsf_type" =~ ^(NoGRS|Retain_GRS)$ ]]; then
             log "ERROR" "Invalid FSF type: $fsf_type"
-            log "ERROR" "Valid types are: NO_GRD, Retain_GRS"
+            log "ERROR" "Valid types are: NoGRS, Retain_GRS"
             return 1
         fi
     done
-    
+
     return 0
 }
 
@@ -188,7 +190,7 @@ validate_parameters() {
 check_previous_steps() {
     local subject_id="$1"
     local step="$2"
-    
+
     case "$step" in
         0)  # No prerequisites for step 0
             return 0
@@ -217,9 +219,19 @@ check_previous_steps() {
                 return 1
             fi
             ;;
-        5)  # Check tissue segmentation
+        5)  # Check tissue segmentation and confirm registration
             if [ ! -f "$OUTPUT_DIR/$subject_id/func/seg/wm_mask.nii.gz" ]; then
                 log "ERROR" "Tissue segmentation must complete before nuisance regression"
+                return 1
+            fi
+            if [ ! -f "$OUTPUT_DIR/$subject_id/func/reg_dir/example_func2standard.nii.gz" ]; then
+                log "ERROR" "Registration must complete before nuisance regression"
+                return 1
+            fi
+            ;;
+        6)  # Check nuisance regression output for specific FSF type
+            if [ ! -f "$OUTPUT_DIR/$subject_id/func/rest_res2standard.nii.gz" ]; then
+                log "ERROR" "Nuisance regression must complete before results extraction"
                 return 1
             fi
             ;;
@@ -232,51 +244,56 @@ run_step() {
     local cmd="$2"
     local subject_id="$3"
     local session="${4:-}"
-    
+
     log "INFO" "Starting Step $step for subject $subject_id${session:+ session $session}..."
-    
+
     if [ "$DRY_RUN" = true ]; then
         log "DRY-RUN" "Would execute: $cmd"
         return 0
     fi
-    
+
     local retry_count=0
     while [ $retry_count -lt $MAX_RETRIES ]; do
         # Create temporary log file
         local temp_log=$(mktemp)
-        
+
         if eval "$cmd" 2>&1 | tee "$temp_log"; then
             rm "$temp_log"
             log "SUCCESS" "Step $step completed for subject $subject_id${session:+ session $session}"
             return 0
         fi
-        
+
         retry_count=$((retry_count + 1))
         local error_msg=$(tail -n 5 "$temp_log")
         record_error "$step" "$subject_id" "$session" "Attempt $retry_count failed: $error_msg"
         rm "$temp_log"
-        
+
         if [ $retry_count -lt $MAX_RETRIES ]; then
             log "WARNING" "Retry $retry_count/$MAX_RETRIES for step $step..."
             sleep 5
         fi
     done
-    
+
     log "ERROR" "Step $step failed after $MAX_RETRIES attempts for subject $subject_id${session:+ session $session}"
     return 1
 }
 
-
 process_subject() {
     local subject_id="$1"
     local session="${2:-}"
-    
+
     log "INFO" "Processing subject $subject_id${session:+ session $session}..."
-    
+
     # Initialize flags
-    [ "$DRY_RUN" = "true" ] && DRY_RUN_FLAG="-d" || DRY_RUN_FLAG=""
-    [ "$VERBOSE" = "true" ] && VERBOSE_FLAG="-v" || VERBOSE_FLAG=""
-    [ "$SKIP_EXISTING" = "true" ] && SKIP_EXISTING_FLAG="-x" || SKIP_EXISTING_FLAG=""
+    # Note: Flags are now step-specific
+    # Define general flags that apply to all steps that support them
+    GENERAL_FLAGS=()
+    if [ "$SKIP_EXISTING" = true ]; then
+        GENERAL_FLAGS+=("-x")
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        GENERAL_FLAGS+=("-d")
+    fi
 
     # Get anatomical file path
     local anat_file
@@ -299,9 +316,8 @@ process_subject() {
         ${session:+-e \"$session\"} \
         -c \"$NUM_THREADS\" \
         -m \"default\" \
-        $SKIP_EXISTING_FLAG \
-        $DRY_RUN_FLAG \
-        $VERBOSE_FLAG" "$subject_id" "$session" || {
+        ${GENERAL_FLAGS[*]} \
+        -v" "$subject_id" "$session" || {  # Assuming FC_step0 supports -v
             log "ERROR" "ReconAll processing failed for subject $subject_id"
             return 1
         }
@@ -319,10 +335,10 @@ process_subject() {
         -r \"$OUTPUT_DIR/recon_all\" \
         -c \"$NUM_THREADS\" \
         -l \"$LOG_DIR\" \
-        $SKIP_EXISTING_FLAG \
-        $DRY_RUN_FLAG \
-        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+        ${GENERAL_FLAGS[*]} \
+        -v" "$subject_id" "$session" || return 1  # Assuming FC_step1 supports -v
 
+    # Step 2: Functional Preprocessing
     run_step "2" "bash FC_step2 \
         -i \"$INPUT_DIR\" \
         -o \"$OUTPUT_DIR\" \
@@ -332,10 +348,9 @@ process_subject() {
         -h \"$HIGHP\" \
         -l \"$LOWP\" \
         -d \"$LOG_DIR\" \
-        $SKIP_EXISTING_FLAG \
-        $DRY_RUN_FLAG \
-        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
-    
+        ${GENERAL_FLAGS[*]} \
+        -v" "$subject_id" "$session" || return 1  # Assuming FC_step2 supports -v
+
     # Step 3: Registration
     run_step "3" "bash FC_step3 \
         -i \"$INPUT_DIR\" \
@@ -343,56 +358,57 @@ process_subject() {
         -s \"$STANDARD_DIR\" \
         -n \"$NUM_THREADS\" \
         -l \"$LOG_DIR\" \
-        $SKIP_EXISTING_FLAG \
-        $DRY_RUN_FLAG \
-        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+        ${GENERAL_FLAGS[*]} \
+        -v" "$subject_id" "$session" || return 1  # Assuming FC_step3 supports -v
 
     # Step 4: Tissue Segmentation
     run_step "4" "bash FC_step4 \
         -i \"$INPUT_DIR\" \
         -o \"$OUTPUT_DIR\" \
-        -s \"$STANDARD_DIR\" \
+        -s \"$TISSUES_DIR\" \
         -n \"$NUM_THREADS\" \
         -g \"$SIGMA\" \
         -l \"$LOG_DIR\" \
-        $SKIP_EXISTING_FLAG \
-        $DRY_RUN_FLAG \
-        $VERBOSE_FLAG" "$subject_id" "$session" || return 1
-    
+        ${GENERAL_FLAGS[*]} \
+        -v" "$subject_id" "$session" || return 1  # Assuming FC_step4 supports -v
+
     # Step 5: Nuisance Regression for each FSF type
-    if ! check_previous_steps "$subject_id" "5" || [ "$SKIP_EXISTING" = "false" ]; then
-        for fsf_type in "${FSF_TYPES[@]}"; do
-            run_step "5-${fsf_type}" "bash FC_step5 \
-                -i \"$INPUT_DIR\" \
-                -o \"$OUTPUT_DIR\" \
-                -t \"$TEMPLATE_DIR\" \
-                -r \"$TR\" \
-                -e \"$TE\" \
-                -v \"$N_VOLS\" \
-                -f \"$fsf_type\" \
-                $SKIP_EXISTING_FLAG \
-                $DRY_RUN_FLAG \
-                $VERBOSE_FLAG" "$subject_id" "$session" || return 1
-        done
-    fi
+    for fsf_type in "${FSF_TYPES[@]}"; do
+        # if [ "$SKIP_EXISTING" = false ] || \
+        #    [ ! -f "${OUTPUT_DIR}/${subject_id}/func/rest_res2standard.nii.gz" ]; then
+        run_step "5-${fsf_type}" "bash FC_step5 \
+            -i \"$INPUT_DIR\" \
+            -o \"$OUTPUT_DIR\" \
+            -t \"$TEMPLATE_DIR\" \
+            -r \"$TR\" \
+            -e \"$TE\" \
+            -s \"$N_VOLS\" \
+            -f \"${fsf_type}\"" "$subject_id" "$session" || return 1
+        # else
+            # log "INFO" "Nuisance regression already completed for $fsf_type. Skipping."
+        # fi
+    done
 
     # Step 6: Results Extraction for each FSF type
     for fsf_type in "${FSF_TYPES[@]}"; do
-        local step_name="6-${fsf_type}"
-        run_step "$step_name" "bash FC_step6 \
-            -i \"$INPUT_DIR\" \
-            -o \"$OUTPUT_DIR\" \
-            -f \"$fsf_type\" \
-            -l \"$LOG_DIR\" \
-            $SKIP_EXISTING_FLAG \
-            $DRY_RUN_FLAG \
-            $VERBOSE_FLAG" "$subject_id" "$session" || return 1
+        local step5_output="${OUTPUT_DIR}/${subject_id}/func/rest_res2standard.nii.gz"
+        if [ -f "$step5_output" ] || [ "$SKIP_EXISTING" = false ]; then
+            local step_name="6-${fsf_type}"
+            run_step "$step_name" "bash FC_step6 \
+                -i \"$INPUT_DIR\" \
+                -o \"$OUTPUT_DIR\" \
+                -f \"${fsf_type}\" \
+                -l \"$LOG_DIR\" \
+                ${GENERAL_FLAGS[*]} \
+                -v" "$subject_id" "$session" || return 1  # Assuming FC_step6 supports -v
+        else
+            log "WARNING" "Skipping Step 6 for $fsf_type - Step 5 output not found"
+        fi
     done
 
     log "SUCCESS" "All steps completed for subject $subject_id${session:+ session $session}"
     return 0
 }
-
 
 generate_report() {
     local report_file="$OUTPUT_DIR/processing_report_${CURRENT_DATE}.txt"
@@ -410,13 +426,14 @@ generate_report() {
         echo "  - Threads: $NUM_THREADS"
         echo "  - FWHM: $FWHM"
         echo "  - Sigma: $SIGMA"
+        echo "  - Number Volume: $N_VOLS"
         echo "-------------------------"
         if [ -f "$ERROR_SUBJECTS_FILE" ] && [ -s "$ERROR_SUBJECTS_FILE" ]; then
             echo "Failed Subjects List:"
             cat "$ERROR_SUBJECTS_FILE"
         fi
     } > "$report_file"
-    
+
     log "INFO" "Processing report generated: $report_file"
 }
 
@@ -427,7 +444,7 @@ main() {
         LOG_DIR="$OUTPUT_DIR/logs"
     fi
     mkdir -p "$LOG_DIR"
-    
+
     # Initialize error tracking
     ERROR_SUBJECTS_FILE="${ERROR_LOG_DIR}/failed_subjects_${CURRENT_DATE}.txt"
     mkdir -p "$ERROR_LOG_DIR"
@@ -436,73 +453,72 @@ main() {
     # Create temporary directory for temp files
     TEMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TEMP_DIR"' EXIT
-    
-    local temp_file="$TEMP_DIR/subjects.txt"
-    : > "$temp_file"
-    
+
+    # Define a distinct temporary file for subjects
+    subjects_file="${TEMP_DIR}/subjects_list.txt"
+    : > "$subjects_file"
+
     # Validate environment and parameters
     log "INFO" "Validating environment and parameters..."
     if ! setup_environment || ! validate_parameters; then
         log "ERROR" "Validation failed. Check logs for details."
         exit 1
     fi
-    
+
     # Setup directories
     log "INFO" "Setting up directory structure..."
     if ! setup_directories "$OUTPUT_DIR"; then
         log "ERROR" "Failed to setup directories"
         exit 1
     fi
-    
-    # Create temporary file for subject list
-    local temp_file=$(mktemp)
-    trap 'rm -f "$temp_file"' EXIT
-    
+
     # Find subjects and sessions
     log "INFO" "Scanning input directory for subjects..."
     while IFS= read -r dir; do
         subject_dir=$(basename "$dir")
         if [[ -d "$dir/func" ]]; then
-            echo "$subject_dir \"\"" >> "$temp_file"
+            echo "$subject_dir \"\"" >> "$subjects_file"
         else
             while IFS= read -r session_dir; do
                 session=$(basename "$session_dir")
                 if [[ -d "$session_dir/func" ]]; then
-                    echo "$subject_dir $session" >> "$temp_file"
+                    echo "$subject_dir $session" >> "$subjects_file"
                 fi
             done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
         fi
     done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
-    
-    total_subjects=$(wc -l < "$temp_file")
+
+    total_subjects=$(wc -l < "$subjects_file")
     log "INFO" "Found $total_subjects subjects/sessions to process"
-    
+
     if [ "$total_subjects" -eq 0 ]; then
         log "ERROR" "No subjects found in input directory"
         exit 1
     fi
-    
+
     # Process subjects
     local failed_count=0
     while IFS= read -r line; do
+        # Use read with "set -u" to avoid unbound variable issues
+        # Ensure that session is read correctly, even if empty
         read -r subject_id session <<< "$line"
         log "INFO" "Starting pipeline for subject: $subject_id${session:+ session $session}"
         if ! process_subject "$subject_id" "$session"; then
             failed_count=$((failed_count + 1))
             log "ERROR" "Pipeline failed for subject: $subject_id${session:+ session $session}"
         fi
-    done < "$temp_file"
-    
+    done < "$subjects_file"
+
     # Generate final report
     generate_report
-    
+
     # Final status
     if [ "$failed_count" -gt 0 ]; then
         log "WARNING" "Processing completed with $failed_count failures"
-        return 1
+        exit 1
     else
         log "SUCCESS" "All processing completed successfully"
-        return 0
+        exit 0
     fi
 }
 

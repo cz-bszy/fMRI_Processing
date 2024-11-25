@@ -7,7 +7,7 @@ set -euo pipefail
 # Description:
 #   Enhanced results extraction script that:
 #   1. Extracts preprocessed fMRI data
-#   2. Organizes results into NoGRS and GRS folders
+#   2. Organizes results into NoGRS and Retain_GRS folders
 #   3. Supports both single-subject and batch processing
 # =============================================================================
 
@@ -30,7 +30,7 @@ usage() {
     echo "Required Arguments:"
     echo "  -i    Input data directory"
     echo "  -o    Output directory"
-    echo "  -f    FSF type (NoGRS or GRS)"
+    echo "  -f    FSF type (NoGRS or Retain_GRS)"
     echo ""
     echo "Optional Arguments:"
     echo "  -l    Log directory (default: output_dir/logs)"
@@ -58,8 +58,8 @@ validate_input() {
         usage
     fi
 
-    if ! [[ "$FSF_TYPE" =~ ^(NoGRS|GRS)$ ]]; then
-        log "ERROR" "FSF type must be either NoGRS or GRS"
+    if ! [[ "$FSF_TYPE" =~ ^(NoGRS|Retain_GRS)$ ]]; then
+        log "ERROR" "FSF type must be either NoGRS or Retain_GRS"
         exit 1
     fi
 
