@@ -3,14 +3,17 @@
 set -euo pipefail
 
 # =============================================================================
-# Script: FC_step5
+# Script: FC_step5_6
 # Description:
-#   Enhanced nuisance regression script that performs:
-#   1. Splits motion parameters
-#   2. Extracts signals (global, CSF, WM)
-#   3. Runs FEAT model based on FSF type
-#   4. Gets residuals and processes them
-#   5. Resamples residuals to MNI space
+#   Combined enhanced processing script that performs:
+#   1. Nuisance regression (former Step 5)
+#       - Splits motion parameters
+#       - Extracts signals (global, CSF, WM)
+#       - Runs FEAT model based on FSF type
+#       - Gets residuals and processes them
+#       - Resamples residuals to MNI space
+#   2. Results extraction (former Step 6)
+#       - Organizes results into designated output structure
 # =============================================================================
 
 # ---------------------------- Configuration ----------------------------------
@@ -31,7 +34,7 @@ VERBOSE=false
 # ---------------------------- Usage Function --------------------------------
 
 usage() {
-    echo "Enhanced Nuisance Regression Script"
+    echo "Combined FC Processing Script"
     echo "Usage: $0 [options]" >&2
     echo ""
     echo "Required Arguments:"
@@ -48,7 +51,7 @@ usage() {
     echo "  -l    Log directory (default: output_dir/logs)"
     echo "  -x    Skip existing processed subjects"
     echo "  -d    Dry run (show commands without executing)"
-    echo "  -b    Verbose output"
+    echo "  -v    Verbose output"
     echo "  -h    Display this help message"
     exit 1
 }
@@ -60,7 +63,7 @@ log() {
     shift
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
     if [ ! -z "$LOG_DIR" ]; then
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/nuisance_$(date +'%Y%m%d').log"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/fc_processing_$(date +'%Y%m%d').log"
     fi
 }
 
@@ -116,12 +119,13 @@ validate_input() {
     fi
 }
 
-process_nuisance() {
+process_subject() {
     local subject_id="$1"
     local session="$2"
     
     local output_dir
     local func_dir
+    local results_dir="${OUTPUT_DIR}/results/${FSF_TYPE}"
     
     # Set up directory structure
     if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
@@ -135,36 +139,37 @@ process_nuisance() {
     local reg_dir="${func_dir}/reg_dir"
     local segment_dir="${func_dir}/seg"
     local nuisance_dir="${func_dir}/nuisance"
-
-    # ------------------- Added Cleanup Section -------------------
-    # Delete previously generated files and directories to ensure a clean start
-    log "INFO" "Cleaning up previous outputs for subject $subject_id${session:+ session $session}"
     
-    # Remove nuisance directory if it exists
-    if [ -d "$nuisance_dir" ]; then
-        rm -rf "$nuisance_dir"
-        log "INFO" "Removed existing nuisance directory: $nuisance_dir"
+    mkdir -p "$results_dir"
+    
+    # Create target filename based on presence of session
+    local target_filename
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+        target_filename="${subject_id}_${FSF_TYPE}.nii.gz"
+    else
+        target_filename="${subject_id}_${session}_${FSF_TYPE}.nii.gz"
+    fi
+    
+    local target_file="${results_dir}/${target_filename}"
+    
+    # Skip if already processed
+    if [ "$SKIP_EXISTING" = true ] && [ -f "$target_file" ]; then
+        log "INFO" "Results already exist for subject $subject_id${session:+ session $session}. Skipping."
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN" "Would process subject $subject_id${session:+ session $session}"
+        return 0
     fi
 
-    # Remove residual files if they exist
-    local residual_files=(
-        "${func_dir}/rest_res.nii.gz"
-        "${func_dir}/rest_res2standard.nii.gz"
-    )
-
-    for res_file in "${residual_files[@]}"; do
-        if [ -f "$res_file" ]; then
-            rm -f "$res_file"
-            log "INFO" "Removed existing file: $res_file"
-        fi
-    done
-    # ------------------- End of Cleanup Section -------------------
-
+    # Clean up previous outputs
+    log "INFO" "Cleaning up previous outputs for subject $subject_id${session:+ session $session}"
+    rm -rf "$nuisance_dir" "${func_dir}/rest_res.nii.gz" "${func_dir}/rest_res2standard.nii.gz"
+    
     # Create necessary directories
     mkdir -p "$nuisance_dir"
 
-    log "INFO" "Processing nuisance regression for subject $subject_id${session:+ session $session}"
-    
     # Check required input files
     local required_inputs=(
         "${func_dir}/rest_mc.1D"
@@ -182,36 +187,23 @@ process_nuisance() {
         fi
     done
     
-    # Skip if already processed
-    if [ "$SKIP_EXISTING" = true ] && [ -f "${func_dir}/rest_res2standard.nii.gz" ]; then
-        log "INFO" "Nuisance regression already completed for subject $subject_id${session:+ session $session}. Skipping."
-        return 0
-    fi
-    
-    if [ "$DRY_RUN" = true ]; then
-        log "DRY-RUN" "Would process nuisance regression for subject $subject_id${session:+ session $session}"
-        return 0
-    fi
+    # Process nuisance regression
+    log "INFO" "Processing nuisance regression..."
     
     # Split motion parameters
-    log "INFO" "Splitting motion parameters..."
     for i in {1..6}; do
         awk -v col=$i '{print $col}' "${func_dir}/rest_mc.1D" > "${nuisance_dir}/mc${i}.1D"
     done
     
     # Extract signals
-    log "INFO" "Extracting tissue signals..."
     3dmaskave -mask "${segment_dir}/global_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/global.1D"
     3dmaskave -mask "${segment_dir}/csf_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/csf.1D"
     3dmaskave -mask "${segment_dir}/wm_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/wm.1D"
     
-    # Create FSF file
-    log "INFO" "Creating FSF file for $FSF_TYPE regression..."
+    # Copy preprocessed data and create FSF file
+    cp "${func_dir}/rest_pp.nii.gz" "${nuisance_dir}/"
     
     local regstandard_path="$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz"
-    
-    # Copy preprocessed data to nuisance directory
-    cp "${func_dir}/rest_pp.nii.gz" "${nuisance_dir}/"
     
     if [ "$FSF_TYPE" = "NoGRS" ]; then
         sed -e "s:nuisance_dir:${nuisance_dir}:g" \
@@ -240,16 +232,13 @@ process_nuisance() {
             "${TEMPLATE_DIR}/nuisance_R.fsf" > "${nuisance_dir}/nuisance.fsf"
     fi
     
-    log "INFO" "Running FEAT model..."
+    # Run FEAT model and GLM
+    log "INFO" "Running FEAT model and GLM..."
     feat_model "${nuisance_dir}/nuisance"
     
-    # Get and format minimum value properly
     local minVal
     minVal=$(3dBrickStat -min -mask "${func_dir}/rest_pp_mask.nii.gz" "${func_dir}/rest_pp.nii.gz" | tr -d '[:space:]')
     
-    log "INFO" "Running FILM GLM with threshold $minVal..."
-    
-    # Fixed stats directory path
     if ! film_gls --rn="${nuisance_dir}/stats" \
               --noest --sa --ms=5 \
               --in="${nuisance_dir}/rest_pp.nii.gz" \
@@ -259,55 +248,53 @@ process_nuisance() {
         return 1
     fi
 
-    # Wait for file to be created
     sleep 5
     
-    # Fixed residuals file path
+    # Process and resample residuals
     local res4d_file="${nuisance_dir}/stats/res4d.nii.gz"
     
-    if [ -f "$res4d_file" ]; then
-        log "INFO" "Processing residuals..."
-        3dTstat -mean -prefix "${nuisance_dir}/stats/res4d_mean.nii.gz" \
-                "$res4d_file"
-        
-        3dcalc -a "$res4d_file" \
-               -b "${nuisance_dir}/stats/res4d_mean.nii.gz" \
-               -expr '(a-b)+100' \
-               -prefix "${func_dir}/rest_res.nii.gz"
-        
-        # Check if rest_res.nii.gz was created
-        if [ -f "${func_dir}/rest_res.nii.gz" ]; then
-            log "INFO" "Resampling to standard space..."
-            if ! flirt -ref "${reg_dir}/standard.nii.gz" \
-                      -in "${func_dir}/rest_res.nii.gz" \
-                      -out "${func_dir}/rest_res2standard.nii.gz" \
-                      -applyxfm -init "${reg_dir}/example_func2standard.mat" \
-                      -interp trilinear; then
-                log "ERROR" "Standard space resampling failed"
-                return 1
-            fi
-        else
-            log "ERROR" "Failed to create rest_res.nii.gz"
-            return 1
-        fi
-    else
-        log "ERROR" "FILM GLM did not produce res4d.nii.gz at expected location: $res4d_file"
+    if [ ! -f "$res4d_file" ]; then
+        log "ERROR" "FILM GLM did not produce res4d.nii.gz"
         return 1
     fi
     
-    # Verify final output
-    if [ ! -f "${func_dir}/rest_res2standard.nii.gz" ]; then
-        log "ERROR" "Failed to create final output file"
+    log "INFO" "Processing residuals..."
+    3dTstat -mean -prefix "${nuisance_dir}/stats/res4d_mean.nii.gz" "$res4d_file"
+    
+    3dcalc -a "$res4d_file" \
+           -b "${nuisance_dir}/stats/res4d_mean.nii.gz" \
+           -expr '(a-b)+100' \
+           -prefix "${func_dir}/rest_res.nii.gz"
+    
+    if [ ! -f "${func_dir}/rest_res.nii.gz" ]; then
+        log "ERROR" "Failed to create rest_res.nii.gz"
         return 1
     fi
     
-    log "SUCCESS" "Nuisance regression completed for subject $subject_id${session:+ session $session}"
+    log "INFO" "Resampling to standard space..."
+    if ! flirt -ref "${reg_dir}/standard.nii.gz" \
+              -in "${func_dir}/rest_res.nii.gz" \
+              -out "${func_dir}/rest_res2standard.nii.gz" \
+              -applyxfm -init "${reg_dir}/example_func2standard.mat" \
+              -interp trilinear; then
+        log "ERROR" "Standard space resampling failed"
+        return 1
+    fi
+    
+    # Copy final results to results directory
+    if ! cp "${func_dir}/rest_res2standard.nii.gz" "$target_file"; then
+        log "ERROR" "Failed to copy final results"
+        return 1
+    fi
+    
+    log "SUCCESS" "Completed processing for subject $subject_id${session:+ session $session}"
     return 0
 }
+
 # ---------------------------- Main Script ----------------------------------
 
 # Process command line arguments
-while getopts "i:o:t:r:e:s:f:n:l:xdbh" opt; do
+while getopts "i:o:t:r:e:s:f:n:l:xdvh" opt; do
     case ${opt} in
         i) INPUT_DIR="$OPTARG";;
         o) OUTPUT_DIR="$OPTARG";;
@@ -320,7 +307,7 @@ while getopts "i:o:t:r:e:s:f:n:l:xdbh" opt; do
         l) LOG_DIR="$OPTARG";;
         x) SKIP_EXISTING=true;;
         d) DRY_RUN=true;;
-        b) VERBOSE=true;;
+        v) VERBOSE=true;;
         h) usage;;
         \?) log "ERROR" "Invalid Option: -$OPTARG"; usage;;
         :) log "ERROR" "Option -$OPTARG requires an argument."; usage;;
@@ -341,6 +328,7 @@ mkdir -p "$LOG_DIR"
 temp_file=$(mktemp)
 trap 'rm -f "$temp_file"' EXIT
 
+# Find subjects and sessions
 # Find subjects and sessions
 log "INFO" "Scanning input directory for subjects..."
 while IFS= read -r dir; do
@@ -373,10 +361,10 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # Process subjects in parallel
-export -f process_nuisance
+export -f process_subject
 export -f log
-export OUTPUT_DIR LOG_DIR SKIP_EXISTING DRY_RUN VERBOSE
-export TEMPLATE_DIR TR TE N_VOLS FSF_TYPE
+export INPUT_DIR OUTPUT_DIR TEMPLATE_DIR TR TE N_VOLS FSF_TYPE
+export LOG_DIR SKIP_EXISTING DRY_RUN VERBOSE
 
 # Set maximum parallel jobs based on available cores
 TOTAL_CORES=$(nproc)
@@ -387,8 +375,7 @@ fi
 
 log "INFO" "Processing with maximum $MAX_JOBS parallel jobs"
 
-# Fixed parallel command
 parallel --progress --jobs "$MAX_JOBS" --colsep ' ' \
-    process_nuisance {1} {2} < "$temp_file"
+    process_subject {1} {2} < "$temp_file"
 
-log "SUCCESS" "All nuisance regression processing completed"
+log "SUCCESS" "All processing completed"
