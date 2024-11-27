@@ -12,23 +12,23 @@ set -euo pipefail
 # ---------------------------- Configuration ----------------------------------
 
 # Directory settings
-INPUT_DIR="/mnt/e/ABIDE/Data/Caltech"          # Raw data directory
-OUTPUT_DIR="/mnt/e/ABIDE/Outputs/Caltech"     # Output directory
+INPUT_DIR="/mnt/e/ABIDE/Data/Leuven_1"          # Raw data directory
+OUTPUT_DIR="/mnt/e/ABIDE/Outputs/Leuven_1"     # Output directory
 STANDARD_DIR="./standard"                   # Standard brain templates
 TISSUES_DIR="./tissuepriors"
 TEMPLATE_DIR="./template"                   # FSF templates
 
 # Processing parameters
-NUM_THREADS=4                               # Number of CPU threads to use
+NUM_THREADS=6                               # Number of CPU threads to use
 FWHM=6.0                                    # Full Width at Half Maximum for smoothing
 SIGMA=2.548                                 # Sigma for smoothing (FWHM = 2.355 * SIGMA)
 HIGHP=0.1                                   # High-pass filter in Hz
 LOWP=0.01                                   # Low-pass filter in Hz
-TR=2.0                                      # Repetition Time
-TE=30                                       # Echo Time
-N_VOLS=150                                  # Number of volumes
+TR=1.6669999999999998                                     # Repetition Time
+TE=33                                       # Echo Time
+N_VOLS=250                                # Number of volumes
 
-# FSF_TYPES=("NoGRS")
+# FSF_TYPES=("NoGRS") "NoGRS" 
 FSF_TYPES=("NoGRS" "Retain_GRS")            # Default FSF types "NoGRS" 
 FILE_PATTERN="*T1w.nii*"                   # Pattern for anatomical files
 PROCESSING_MODE="default"                   # Processing mode for recon-all
@@ -37,7 +37,7 @@ PROCESSING_MODE="default"                   # Processing mode for recon-all
 # Processing flags
 SKIP_EXISTING=true                         # Skip if output exists
 DRY_RUN=false                              # Show commands without executing
-VERBOSE=true                               # Show detailed output
+VERBOSE=false                               # Show detailed output
 
 # Error tracking configuration
 ERROR_LOG_DIR="${OUTPUT_DIR}/error_logs"   # Will be created if not exists
@@ -55,27 +55,61 @@ log() {
     local level="$1"
     shift
     local message="[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*"
-    echo "$message"
+    
+    # Only show DEBUG messages if VERBOSE is true
+    if [ "$level" = "DEBUG" ] && [ "$VERBOSE" != "true" ]; then
+        return 0
+    fi
+    
+    # Color coding for different log levels
+    case "$level" in
+        "ERROR")   echo -e "\033[31m$message\033[0m" ;;
+        "WARNING") echo -e "\033[33m$message\033[0m" ;;
+        "SUCCESS") echo -e "\033[32m$message\033[0m" ;;
+        "INFO")    echo -e "\033[36m$message\033[0m" ;;
+        *)         echo "$message" ;;
+    esac
+    
     if [ -n "$LOG_DIR" ]; then
         echo "$message" >> "$LOG_DIR/pipeline_${CURRENT_DATE}.log"
     fi
 }
+
 
 record_error() {
     local step="$1"
     local subject_id="$2"
     local session="${3:-}"
     local error_msg="$4"
+    local error_code="${5:-1}" 
 
     mkdir -p "$ERROR_LOG_DIR"
 
     local error_detail_file="${ERROR_LOG_DIR}/errors_${CURRENT_DATE}.log"
-    local message="[$(date +'%Y-%m-%d %H:%M:%S')] Step ${step} - Subject ${subject_id}${session:+ Session ${session}} - ${error_msg}"
-    echo "$message" >> "$error_detail_file"
+    local error_summary_file="${ERROR_LOG_DIR}/error_summary_${CURRENT_DATE}.log"
 
-    if ! grep -q "^${subject_id}${session:+_${session}}$" "$ERROR_SUBJECTS_FILE" 2>/dev/null; then
-        echo "${subject_id}${session:+_${session}}" >> "$ERROR_SUBJECTS_FILE"
-    fi
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    local subject_session="${subject_id}${session:+_${session}}"
+    local error_entry="[${timestamp}] [ERROR CODE ${error_code}]
+    Subject: ${subject_session}
+    Step: ${step}
+    Error: ${error_msg}
+    ----------------------------------------"
+
+    echo "$error_entry" >> "$error_detail_file"
+
+    (
+        flock -x 200
+        if ! grep -q "^${subject_session}|${step}|${error_code}$" "$ERROR_SUBJECTS_FILE" 2>/dev/null; then
+            echo "${subject_session}|${step}|${error_code}" >> "$ERROR_SUBJECTS_FILE"
+        fi
+    ) 200>"${ERROR_LOG_DIR}/.lock"
+
+    {
+        echo "Last Error: ${timestamp}"
+        echo "Total Errors: $(wc -l < "$ERROR_SUBJECTS_FILE")"
+        echo "Unique Subjects with Errors: $(cut -d'|' -f1 "$ERROR_SUBJECTS_FILE" | sort -u | wc -l)"
+    } > "$error_summary_file"
 }
 
 setup_environment() {
@@ -240,6 +274,7 @@ run_step() {
     local cmd="$2"
     local subject_id="$3"
     local session="${4:-}"
+    local status=0
 
     log "INFO" "Starting Step $step for subject $subject_id${session:+ session $session}..."
 
@@ -248,22 +283,31 @@ run_step() {
         return 0
     fi
 
-    # Create temporary log file
     local temp_log=$(mktemp)
+    local error_code=0
 
-    if eval "$cmd" 2>&1 | tee "$temp_log"; then
+    if ! eval "$cmd" 2>&1 | tee "$temp_log"; then
+        error_code=$?
+        status=1
+    fi
+
+    if grep -qi "error\|exception\|failed" "$temp_log"; then
+        status=1
+        error_code=${error_code:-1}
+    fi
+
+    if [ $status -eq 0 ]; then
         rm "$temp_log"
         log "SUCCESS" "Step $step completed for subject $subject_id${session:+ session $session}"
         return 0
     else
         local error_msg=$(tail -n 5 "$temp_log")
-        record_error "$step" "$subject_id" "$session" "Step failed: $error_msg"
+        record_error "$step" "$subject_id" "$session" "$error_msg" "$error_code"
         rm "$temp_log"
         log "ERROR" "Step $step failed for subject $subject_id${session:+ session $session}"
         return 1
     fi
 }
-
 
 check_mask_validity() {
     local mask_file="$1"
@@ -328,7 +372,7 @@ process_subject() {
     #     return 1
     # fi
     
-    reconall_dir="/mnt/e/ABIDE/Outputs/recon_all/Caltech"
+    reconall_dir="/mnt/e/ABIDE/Outputs/recon_all/Leuven_1"
 
     # Step 1: Check and run Anatomical Preprocessing if needed
     if [ ! -f "$OUTPUT_DIR/$subject_id/anat/Stru_Brain.nii.gz" ]; then
@@ -411,20 +455,19 @@ process_subject() {
             fi
         done
         
-        if ! run_step "processing-${fsf_type}" "bash FC_step5 \
-            -i \"$INPUT_DIR\" \
-            -o \"$OUTPUT_DIR\" \
-            -t \"$TEMPLATE_DIR\" \
-            -r \"$TR\" \
-            -e \"$TE\" \
-            -s \"$N_VOLS\" \
-            -f \"${fsf_type}\" \
-            -l \"$LOG_DIR\" \
-            ${GENERAL_FLAGS[*]} \
-            -v" "$subject_id" "$session"; then
-            log "ERROR" "FSF type ${fsf_type} failed for subject $subject_id${session:+ session $session}"
-            return 1
-        fi
+        run_step "processing-${fsf_type}" "bash FC_step5 \
+        -i \"$INPUT_DIR\" \
+        -o \"$OUTPUT_DIR\" \
+        -t \"$TEMPLATE_DIR\" \
+        -r \"$TR\" \
+        -e \"$TE\" \
+        -s \"$N_VOLS\" \
+        -f \"${fsf_type}\" \
+        -l \"$LOG_DIR\" \
+        ${GENERAL_FLAGS[*]} \
+        -v" "$subject_id" "$session";
+        # log "ERROR" "FSF type ${fsf_type} failed for subject $subject_id${session:+ session $session}"
+
         
         log "SUCCESS" "Completed FSF type ${fsf_type} for subject $subject_id${session:+ session $session}"
     done
@@ -442,7 +485,28 @@ generate_report() {
         echo "Output Directory: $OUTPUT_DIR"
         echo "-------------------------"
         echo "Total Subjects Processed: $total_subjects"
-        echo "Failed Subjects: $failed_count"
+        
+        if [ -f "$ERROR_SUBJECTS_FILE" ] && [ -s "$ERROR_SUBJECTS_FILE" ]; then
+            echo "Failed Subjects Summary:"
+            echo "-------------------------"
+            echo "Total Errors: $(wc -l < "$ERROR_SUBJECTS_FILE")"
+            echo "Unique Subjects with Errors: $(cut -d'|' -f1 "$ERROR_SUBJECTS_FILE" | sort -u | wc -l)"
+            echo "Errors by Step:"
+            echo "-------------------------"
+            cut -d'|' -f2 "$ERROR_SUBJECTS_FILE" | sort | uniq -c | while read -r count step; do
+                echo "  $step: $count errors"
+            done
+            echo "-------------------------"
+            echo "Failed Subjects Details:"
+            while IFS='|' read -r subject step code; do
+                echo "  Subject: $subject"
+                echo "    - Failed at step: $step"
+                echo "    - Error code: $code"
+            done < "$ERROR_SUBJECTS_FILE"
+        else
+            echo "No errors encountered during processing"
+        fi
+        
         echo "-------------------------"
         echo "FSF Types Processed: ${FSF_TYPES[*]}"
         echo "Processing Parameters:"
@@ -450,11 +514,6 @@ generate_report() {
         echo "  - FWHM: $FWHM"
         echo "  - Sigma: $SIGMA"
         echo "  - Number Volume: $N_VOLS"
-        echo "-------------------------"
-        if [ -f "$ERROR_SUBJECTS_FILE" ] && [ -s "$ERROR_SUBJECTS_FILE" ]; then
-            echo "Failed Subjects List:"
-            cat "$ERROR_SUBJECTS_FILE"
-        fi
     } > "$report_file"
 
     log "INFO" "Processing report generated: $report_file"
@@ -539,6 +598,5 @@ main() {
         exit 0
     fi
 }
-
 # ---------------------------- Execute Main --------------------------------
 main "$@"

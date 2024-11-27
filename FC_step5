@@ -3,16 +3,16 @@
 set -euo pipefail
 
 # =============================================================================
-# Script: FC_step5_6
+# Script: FC_step5
 # Description:
 #   Combined enhanced processing script that performs:
-#   1. Nuisance regression (former Step 5)
+#   1. Nuisance regression
 #       - Splits motion parameters
 #       - Extracts signals (global, CSF, WM)
 #       - Runs FEAT model based on FSF type
 #       - Gets residuals and processes them
 #       - Resamples residuals to MNI space
-#   2. Results extraction (former Step 6)
+#   2. Results extraction 
 #       - Organizes results into designated output structure
 # =============================================================================
 
@@ -61,11 +61,21 @@ usage() {
 log() {
     local level="$1"
     shift
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+    local message="[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*"
+
+    case "$level" in
+        "ERROR")   echo -e "\033[31m$message\033[0m" ;;
+        "WARNING") echo -e "\033[33m$message\033[0m" ;;
+        "SUCCESS") echo -e "\033[32m$message\033[0m" ;;
+        "INFO")    echo -e "\033[36m$message\033[0m" ;;
+        *)         echo "$message" ;;
+    esac
+    
     if [ ! -z "$LOG_DIR" ]; then
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/fc_processing_$(date +'%Y%m%d').log"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/preproc_$(date +'%Y%m%d').log"
     fi
 }
+
 
 check_prerequisites() {
     local missing_prereqs=()
@@ -232,7 +242,7 @@ process_subject() {
             "${TEMPLATE_DIR}/nuisance_R.fsf" > "${nuisance_dir}/nuisance.fsf"
     fi
     
-    # Run FEAT model and GLM
+
     log "INFO" "Running FEAT model and GLM..."
     feat_model "${nuisance_dir}/nuisance"
     

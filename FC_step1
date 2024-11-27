@@ -19,7 +19,7 @@ OUTPUT_DIR=""
 RECON_ALL_DIR=""
 NUM_THREADS=""
 LOG_DIR=""
-CORES_PER_SUBJECT=2
+CORES_PER_SUBJECT=4
 SKIP_EXISTING=false
 DRY_RUN=false
 VERBOSE=false
@@ -50,11 +50,21 @@ usage() {
 log() {
     local level="$1"
     shift
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+    local message="[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*"
+
+    case "$level" in
+        "ERROR")   echo -e "\033[31m$message\033[0m" ;;
+        "WARNING") echo -e "\033[33m$message\033[0m" ;;
+        "SUCCESS") echo -e "\033[32m$message\033[0m" ;;
+        "INFO")    echo -e "\033[36m$message\033[0m" ;;
+        *)         echo "$message" ;;
+    esac
+    
     if [ ! -z "$LOG_DIR" ]; then
-        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/anatproc_$(date +'%Y%m%d').log"
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/preproc_$(date +'%Y%m%d').log"
     fi
 }
+
 
 validate_input() {
     if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$RECON_ALL_DIR" ]; then
