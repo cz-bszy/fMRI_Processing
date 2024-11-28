@@ -242,7 +242,7 @@ process_subject() {
 }
 
 # ---------------------------- Main Execution ---------------------------------
-
+# Setup and validate environment
 check_prerequisites
 validate_input
 setup_directories
@@ -250,64 +250,54 @@ setup_directories
 # Determine available CPU resources
 TOTAL_CORES=$(nproc)
 log "INFO" "Total CPU cores available: $TOTAL_CORES"
-MAX_JOBS=$(( TOTAL_CORES / CORES_PER_SUBJECT ))
-if [ "$MAX_JOBS" -lt 1 ]; then
-    MAX_JOBS=1
+
+if [ "$CORES_PER_SUBJECT" -gt "$TOTAL_CORES" ]; then
+    log "WARNING" "Requested cores per subject ($CORES_PER_SUBJECT) exceeds available cores ($TOTAL_CORES)"
+    CORES_PER_SUBJECT=$TOTAL_CORES
 fi
-log "INFO" "Maximum parallel jobs: $MAX_JOBS"
 
-# Create temporary file for subject list
-temp_file=$(mktemp)
-trap 'rm -f "$temp_file"' EXIT
+log "INFO" "Using $CORES_PER_SUBJECT cores for processing"
 
-# Find and process anatomical files
-find "$INPUT_DIR" -type f -name "$FILE_PATTERN" | while read -r anat_file; do
-    relative_path="${anat_file#"$INPUT_DIR"/}"
-    if [ "$VERBOSE" = true ]; then
-        log "DEBUG" "Processing path: $relative_path"
-    fi
-    
-    # Extract components from path
-    IFS='/' read -r -a path_components <<< "$relative_path"
-    
-    case ${#path_components[@]} in
-        3)  # sub/anat/file.nii.gz
-            subject_id="${path_components[0]}"
-            session=""
-            ;;
-        4)  # sub/ses/anat/file.nii.gz
-            subject_id="${path_components[0]}"
-            session="${path_components[1]}"
-            ;;
-        *)
-            log "WARNING" "Unexpected path structure: $relative_path"
-            continue
-            ;;
-    esac
-    
-    echo "$subject_id $anat_file $session" >> "$temp_file"
-done
+# Process command line arguments for subject
+shift $((OPTIND-1))
 
-total_subjects=$(wc -l < "$temp_file")
-log "INFO" "Total subjects to process: $total_subjects"
+if [ $# -lt 1 ]; then
+    log "ERROR" "Subject ID must be provided"
+    usage
+fi
 
-if [ "$total_subjects" -eq 0 ]; then
-    log "ERROR" "No anatomical files found matching pattern: $FILE_PATTERN"
+subject_id="$1"
+session="${2:-\"\"}"
+
+# Find anatomical file for the subject
+anat_file=""
+if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+    anat_file=$(find "$INPUT_DIR/$subject_id" -type f -name "$FILE_PATTERN" | head -n 1)
+else
+    anat_file=$(find "$INPUT_DIR/$subject_id/$session" -type f -name "$FILE_PATTERN" | head -n 1)
+fi
+
+if [ -z "$anat_file" ]; then
+    log "ERROR" "No anatomical file found for subject $subject_id${session:+ session $session} matching pattern: $FILE_PATTERN"
     exit 1
 fi
 
+if [ "$VERBOSE" = true ]; then
+    log "DEBUG" "Found anatomical file: $anat_file"
+fi
+
 if [ "$DRY_RUN" = true ]; then
-    log "DRY-RUN" "The following subjects would be processed:"
-    cat "$temp_file"
+    log "DRY-RUN" "Would process anatomical file: $anat_file"
+    log "DRY-RUN" "Subject: $subject_id${session:+ Session: $session}"
     exit 0
 fi
 
-# Process subjects in parallel
-export -f process_subject
-export -f run_recon_all_step
-export -f log
+# Process the single subject
 export OUTPUT_DIR LOG_DIR PROCESSING_MODE EXPERT_FILE MAX_TIME CORES_PER_SUBJECT SKIP_EXISTING DRY_RUN VERBOSE
 
-parallel --progress --jobs "$MAX_JOBS" --colsep ' ' process_subject {1} {2} {3} < "$temp_file"
+if ! process_subject "$subject_id" "$anat_file" "$session"; then
+    log "ERROR" "ReconAll processing failed for subject $subject_id${session:+ session $session}"
+    exit 1
+fi
 
-log "INFO" "Processing completed successfully."
+log "SUCCESS" "ReconAll processing completed for subject $subject_id${session:+ session $session}"

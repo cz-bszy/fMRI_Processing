@@ -250,6 +250,8 @@ process_subject() {
 
 # ---------------------------- Main Script ----------------------------------
 
+# ---------------------------- Main Script ----------------------------------
+
 # Process command line arguments
 while getopts "i:o:n:w:g:h:l:d:xrvu" opt; do
     case ${opt} in
@@ -270,6 +272,8 @@ while getopts "i:o:n:w:g:h:l:d:xrvu" opt; do
     esac
 done
 
+shift $((OPTIND-1))
+
 # Setup and validation
 check_prerequisites
 validate_input
@@ -280,58 +284,43 @@ if [ -z "$LOG_DIR" ]; then
 fi
 mkdir -p "$LOG_DIR"
 
-# Create temporary file for subject list
-temp_file=$(mktemp)
-trap 'rm -f "$temp_file"' EXIT
+# Validate subject arguments
+if [ $# -lt 1 ]; then
+    log "ERROR" "Subject ID must be provided"
+    usage
+fi
 
-# Find subjects and sessions
-log "INFO" "Scanning input directory for subjects..."
-while IFS= read -r dir; do
-    subject_dir=$(basename "$dir")
-    
-    if [[ -d "$dir/func" ]]; then
-        echo "$subject_dir "" $dir" >> "$temp_file"
-    else
-        # Session structure
-        while IFS= read -r session_dir; do
-            session=$(basename "$session_dir")
-            if [[ -d "$session_dir/func" ]]; then
-                echo "$subject_dir $session $session_dir" >> "$temp_file"
-            fi
-        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
-    fi
-done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
+subject_id="$1"
+session="${2:-\"\"}"
+subject_path="${3:-${INPUT_DIR}/${subject_id}}"
 
-total_subjects=$(wc -l < "$temp_file")
-log "INFO" "Found $total_subjects subject/session combinations to process"
+# Validate subject directory exists
+if [ ! -d "$subject_path" ]; then
+    log "ERROR" "Subject directory not found: $subject_path"
+    exit 1
+fi
 
-if [ "$total_subjects" -eq 0 ]; then
-    log "ERROR" "No subjects found in input directory"
+# Validate functional directory exists
+if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+    func_path="${subject_path}/func"
+else
+    func_path="${subject_path}/func"
+fi
+
+if [ ! -d "$func_path" ]; then
+    log "ERROR" "Functional directory not found: $func_path"
     exit 1
 fi
 
 if [ "$DRY_RUN" = true ]; then
-    log "DRY-RUN" "Would process the following subjects:"
-    cat "$temp_file"
+    log "DRY-RUN" "Would process subject: $subject_id${session:+ session $session}"
     exit 0
 fi
 
-# Process subjects in parallel
-export -f process_subject
-export -f log
-export OUTPUT_DIR LOG_DIR SKIP_EXISTING DRY_RUN VERBOSE
-export NUM_THREADS FWHM SIGMA HIGHP LOWP
-
-# Set maximum parallel jobs based on available cores
-TOTAL_CORES=$(nproc)
-MAX_JOBS=$(( TOTAL_CORES / NUM_THREADS ))
-if [ "$MAX_JOBS" -lt 1 ]; then
-    MAX_JOBS=1
+# Process the single subject
+if ! process_subject "$subject_id" "$session" "$subject_path"; then
+    log "ERROR" "Preprocessing failed for subject $subject_id${session:+ session $session}"
+    exit 1
 fi
 
-log "INFO" "Processing with maximum $MAX_JOBS parallel jobs"
-
-parallel --progress --jobs "$MAX_JOBS" --colsep ' ' \
-    process_subject {1} {2} {3} < "$temp_file"
-
-log "SUCCESS" "All preprocessing completed"
+log "SUCCESS" "Preprocessing completed for subject $subject_id${session:+ session $session}"

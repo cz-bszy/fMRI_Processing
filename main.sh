@@ -12,8 +12,8 @@ set -euo pipefail
 # ---------------------------- Configuration ----------------------------------
 
 # Directory settings
-INPUT_DIR="/mnt/e/ABIDE/Data/Leuven_1"          # Raw data directory
-OUTPUT_DIR="/mnt/e/ABIDE/Outputs/Leuven_1"     # Output directory
+INPUT_DIR="/mnt/e/ABIDE/Data/KKI"          # Raw data directory
+OUTPUT_DIR="/mnt/e/ABIDE/Outputs/KKI"     # Output directory
 STANDARD_DIR="./standard"                   # Standard brain templates
 TISSUES_DIR="./tissuepriors"
 TEMPLATE_DIR="./template"                   # FSF templates
@@ -24,11 +24,12 @@ FWHM=6.0                                    # Full Width at Half Maximum for smo
 SIGMA=2.548                                 # Sigma for smoothing (FWHM = 2.355 * SIGMA)
 HIGHP=0.1                                   # High-pass filter in Hz
 LOWP=0.01                                   # Low-pass filter in Hz
-TR=1.6669999999999998                                     # Repetition Time
-TE=33                                       # Echo Time
-N_VOLS=250                                # Number of volumes
+TR=2.5                                   # Repetition Time
+TE=30                                      # Echo Time
+N_VOLS=156                              # Number of volumes
 
 # FSF_TYPES=("NoGRS") "NoGRS" 
+declare -a FSF_TYPES
 FSF_TYPES=("NoGRS" "Retain_GRS")            # Default FSF types "NoGRS" 
 FILE_PATTERN="*T1w.nii*"                   # Pattern for anatomical files
 PROCESSING_MODE="default"                   # Processing mode for recon-all
@@ -74,7 +75,6 @@ log() {
         echo "$message" >> "$LOG_DIR/pipeline_${CURRENT_DATE}.log"
     fi
 }
-
 
 record_error() {
     local step="$1"
@@ -259,12 +259,6 @@ check_previous_steps() {
                 return 1
             fi
             ;;
-        6)  # Check nuisance regression output for specific FSF type
-            if [ ! -f "$OUTPUT_DIR/$subject_id/func/rest_res2standard.nii.gz" ]; then
-                log "ERROR" "Nuisance regression must complete before results extraction"
-                return 1
-            fi
-            ;;
     esac
     return 0
 }
@@ -324,35 +318,34 @@ check_mask_validity() {
     return 0
 }
 
+
 process_subject() {
     local subject_id="$1"
     local session="${2:-}"
 
-    log "INFO" "Processing subject $subject_id${session:+ session $session}..."
+    local fsf_array
+    IFS=' ' read -r -a fsf_array <<< "$FSF_TYPES_STRING"
+    
+    local subject_output_dir="$OUTPUT_DIR/${subject_id}"
+    local subject_input_dir="$INPUT_DIR/${subject_id}"
+    
+    log "INFO" "Processing subject $subject_id${session:+ with session $session}"
+    
+    # Create necessary directories
+    mkdir -p "${subject_output_dir}/anat"
+    mkdir -p "${subject_output_dir}/func"
+    chmod -R 775 "${subject_output_dir}"
 
-    GENERAL_FLAGS=()
-    if [ "$SKIP_EXISTING" = true ]; then
-        GENERAL_FLAGS+=("-x")
-    fi
-    if [ "$DRY_RUN" = true ]; then
-        GENERAL_FLAGS+=("-d")
-    fi
-
-    # Get anatomical file path
+    # Get anatomical file path based on session presence
     local anat_file
     if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
-        anat_file=$(find "$INPUT_DIR/$subject_id/anat" -type f -name "*T1w.nii*" | head -n 1)
+        anat_file=$(find "$subject_input_dir/anat" -type f -name "*T1w.nii*" | head -n 1)
     else
-        anat_file=$(find "$INPUT_DIR/$subject_id/$session/anat" -type f -name "*T1w.nii*" | head -n 1)
+        anat_file=$(find "$subject_input_dir/$session/anat" -type f -name "*T1w.nii*" | head -n 1)
     fi
 
-    if [ -z "$anat_file" ]; then
-        log "ERROR" "No anatomical file found for subject $subject_id${session:+ session $session}"
-        return 1
-    fi
-    
 
-    # Step 0: ReconAll Processing
+    #### Step 0: ReconAll Processing
     # log "INFO" "Starting ReconAll processing..."
     # run_step "0" "bash FC_step0 \
     #     -i \"$INPUT_DIR\" \
@@ -366,33 +359,38 @@ process_subject() {
     #         return 1
     #     }
 
-    # # Verify ReconAll output exists before continuing
+    # Verify ReconAll output exists before continuing
     # if [ ! -f "$OUTPUT_DIR/recon_all/$subject_id/mri/brain.mgz" ]; then
     #     log "ERROR" "ReconAll output not found for subject $subject_id"
     #     return 1
     # fi
     
-    reconall_dir="/mnt/e/ABIDE/Outputs/recon_all/Leuven_1"
+    reconall_dir="/mnt/e/ABIDE/Outputs/recon_all/KKI"
 
     # Step 1: Check and run Anatomical Preprocessing if needed
-    if [ ! -f "$OUTPUT_DIR/$subject_id/anat/Stru_Brain.nii.gz" ]; then
+    if [ ! -f "${subject_output_dir}/anat/Stru_Brain.nii.gz" ]; then
         log "INFO" "Running Step 1: Anatomical Preprocessing..."
-        run_step "1" "bash FC_step1 \
+        # Pass the raw subject ID without sub- prefix to FC_step1
+        if ! run_step "1" "bash FC_step1 \
             -i \"$INPUT_DIR\" \
             -o \"$OUTPUT_DIR\" \
             -r \"$reconall_dir\" \
             -c \"$NUM_THREADS\" \
             -l \"$LOG_DIR\" \
             ${GENERAL_FLAGS[*]} \
-            -v" "$subject_id" "$session" || return 1
+            -v \
+            ${subject_id} \"${session}\"" \
+            "$subject_id" "$session"; then
+            return 1
+        fi
     else
         log "INFO" "Skipping Step 1: Anatomical Preprocessing (output exists)"
     fi
 
-    # Step 2: Check and run Functional Preprocessing if needed
-    if [ ! -f "$OUTPUT_DIR/$subject_id/func/example_func.nii.gz" ]; then
+    # Step 2: Functional Preprocessing
+    if [ ! -f "${subject_output_dir}/func/example_func.nii.gz" ]; then
         log "INFO" "Running Step 2: Functional Preprocessing..."
-        run_step "2" "bash FC_step2 \
+        if ! run_step "2" "bash FC_step2 \
             -i \"$INPUT_DIR\" \
             -o \"$OUTPUT_DIR\" \
             -n \"$NUM_THREADS\" \
@@ -402,30 +400,38 @@ process_subject() {
             -l \"$LOWP\" \
             -d \"$LOG_DIR\" \
             ${GENERAL_FLAGS[*]} \
-            -v" "$subject_id" "$session" || return 1
+            -v \
+            $subject_id $session" \
+            "$subject_id" "$session"; then
+            return 1
+        fi
     else
         log "INFO" "Skipping Step 2: Functional Preprocessing (output exists)"
     fi
 
-    # Step 3: Check and run Registration if needed
-    if [ ! -f "$OUTPUT_DIR/$subject_id/func/reg_dir/example_func2standard.nii.gz" ]; then
+    # Step 3: Registration
+    if [ ! -f "${subject_output_dir}/func/reg_dir/example_func2standard.nii.gz" ]; then
         log "INFO" "Running Step 3: Registration..."
-        run_step "3" "bash FC_step3 \
+        if ! run_step "3" "bash FC_step3 \
             -i \"$INPUT_DIR\" \
             -o \"$OUTPUT_DIR\" \
             -s \"$STANDARD_DIR\" \
             -n \"$NUM_THREADS\" \
             -l \"$LOG_DIR\" \
             ${GENERAL_FLAGS[*]} \
-            -v" "$subject_id" "$session" || return 1
+            -v \
+            $subject_id $session" \
+            "$subject_id" "$session"; then
+            return 1
+        fi
     else
         log "INFO" "Skipping Step 3: Registration (output exists)"
     fi
 
-    # Step 4: Check and run Tissue Segmentation if needed
-    if [ ! -f "$OUTPUT_DIR/$subject_id/func/seg/wm_mask.nii.gz" ]; then
+    # Step 4: Tissue Segmentation
+    if [ ! -f "${subject_output_dir}/func/seg/wm_mask.nii.gz" ]; then
         log "INFO" "Running Step 4: Tissue Segmentation..."
-        run_step "4" "bash FC_step4 \
+        if ! run_step "4" "bash FC_step4 \
             -i \"$INPUT_DIR\" \
             -o \"$OUTPUT_DIR\" \
             -s \"$TISSUES_DIR\" \
@@ -433,42 +439,45 @@ process_subject() {
             -g \"$SIGMA\" \
             -l \"$LOG_DIR\" \
             ${GENERAL_FLAGS[*]} \
-            -v" "$subject_id" "$session" || return 1
+            -v \
+            $subject_id $session" \
+            "$subject_id" "$session"; then
+            return 1
+        fi
     else
         log "INFO" "Skipping Step 4: Tissue Segmentation (output exists)"
     fi
 
+    # Verify tissue masks before FSF processing
+    local func_dir="${subject_output_dir}/func"
+    for mask in "global" "csf" "wm"; do
+        local mask_file="${func_dir}/seg/${mask}_mask.nii.gz"
+        if [ ! -f "$mask_file" ] || ! check_mask_validity "$mask_file"; then
+            log "ERROR" "Invalid or empty ${mask} mask for subject $subject_id${session:+ session $session}"
+            return 1
+        fi
+    done
 
-    for fsf_type in "${FSF_TYPES[@]}"; do
-        log "INFO" "Processing FSF type: ${fsf_type}"
-        
-        # Check required files before processing
-        local func_dir="${OUTPUT_DIR}/${subject_id}/func"
-        local nuisance_dir="${func_dir}/nuisance"
-        
-        # Verify tissue masks have valid data
-        for mask in "global" "csf" "wm"; do
-            local mask_file="${func_dir}/seg/${mask}_mask.nii.gz"
-            if [ ! -f "$mask_file" ] || ! check_mask_validity "$mask_file"; then
-                log "ERROR" "Invalid or empty ${mask} mask for subject $subject_id${session:+ session $session}"
-                return 1
-            fi
-        done
-        
-        run_step "processing-${fsf_type}" "bash FC_step5 \
-        -i \"$INPUT_DIR\" \
-        -o \"$OUTPUT_DIR\" \
-        -t \"$TEMPLATE_DIR\" \
-        -r \"$TR\" \
-        -e \"$TE\" \
-        -s \"$N_VOLS\" \
-        -f \"${fsf_type}\" \
-        -l \"$LOG_DIR\" \
-        ${GENERAL_FLAGS[*]} \
-        -v" "$subject_id" "$session";
-        # log "ERROR" "FSF type ${fsf_type} failed for subject $subject_id${session:+ session $session}"
+    # Step 5: Process each FSF type
 
-        
+    log "INFO" "Starting FSF processing for subject $subject_id"
+    log "INFO" "FSF types to process: ${fsf_array[*]}"
+    for fsf_type in "${fsf_array[@]}"; do
+        if ! run_step "processing-${fsf_type}" "bash FC_step5 \
+            -i \"$INPUT_DIR\" \
+            -o \"$OUTPUT_DIR\" \
+            -t \"$TEMPLATE_DIR\" \
+            -r \"$TR\" \
+            -e \"$TE\" \
+            -s \"$N_VOLS\" \
+            -f \"${fsf_type}\" \
+            -l \"$LOG_DIR\" \
+            ${GENERAL_FLAGS[*]} \
+            -v \
+            $subject_id $session" \
+            "$subject_id" "$session"; then
+            return 1
+        fi
         log "SUCCESS" "Completed FSF type ${fsf_type} for subject $subject_id${session:+ session $session}"
     done
 
@@ -519,17 +528,16 @@ generate_report() {
     log "INFO" "Processing report generated: $report_file"
 }
 
-# ---------------------------- Main Pipeline --------------------------------
 main() {
     # Set up logging directory
     if [ -z "$LOG_DIR" ]; then
         LOG_DIR="$OUTPUT_DIR/logs"
     fi
     mkdir -p "$LOG_DIR"
+    mkdir -p "$ERROR_LOG_DIR"
 
     # Initialize error tracking
     ERROR_SUBJECTS_FILE="${ERROR_LOG_DIR}/failed_subjects_${CURRENT_DATE}.txt"
-    mkdir -p "$ERROR_LOG_DIR"
     : > "$ERROR_SUBJECTS_FILE"
 
     # Create temporary directory for temp files
@@ -554,40 +562,92 @@ main() {
         exit 1
     fi
 
-    log "INFO" "Scanning input directory for subjects..."
+
+    # Discover subjects
+    log "INFO" "Scanning input directory for subjects and sessions..."
     while IFS= read -r dir; do
-        subject_dir=$(basename "$dir")
-        if [[ -d "$dir/func" ]]; then
-            echo "$subject_dir \"\"" >> "$subjects_file"
+        subject_id=$(basename "$dir")
+        
+        if [[ -d "$dir/anat" ]]; then
+            # No session structure
+            echo "$subject_id \"\"" >> "$subjects_file"
         else
+            # Check for sessions
             while IFS= read -r session_dir; do
                 session=$(basename "$session_dir")
-                if [[ -d "$session_dir/func" ]]; then
-                    echo "$subject_dir $session" >> "$subjects_file"
+                if [[ -d "$session_dir/anat" ]]; then
+                    echo "$subject_id $session" >> "$subjects_file"
                 fi
             done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
         fi
-    done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
+    done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d -name "sub-*")
 
     total_subjects=$(wc -l < "$subjects_file")
-    log "INFO" "Found $total_subjects subjects/sessions to process"
+    log "INFO" "Found $total_subjects subject/session combinations to process"
 
     if [ "$total_subjects" -eq 0 ]; then
         log "ERROR" "No subjects found in input directory"
         exit 1
     fi
 
-    # Process subjects
-    local failed_count=0
-    while IFS= read -r line; do
-        read -r subject_id session <<< "$line"
-        log "INFO" "Starting pipeline for subject: $subject_id${session:+ session $session}"
-        if ! process_subject "$subject_id" "$session"; then
-            failed_count=$((failed_count + 1))
-            log "ERROR" "Pipeline failed for subject: $subject_id${session:+ session $session}"
-        fi
-    done < "$subjects_file"
+    # Determine number of parallel jobs
+    local total_cores=$(nproc)
+    local max_parallel_jobs=$((total_cores < NUM_THREADS ? total_cores : NUM_THREADS))
+    log "INFO" "Running with $max_parallel_jobs parallel jobs (Total cores: $total_cores, Requested threads: $NUM_THREADS)"
 
+    process_subject_parallel() {
+        local subject_id="$1"
+        local session="$2"
+        
+        if ! process_subject "$subject_id" "$session"; then
+            echo "$subject_id|$session|FAILED" >> "$ERROR_SUBJECTS_FILE"
+            return 1
+        fi
+    }
+        
+    export -f process_subject_parallel
+    export -f process_subject
+    export -f run_step
+    export -f log
+    export -f record_error
+    export -f check_mask_validity
+
+
+    export FSF_TYPES_STRING="${FSF_TYPES[*]}"
+    log "INFO" "Exporting FSF types: $FSF_TYPES_STRING"
+
+    export INPUT_DIR OUTPUT_DIR STANDARD_DIR TEMPLATE_DIR TISSUES_DIR
+    export NUM_THREADS FWHM SIGMA HIGHP LOWP TR TE N_VOLS
+    export FSF_TYPES FILE_PATTERN PROCESSING_MODE
+    export SKIP_EXISTING DRY_RUN VERBOSE
+    export ERROR_LOG_DIR ERROR_SUBJECTS_FILE LOG_DIR CURRENT_DATE
+    export -f setup_environment validate_parameters setup_directories
+
+
+    local total_cores=$(nproc)
+    local threads_per_subject=$NUM_THREADS
+    local max_parallel_jobs=$((total_cores / threads_per_subject))
+    
+    # Ensure at least one job can run
+    if [ "$max_parallel_jobs" -lt 1 ]; then
+        max_parallel_jobs=1
+        log "WARNING" "Available cores ($total_cores) less than requested threads per subject ($threads_per_subject). Running single job."
+    fi
+    
+    log "INFO" "Running with $max_parallel_jobs parallel subjects (Total cores: $total_cores, Threads per subject: $threads_per_subject)"
+
+    # Process subjects in parallel
+    parallel --jobs "$max_parallel_jobs" --colsep ' ' \
+        process_subject_parallel {1} {2} :::: "$subjects_file"
+        
+    # Check for failures
+    local failed_count=0
+    if [ -f "$ERROR_SUBJECTS_FILE" ]; then
+        failed_count=$(grep -c "FAILED" "$ERROR_SUBJECTS_FILE" || true)
+    fi
+
+    # Generate processing report
+    log "INFO" "Generating processing report..."
     generate_report
 
     if [ "$failed_count" -gt 0 ]; then
@@ -598,5 +658,6 @@ main() {
         exit 0
     fi
 }
+
 # ---------------------------- Execute Main --------------------------------
 main "$@"

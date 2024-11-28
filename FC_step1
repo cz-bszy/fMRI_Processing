@@ -121,17 +121,15 @@ process_subject() {
     local session="$2"
     local recon_subj_dir="$3"
     
+    # Create output directory structure with sub- prefix
     local output_dir
     local anat_output_dir
     
-    # Modified directory structure handling
-    if [ -z "$session" ]; then
-        # No session - create anat directory directly under subject directory
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
         output_dir="${OUTPUT_DIR}/${subject_id}"
         anat_output_dir="${output_dir}/anat"
     else
-        # With session - maintain session directory structure
-        output_dir="${OUTPUT_DIR}/${subject_id}/${session}"
+        output_dir="${OUTPUT_DIR}/${subject_id}/ses-${session}"
         anat_output_dir="${output_dir}/anat"
     fi
     
@@ -231,6 +229,8 @@ find_subjects() {
 
 # ---------------------------- Main Script ----------------------------------
 
+# ---------------------------- Main Script ----------------------------------
+
 # Process command line arguments
 while getopts "i:o:r:c:l:xdvh" opt; do
     case ${opt} in
@@ -248,6 +248,8 @@ while getopts "i:o:r:c:l:xdvh" opt; do
     esac
 done
 
+shift $((OPTIND-1))
+
 # Validate inputs and check prerequisites
 validate_input
 check_prerequisites
@@ -256,45 +258,54 @@ check_prerequisites
 if [ -z "$LOG_DIR" ]; then
     LOG_DIR="$OUTPUT_DIR/logs"
 fi
+
 mkdir -p "$LOG_DIR"
 
-# Create temporary file for subject list
-temp_file=$(mktemp)
-trap 'rm -f "$temp_file"' EXIT
+# Validate subject arguments
+if [ $# -lt 1 ]; then
+    log "ERROR" "Subject ID must be provided"
+    usage
+fi
 
-# Find subjects and sessions
-log "INFO" "Scanning input directory for subjects..."
-find_subjects "$temp_file"
+subject_id="$1"
+session="${2:-\"\"}"
+recon_path="${RECON_ALL_DIR}/${subject_id}"
 
-total_subjects=$(wc -l < "$temp_file")
-log "INFO" "Found $total_subjects subject/session combinations to process"
+# Validate subject directory exists
+subject_path="${INPUT_DIR}/${subject_id}"
+if [ ! -d "$subject_path" ]; then
+    log "ERROR" "Subject directory not found: $subject_path"
+    exit 1
+fi
 
-if [ "$total_subjects" -eq 0 ]; then
-    log "ERROR" "No subjects found in input directory"
+# Validate anatomical directory exists
+if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+    anat_path="${subject_path}/anat"
+else
+    anat_path="${subject_path}/${session}/anat"
+fi
+
+if [ ! -d "$anat_path" ]; then
+    log "ERROR" "Anatomical directory not found: $anat_path"
+    exit 1
+fi
+
+# Validate ReconAll directory exists
+if [ ! -d "$recon_path" ]; then
+    log "ERROR" "ReconAll directory not found: $recon_path"
     exit 1
 fi
 
 if [ "$DRY_RUN" = true ]; then
-    log "DRY-RUN" "Would process the following subjects:"
-    cat "$temp_file"
+    log "DRY-RUN" "Would process anatomical data for subject: $subject_id${session:+ session $session}"
     exit 0
 fi
 
-# Process subjects in parallel
-export -f process_subject
-export -f log
-export OUTPUT_DIR LOG_DIR SKIP_EXISTING DRY_RUN VERBOSE
-
-# Calculate maximum parallel jobs
-TOTAL_CORES=$(nproc)
-MAX_JOBS=$(( TOTAL_CORES / CORES_PER_SUBJECT ))
-if [ "$MAX_JOBS" -lt 1 ]; then
-    MAX_JOBS=1
+# Process the single subject
+if ! process_subject "$subject_id" "$session" "$recon_path"; then
+    log "ERROR" "Anatomical preprocessing failed for subject $subject_id${session:+ session $session}"
+    exit 1
 fi
 
-log "INFO" "Processing with maximum $MAX_JOBS parallel jobs"
+log "SUCCESS" "Anatomical preprocessing completed for subject $subject_id${session:+ session $session}"
 
-parallel --progress --jobs "$MAX_JOBS" --colsep ' ' \
-    process_subject {1} {2} "$RECON_ALL_DIR/{1}" < "$temp_file"
-
-log "SUCCESS" "All processing completed"
