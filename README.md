@@ -1,135 +1,113 @@
-# fMRI Data Processing Pipeline
+# Modular Neuroimaging Processing Pipeline
 
-A comprehensive bash-based pipeline for processing fMRI data, including anatomical preprocessing, functional preprocessing, registration, and nuisance regression.
+This repository contains a Bash-based orchestration layer for neuroimaging workflows. The entrypoint (`main.sh`) currently drives a functional MRI (fMRI) pipeline and is structured so additional modalities (e.g., structural MRI, PET) can be plugged in with minimal effort.
 
-## Overview
-
-This pipeline integrates multiple processing steps:
-1. FreeSurfer's ReconAll Processing (FC_step0)
-2. Anatomical Data Processing (FC_step1)
-3. Functional Data Preprocessing (FC_step2)
-4. Registration (FC_step3)
-5. Tissue Segmentation (FC_step4)
-6. Nuisance Regression (FC_step5)
-7. Results Extraction (FC_step6)
+## Features
+- **Pipeline registry** that enumerates ordered steps, associated commands, and completion checks per modality.
+- **Extensible architecture**: register new modalities/steps without touching the subject-processing core.
+- **Robust execution controls**: skip-completed logic, dry-run support, parallelisation, and consistent logging.
+- **Centralised error tracking** with per-subject summaries and daily reports.
 
 ## Prerequisites
+Install and configure the following toolkits before running the pipeline:
 
-- FreeSurfer
-- FSL
-- AFNI
-- GNU Parallel
+- [FreeSurfer](https://surfer.nmr.mgh.harvard.edu/)
+- [FSL](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/)
+- [AFNI](https://afni.nimh.nih.gov/)
+- [GNU Parallel](https://www.gnu.org/software/parallel/)
 
-## Directory Structure
+Ensure `FREESURFER_HOME` and `FSLDIR` are set in the environment and their setup scripts have been sourced.
 
+## Directory Layout
 ```
-input_dir/
-├── sub-001/
-│   ├── anat/
-│   │   └── sub-001_T1w.nii.gz
-│   └── func/
-│       └── sub-001_task-rest_bold.nii.gz
-└── sub-002/
+fMRI_Processing/
+├── main.sh
+├── FC_step0 ... FC_step5        # Modality-specific helper scripts
+├── standard/                    # Standard-space templates
+├── template/                    # FEAT/FSF templates
+├── tissuepriors/                # Tissue priors for segmentation
+└── ...
+```
+
+### Input structure
+```
+/input_dir/
+└── sub-001/
     ├── anat/
-    │   └── sub-002_T1w.nii.gz
+    │   └── sub-001_T1w.nii.gz
     └── func/
-        └── sub-002_task-rest_bold.nii.gz
+        └── sub-001_task-rest_bold.nii.gz
 ```
+Sessions (`ses-001`, `ses-002`, …) are automatically detected if present under each subject directory.
+
+### Output structure
+```
+/output_dir/
+├── logs/pipeline_YYYYMMDD.log
+├── error_logs/
+│   ├── failed_subjects_YYYYMMDD.txt
+│   └── errors_YYYYMMDD.log
+├── recon_all/
+└── sub-001/
+    ├── anat/
+    └── func/
+```
+A per-run summary is written to `processing_report_YYYYMMDD.txt`.
 
 ## Configuration
+Key settings reside near the top of `main.sh`:
+- `INPUT_DIR`, `OUTPUT_DIR`, `STANDARD_DIR`, `TISSUES_DIR`, `TEMPLATE_DIR`, `RECONALL_DIR`
+- Processing parameters (`NUM_THREADS`, `FWHM`, `SIGMA`, `HIGHP`, `LOWP`, `TR`, `TE`, `N_VOLS`)
+- Pipeline controls (`PIPELINES_TO_RUN`, `FSF_TYPES`, `GENERAL_FLAGS`, `SKIP_EXISTING`, `DRY_RUN`, `VERBOSE`)
 
-Key parameters in `main.sh`:
+Override any variable at invocation time by exporting or prefixing the call:
 ```bash
-# Directory settings
-INPUT_DIR="/path/to/input"          # Raw data directory
-OUTPUT_DIR="/path/to/output"        # Output directory
-STANDARD_DIR="./standard"           # Standard brain templates
-TEMPLATE_DIR="./template"           # FSF templates
-
-# Processing parameters
-NUM_THREADS=4                       # Number of CPU threads
-FWHM=6.0                           # Full Width at Half Maximum
-SIGMA=2.548                        # Smoothing sigma
-TR=2.0                             # Repetition Time
-TE=30                              # Echo Time
-N_VOLS=200                         # Number of volumes
+DRY_RUN=true PIPELINES_TO_RUN="fmri" bash main.sh
 ```
 
 ## Usage
+1. Adjust configuration values in `main.sh` or export overrides.
+2. Run the pipeline:
+   ```bash
+   bash main.sh
+   ```
+3. Review logs under `OUTPUT_DIR/logs` and the generated processing report.
 
-### Basic Usage
-```bash
-bash main.sh
-```
+### Common scenarios
+- Inspect commands without executing:
+  ```bash
+  DRY_RUN=true VERBOSE=true bash main.sh
+  ```
+- Reprocess even if outputs exist:
+  ```bash
+  SKIP_EXISTING=false bash main.sh
+  ```
+- Limit processing to a subset of modalities (e.g., future `smri`):
+  ```bash
+  PIPELINES_TO_RUN="fmri smri" bash main.sh
+  ```
 
-### Options
-```bash
--f    FSF types (comma-separated, default: NO_GRD,Retain_GRS)
--s    Skip existing (default: true)
--d    Dry run
--v    Verbose output
--h    Display help message
-```
+## Extending to New Modalities
+1. Create modality-specific helper scripts or command builders.
+2. Register the steps inside `initialize_pipelines()` using `register_shell_step` or `register_custom_step`.
+3. Add any modality-specific preparation to `prepare_pipeline_subject()`.
+4. Update configuration defaults (e.g., include the new modality in `PIPELINES_TO_RUN`).
 
-### Examples
-```bash
-# Dry run with verbose output
-bash main.sh -d -v
-
-# Process with specific FSF type
-bash main.sh -f NO_GRD
-
-# Skip existing processed data
-bash main.sh -s
-```
-
-## Output Structure
-
-```
-output_dir/
-├── logs/
-│   └── pipeline_YYYYMMDD.log
-├── error_logs/
-│   └── failed_subjects_YYYYMMDD.txt
-├── recon_all/
-│   └── [FreeSurfer outputs]
-├── sub-001/
-│   ├── anat/
-│   │   └── [Processed anatomical data]
-│   └── func/
-│       └── [Processed functional data]
-└── results/
-    └── [Final outputs]
-```
+The registry automatically orders steps, handles skip logic, and ensures dry-run support.
 
 ## Error Handling
-
-- Failed subjects are logged in `error_logs/failed_subjects_YYYYMMDD.txt`
-- Detailed error messages in `error_logs/errors_YYYYMMDD.log`
-- Processing report in `processing_report_YYYYMMDD.txt`
-
-## Notes
-
-1. Ensure all prerequisites are installed and properly configured
-2. Set up FreeSurfer environment before running
-3. Check disk space requirements
-4. Verify input data structure
+- Detailed step output is captured via temporary logs; failures append to `error_logs/errors_YYYYMMDD.log`.
+- Unique subject/pipeline/step failures are tracked in `failed_subjects_YYYYMMDD.txt` for quick triage.
+- Aggregate metrics, including per-step error counts, appear in the processing report.
 
 ## Troubleshooting
-
-Common issues:
-- `brain.mgz not found`: ReconAll processing failed
-- `example_func.nii.gz not found`: Functional preprocessing failed
-- Permission errors: Check directory permissions
+- **Missing `brain.mgz`**: recon-all output not located at `RECONALL_DIR`; verify FreeSurfer processing.
+- **Functional outputs absent**: confirm `FC_step2` finished and input data follow expected naming.
+- **Permission errors**: the pipeline attempts to `chmod` key folders; ensure the user has write access.
+- **`parallel: command not found`**: install GNU Parallel or adjust the script to use serial execution.
 
 ## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+Contributions are welcome. Submit pull requests with clear descriptions and, when introducing new modalities, include example configuration and documentation updates.
 
 ## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+Released under the MIT License. See `LICENSE` for details.
