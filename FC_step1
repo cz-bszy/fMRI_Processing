@@ -1,0 +1,311 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# =============================================================================
+# Script: FC_step1
+# Description:
+#   Batch anatomical processing script that:
+#   1. Processes all subjects in an input directory
+#   2. Supports both with/without session directory structures
+#   3. Converts FreeSurfer brain.mgz to Stru_Brain.nii.gz
+#   4. Performs FSL FAST tissue segmentation
+# =============================================================================
+
+# ---------------------------- Configuration ----------------------------------
+
+INPUT_DIR=""
+OUTPUT_DIR=""
+RECON_ALL_DIR=""
+NUM_THREADS=""
+LOG_DIR=""
+CORES_PER_SUBJECT=4
+SKIP_EXISTING=false
+DRY_RUN=false
+VERBOSE=false
+
+# ---------------------------- Usage Function --------------------------------
+
+usage() {
+    echo "Enhanced Batch Anatomical Processing Script"
+    echo "Usage: $0 [options]" >&2
+    echo ""
+    echo "Required Arguments:"
+    echo "  -i    Input data directory"
+    echo "  -o    Output directory"
+    echo "  -r    Recon-all directory (containing FreeSurfer outputs)"
+    echo ""
+    echo "Optional Arguments:"
+    echo "  -c    Cores per subject (default: $CORES_PER_SUBJECT)"
+    echo "  -l    Log directory (default: output_dir/logs)"
+    echo "  -x    Skip existing processed subjects"
+    echo "  -d    Dry run (show commands without executing)"
+    echo "  -v    Verbose output"
+    echo "  -h    Display this help message"
+    exit 1
+}
+
+# ---------------------------- Functions -------------------------------------
+
+log() {
+    local level="$1"
+    shift
+    local message="[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*"
+
+    case "$level" in
+        "ERROR")   echo -e "\033[31m$message\033[0m" ;;
+        "WARNING") echo -e "\033[33m$message\033[0m" ;;
+        "SUCCESS") echo -e "\033[32m$message\033[0m" ;;
+        "INFO")    echo -e "\033[36m$message\033[0m" ;;
+        *)         echo "$message" ;;
+    esac
+    
+    if [ ! -z "$LOG_DIR" ]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/preproc_$(date +'%Y%m%d').log"
+    fi
+}
+
+
+validate_input() {
+    if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$RECON_ALL_DIR" ]; then
+        log "ERROR" "Missing required arguments: input directory, output directory, and recon-all directory must be specified."
+        usage
+    fi
+
+    if [ ! -d "$INPUT_DIR" ]; then
+        log "ERROR" "Input directory '$INPUT_DIR' does not exist."
+        exit 1
+    fi
+
+    if [ ! -d "$RECON_ALL_DIR" ]; then
+        log "ERROR" "Recon-all directory '$RECON_ALL_DIR' does not exist."
+        exit 1
+    fi
+
+    # Create output directory if it doesn't exist
+    mkdir -p "$OUTPUT_DIR"
+
+    # Validate cores per subject if specified
+    if [ ! -z "$NUM_THREADS" ] && ! [[ "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+        log "ERROR" "Number of threads must be a positive integer."
+        exit 1
+    fi
+}
+
+check_prerequisites() {
+    local missing_prereqs=()
+    
+    # Check for FreeSurfer's mri_convert
+    if ! command -v mri_convert >/dev/null 2>&1; then
+        missing_prereqs+=("FreeSurfer (mri_convert)")
+    fi
+    
+    # Check for FSL's fast
+    if ! command -v fast >/dev/null 2>&1; then
+        missing_prereqs+=("FSL (fast)")
+    fi
+    
+    # Check for GNU Parallel
+    if ! command -v parallel >/dev/null 2>&1; then
+        missing_prereqs+=("GNU Parallel")
+    fi
+    
+    if [ ${#missing_prereqs[@]} -ne 0 ]; then
+        log "ERROR" "Missing prerequisites: ${missing_prereqs[*]}"
+        exit 1
+    fi
+}
+
+process_subject() {
+    local subject_id="$1"
+    local session="$2"
+    local recon_subj_dir="$3"
+    
+    # Create output directory structure with sub- prefix
+    local output_dir
+    local anat_output_dir
+    
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+        output_dir="${OUTPUT_DIR}/${subject_id}"
+        anat_output_dir="${output_dir}/anat"
+    else
+        output_dir="${OUTPUT_DIR}/${subject_id}/ses-${session}"
+        anat_output_dir="${output_dir}/anat"
+    fi
+    
+    mkdir -p "$anat_output_dir"
+    
+    if [ "$VERBOSE" = true ]; then
+        log "INFO" "Creating output directory: $anat_output_dir"
+    fi
+    
+    # Set up input/output files
+    local mri_dir="${recon_subj_dir}/mri"
+    local input_file="${mri_dir}/brain.mgz"
+    local output_file="${anat_output_dir}/Stru_Brain.nii.gz"
+    local segment_prefix="${anat_output_dir}/segment"
+    
+    # Check if processing can be skipped
+    if [ "$SKIP_EXISTING" = true ] && [ -f "$output_file" ] && [ -f "${segment_prefix}_seg.nii.gz" ]; then
+        log "INFO" "Output files already exist for subject $subject_id${session:+ session $session}. Skipping."
+        return 0
+    fi
+    
+    # Verify input file exists
+    if [ ! -f "$input_file" ]; then
+        log "ERROR" "Input file '$input_file' does not exist for subject $subject_id${session:+ session $session}"
+        return 1
+    fi
+    
+    # Print commands if in verbose mode
+    if [ "$VERBOSE" = true ]; then
+        log "COMMAND" "mri_convert \"$input_file\" \"$output_file\""
+        log "COMMAND" "fast -t 1 -g -p -o \"$segment_prefix\" \"$output_file\""
+    fi
+    
+    # Exit if dry run
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN" "Would process $subject_id${session:+ session $session}"
+        return 0
+    fi
+    
+    # Perform conversion
+    log "INFO" "Converting brain.mgz to NIfTI format for subject $subject_id${session:+ session $session}..."
+    if ! mri_convert "$input_file" "$output_file"; then
+        log "ERROR" "mri_convert failed for subject $subject_id${session:+ session $session}"
+        return 1
+    fi
+    log "SUCCESS" "Successfully converted to '$output_file'"
+    
+    # Perform segmentation
+    log "INFO" "Running FSL FAST segmentation for subject $subject_id${session:+ session $session}..."
+    if ! fast -t 1 -g -p -o "$segment_prefix" "$output_file"; then
+        log "ERROR" "FSL FAST segmentation failed for subject $subject_id${session:+ session $session}"
+        return 1
+    fi
+    log "SUCCESS" "Successfully completed FSL FAST segmentation"
+    
+    # Verify output files
+    local required_files=(
+        "$output_file"
+        "${segment_prefix}_seg.nii.gz"
+        "${segment_prefix}_pve_0.nii.gz"
+        "${segment_prefix}_pve_1.nii.gz"
+        "${segment_prefix}_pve_2.nii.gz"
+    )
+    
+    for file in "${required_files[@]}"; do
+        if [ ! -f "$file" ]; then
+            log "ERROR" "Expected output file not found: $file"
+            return 1
+        fi
+    done
+    
+    log "SUCCESS" "Processing completed for subject $subject_id${session:+ session $session}"
+    return 0
+}
+
+find_subjects() {
+    local temp_file="$1"
+    
+    while IFS= read -r dir; do
+        subject_dir=$(basename "$dir")
+        
+        # Check if this is a session directory or subject directory
+        if [[ -d "$dir/anat" ]]; then
+            # No session structure
+            echo "$subject_dir "" $dir" >> "$temp_file"
+        else
+            # Session structure
+            while IFS= read -r session_dir; do
+                session=$(basename "$session_dir")
+                if [[ -d "$session_dir/anat" ]]; then
+                    echo "$subject_dir $session $session_dir" >> "$temp_file"
+                fi
+            done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d)
+        fi
+    done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d)
+}
+
+# ---------------------------- Main Script ----------------------------------
+
+# ---------------------------- Main Script ----------------------------------
+
+# Process command line arguments
+while getopts "i:o:r:c:l:xdvh" opt; do
+    case ${opt} in
+        i) INPUT_DIR="$OPTARG";;
+        o) OUTPUT_DIR="$OPTARG";;
+        r) RECON_ALL_DIR="$OPTARG";;
+        c) CORES_PER_SUBJECT="$OPTARG";;
+        l) LOG_DIR="$OPTARG";;
+        x) SKIP_EXISTING=true;;
+        d) DRY_RUN=true;;
+        v) VERBOSE=true;;
+        h) usage;;
+        \?) log "ERROR" "Invalid Option: -$OPTARG"; usage;;
+        :) log "ERROR" "Option -$OPTARG requires an argument."; usage;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+# Validate inputs and check prerequisites
+validate_input
+check_prerequisites
+
+# Set up logging directory
+if [ -z "$LOG_DIR" ]; then
+    LOG_DIR="$OUTPUT_DIR/logs"
+fi
+
+mkdir -p "$LOG_DIR"
+
+# Validate subject arguments
+if [ $# -lt 1 ]; then
+    log "ERROR" "Subject ID must be provided"
+    usage
+fi
+
+subject_id="$1"
+session="${2:-\"\"}"
+recon_path="${RECON_ALL_DIR}/${subject_id}"
+
+# Validate subject directory exists
+subject_path="${INPUT_DIR}/${subject_id}"
+if [ ! -d "$subject_path" ]; then
+    log "ERROR" "Subject directory not found: $subject_path"
+    exit 1
+fi
+
+# Validate anatomical directory exists
+if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+    anat_path="${subject_path}/anat"
+else
+    anat_path="${subject_path}/${session}/anat"
+fi
+
+if [ ! -d "$anat_path" ]; then
+    log "ERROR" "Anatomical directory not found: $anat_path"
+    exit 1
+fi
+
+# Validate ReconAll directory exists
+if [ ! -d "$recon_path" ]; then
+    log "ERROR" "ReconAll directory not found: $recon_path"
+    exit 1
+fi
+
+if [ "$DRY_RUN" = true ]; then
+    log "DRY-RUN" "Would process anatomical data for subject: $subject_id${session:+ session $session}"
+    exit 0
+fi
+
+# Process the single subject
+if ! process_subject "$subject_id" "$session" "$recon_path"; then
+    log "ERROR" "Anatomical preprocessing failed for subject $subject_id${session:+ session $session}"
+    exit 1
+fi
+
+log "SUCCESS" "Anatomical preprocessing completed for subject $subject_id${session:+ session $session}"
+

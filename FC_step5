@@ -1,0 +1,380 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# =============================================================================
+# Script: FC_step5
+# Description:
+#   Combined enhanced processing script that performs:
+#   1. Nuisance regression
+#       - Splits motion parameters
+#       - Extracts signals (global, CSF, WM)
+#       - Runs FEAT model based on FSF type
+#       - Gets residuals and processes them
+#       - Resamples residuals to MNI space
+#   2. Results extraction 
+#       - Organizes results into designated output structure
+# =============================================================================
+
+# ---------------------------- Configuration ----------------------------------
+
+INPUT_DIR=""
+OUTPUT_DIR=""
+TEMPLATE_DIR=""
+NUM_THREADS=4
+TR=""
+TE=""
+N_VOLS=""
+FSF_TYPE=""
+LOG_DIR=""
+SKIP_EXISTING=false
+DRY_RUN=false
+VERBOSE=false
+
+# ---------------------------- Usage Function --------------------------------
+
+usage() {
+    echo "Combined FC Processing Script"
+    echo "Usage: $0 [options]" >&2
+    echo ""
+    echo "Required Arguments:"
+    echo "  -i    Input data directory"
+    echo "  -o    Output directory"
+    echo "  -t    Template directory (containing FSF templates)"
+    echo "  -r    TR value"
+    echo "  -e    TE value"
+    echo "  -s    Number of volumes"
+    echo "  -f    FSF type (NoGRS or Retain_GRS)"
+    echo ""
+    echo "Optional Arguments:"
+    echo "  -n    Number of threads (default: $NUM_THREADS)"
+    echo "  -l    Log directory (default: output_dir/logs)"
+    echo "  -x    Skip existing processed subjects"
+    echo "  -d    Dry run (show commands without executing)"
+    echo "  -v    Verbose output"
+    echo "  -h    Display this help message"
+    exit 1
+}
+
+# ---------------------------- Functions -------------------------------------
+
+log() {
+    local level="$1"
+    shift
+    local message="[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*"
+
+    case "$level" in
+        "ERROR")   echo -e "\033[31m$message\033[0m" ;;
+        "WARNING") echo -e "\033[33m$message\033[0m" ;;
+        "SUCCESS") echo -e "\033[32m$message\033[0m" ;;
+        "INFO")    echo -e "\033[36m$message\033[0m" ;;
+        *)         echo "$message" ;;
+    esac
+    
+    if [ ! -z "$LOG_DIR" ]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/preproc_$(date +'%Y%m%d').log"
+    fi
+}
+
+
+check_prerequisites() {
+    local missing_prereqs=()
+    
+    # Check for AFNI tools
+    for cmd in 3dmaskave 3dTstat 3dcalc 3dBrickStat; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_prereqs+=("AFNI ($cmd)")
+        fi
+    done
+    
+    # Check for FSL tools
+    for cmd in feat_model film_gls flirt; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_prereqs+=("FSL ($cmd)")
+        fi
+    done
+    
+    if [ ${#missing_prereqs[@]} -ne 0 ]; then
+        log "ERROR" "Missing prerequisites: ${missing_prereqs[*]}"
+        exit 1
+    fi
+}
+
+validate_input() {
+    if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$TEMPLATE_DIR" ] || \
+       [ -z "$TR" ] || [ -z "$TE" ] || [ -z "$N_VOLS" ] || [ -z "$FSF_TYPE" ]; then
+        log "ERROR" "All required parameters must be specified."
+        usage
+    fi
+
+    if ! [[ "$FSF_TYPE" =~ ^(NoGRS|Retain_GRS)$ ]]; then
+        log "ERROR" "FSF_TYPE must be either NoGRS or Retain_GRS"
+        exit 1
+    fi
+
+    if ! [[ "$N_VOLS" =~ ^[0-9]+$ ]]; then
+        log "ERROR" "Number of volumes must be a positive integer"
+        exit 1
+    fi
+
+    if ! [[ "$TR" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$TE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        log "ERROR" "TR and TE must be positive numbers"
+        exit 1
+    fi
+
+    # Check FSF templates
+    if [ ! -f "${TEMPLATE_DIR}/nuisance_N.fsf" ] || [ ! -f "${TEMPLATE_DIR}/nuisance_R.fsf" ]; then
+        log "ERROR" "FSF templates not found in template directory"
+        exit 1
+    fi
+}
+
+process_subject() {
+    local subject_id="$1"
+    local session="$2"
+    
+    local output_dir
+    local func_dir
+    local results_dir="${OUTPUT_DIR}/results/${FSF_TYPE}"
+    
+    # Set up directory structure
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+        output_dir="${OUTPUT_DIR}/${subject_id}"
+        func_dir="${output_dir}/func"
+    else
+        output_dir="${OUTPUT_DIR}/${subject_id}/${session}"
+        func_dir="${output_dir}/func"
+    fi
+    
+    local reg_dir="${func_dir}/reg_dir"
+    local segment_dir="${func_dir}/seg"
+    local nuisance_dir="${func_dir}/nuisance"
+    
+    mkdir -p "$results_dir"
+    
+    # Create target filename based on presence of session
+    local target_filename
+    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+        target_filename="${subject_id}_${FSF_TYPE}.nii.gz"
+    else
+        target_filename="${subject_id}_${session}_${FSF_TYPE}.nii.gz"
+    fi
+    
+    local target_file="${results_dir}/${target_filename}"
+    
+    # Skip if already processed
+    if [ "$SKIP_EXISTING" = true ] && [ -f "$target_file" ]; then
+        log "INFO" "Results already exist for subject $subject_id${session:+ session $session}. Skipping."
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN" "Would process subject $subject_id${session:+ session $session}"
+        return 0
+    fi
+
+    # Clean up previous outputs
+    log "INFO" "Cleaning up previous outputs for subject $subject_id${session:+ session $session}"
+    rm -rf "$nuisance_dir" "${func_dir}/rest_res.nii.gz" "${func_dir}/rest_res2standard.nii.gz"
+    
+    # Create necessary directories
+    mkdir -p "$nuisance_dir"
+
+    # Check required input files
+    local required_inputs=(
+        "${func_dir}/rest_mc.1D"
+        "${func_dir}/rest_pp.nii.gz"
+        "${func_dir}/rest_pp_mask.nii.gz"
+        "${segment_dir}/global_mask.nii.gz"
+        "${segment_dir}/csf_mask.nii.gz"
+        "${segment_dir}/wm_mask.nii.gz"
+    )
+    
+    for file in "${required_inputs[@]}"; do
+        if [ ! -f "$file" ]; then
+            log "ERROR" "Required input file not found: $file"
+            return 1
+        fi
+    done
+    
+    # Process nuisance regression
+    log "INFO" "Processing nuisance regression..."
+    
+    # Split motion parameters
+    for i in {1..6}; do
+        awk -v col=$i '{print $col}' "${func_dir}/rest_mc.1D" > "${nuisance_dir}/mc${i}.1D"
+    done
+    
+    # Extract signals
+    3dmaskave -mask "${segment_dir}/global_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/global.1D"
+    3dmaskave -mask "${segment_dir}/csf_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/csf.1D"
+    3dmaskave -mask "${segment_dir}/wm_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/wm.1D"
+    
+    # Copy preprocessed data and create FSF file
+    cp "${func_dir}/rest_pp.nii.gz" "${nuisance_dir}/"
+    
+    local regstandard_path="$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz"
+    
+    if [ "$FSF_TYPE" = "NoGRS" ]; then
+        sed -e "s:nuisance_dir:${nuisance_dir}:g" \
+            -e "s:nuisance_model_outputdir:${nuisance_dir}/residuals.feat:g" \
+            -e "s:nuisance_model_TR:${TR}:g" \
+            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
+            -e "s:nuisance_model_input_data:${nuisance_dir}/rest_pp.nii.gz:g" \
+            -e "s:nuisance_model_TE:${TE}:g" \
+            -e "s:standard_mni_2mm:${regstandard_path}:g" \
+            "${TEMPLATE_DIR}/nuisance_N.fsf" > "${nuisance_dir}/nuisance.fsf"
+    else
+        sed -e "s:nuisance_output:${nuisance_dir}/residuals.feat:g" \
+            -e "s:standard_mni_2mm:${regstandard_path}:g" \
+            -e "s:feat_files_1:${nuisance_dir}/rest_pp:g" \
+            -e "s:fmri_1:${nuisance_dir}/csf.1D:g" \
+            -e "s:fmri_2:${nuisance_dir}/wm.1D:g" \
+            -e "s:fmri_3:${nuisance_dir}/mc1.1D:g" \
+            -e "s:fmri_4:${nuisance_dir}/mc2.1D:g" \
+            -e "s:fmri_5:${nuisance_dir}/mc3.1D:g" \
+            -e "s:fmri_6:${nuisance_dir}/mc4.1D:g" \
+            -e "s:fmri_7:${nuisance_dir}/mc5.1D:g" \
+            -e "s:nuisance_model_TR:${TR}:g" \
+            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
+            -e "s:nuisance_model_TE:${TE}:g" \
+            -e "s:fmri_8:${nuisance_dir}/mc6.1D:g" \
+            "${TEMPLATE_DIR}/nuisance_R.fsf" > "${nuisance_dir}/nuisance.fsf"
+    fi
+    
+
+    log "INFO" "Running FEAT model and GLM..."
+    feat_model "${nuisance_dir}/nuisance"
+    
+    local minVal
+    minVal=$(3dBrickStat -min -mask "${func_dir}/rest_pp_mask.nii.gz" "${func_dir}/rest_pp.nii.gz" | tr -d '[:space:]')
+    
+    if ! film_gls --rn="${nuisance_dir}/stats" \
+              --noest --sa --ms=5 \
+              --in="${nuisance_dir}/rest_pp.nii.gz" \
+              --pd="${nuisance_dir}/nuisance.mat" \
+              --thr="${minVal}"; then
+        log "ERROR" "FILM GLM failed"
+        return 1
+    fi
+
+    sleep 5
+    
+    # Process and resample residuals
+    local res4d_file="${nuisance_dir}/stats/res4d.nii.gz"
+    
+    if [ ! -f "$res4d_file" ]; then
+        log "ERROR" "FILM GLM did not produce res4d.nii.gz"
+        return 1
+    fi
+    
+    log "INFO" "Processing residuals..."
+    3dTstat -mean -prefix "${nuisance_dir}/stats/res4d_mean.nii.gz" "$res4d_file"
+    
+    3dcalc -a "$res4d_file" \
+           -b "${nuisance_dir}/stats/res4d_mean.nii.gz" \
+           -expr '(a-b)+100' \
+           -prefix "${func_dir}/rest_res.nii.gz"
+    
+    if [ ! -f "${func_dir}/rest_res.nii.gz" ]; then
+        log "ERROR" "Failed to create rest_res.nii.gz"
+        return 1
+    fi
+    
+    log "INFO" "Resampling to standard space..."
+    if ! flirt -ref "${reg_dir}/standard.nii.gz" \
+              -in "${func_dir}/rest_res.nii.gz" \
+              -out "${func_dir}/rest_res2standard.nii.gz" \
+              -applyxfm -init "${reg_dir}/example_func2standard.mat" \
+              -interp trilinear; then
+        log "ERROR" "Standard space resampling failed"
+        return 1
+    fi
+    
+    # Copy final results to results directory
+    if ! cp "${func_dir}/rest_res2standard.nii.gz" "$target_file"; then
+        log "ERROR" "Failed to copy final results"
+        return 1
+    fi
+    
+    log "SUCCESS" "Completed processing for subject $subject_id${session:+ session $session}"
+    return 0
+}
+
+# ---------------------------- Main Script ----------------------------------
+
+# ---------------------------- Main Script ----------------------------------
+
+# Process command line arguments
+while getopts "i:o:t:r:e:s:f:n:l:xdvh" opt; do
+    case ${opt} in
+        i) INPUT_DIR="$OPTARG";;
+        o) OUTPUT_DIR="$OPTARG";;
+        t) TEMPLATE_DIR="$OPTARG";;
+        r) TR="$OPTARG";;
+        e) TE="$OPTARG";;
+        s) N_VOLS="$OPTARG";;
+        f) FSF_TYPE="$OPTARG";;
+        n) NUM_THREADS="$OPTARG";;
+        l) LOG_DIR="$OPTARG";;
+        x) SKIP_EXISTING=true;;
+        d) DRY_RUN=true;;
+        v) VERBOSE=true;;
+        h) usage;;
+        \?) log "ERROR" "Invalid Option: -$OPTARG"; usage;;
+        :) log "ERROR" "Option -$OPTARG requires an argument."; usage;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+# Setup and validation
+check_prerequisites
+validate_input
+
+# Set up logging directory
+if [ -z "$LOG_DIR" ]; then
+    LOG_DIR="$OUTPUT_DIR/logs"
+fi
+mkdir -p "$LOG_DIR"
+
+# Validate subject arguments
+if [ $# -lt 1 ]; then
+    log "ERROR" "Subject ID must be provided"
+    usage
+fi
+
+subject_id="$1"
+session="${2:-\"\"}"
+
+# Validate subject directory exists
+subject_path="${INPUT_DIR}/${subject_id}"
+if [ ! -d "$subject_path" ]; then
+    log "ERROR" "Subject directory not found: $subject_path"
+    exit 1
+fi
+
+# Validate functional directory exists
+if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+    func_path="${subject_path}/func"
+else
+    func_path="${subject_path}/${session}/func"
+fi
+
+if [ ! -d "$func_path" ]; then
+    log "ERROR" "Functional directory not found: $func_path"
+    exit 1
+fi
+
+if [ "$DRY_RUN" = true ]; then
+    log "DRY-RUN" "Would process subject: $subject_id${session:+ session $session}"
+    exit 0
+fi
+
+# Process the single subject
+if ! process_subject "$subject_id" "$session"; then
+    log "ERROR" "Processing failed for subject $subject_id${session:+ session $session}"
+    exit 1
+fi
+
+log "SUCCESS" "Processing completed for subject $subject_id${session:+ session $session}"
