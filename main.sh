@@ -35,6 +35,7 @@ N_VOLS=156                                  # Number of volumes
 PIPELINES_TO_RUN=("fmri")                  # Pipelines to execute; extend with smri/pet
 FSF_TYPES=("NoGRS" "Retain_GRS")          # FSF flavours for fMRI step 5
 GENERAL_FLAGS=()                            # Additional flags forwarded to step scripts
+FUNC_FILE_PATTERN="${FUNC_FILE_PATTERN:-*rest*.nii*}"  # Glob(s) searched for functional runs (comma-separated)
 
 # Processing behaviour
 SKIP_EXISTING=true                          # Skip completed steps when outputs exist
@@ -224,7 +225,6 @@ setup_directories() {
     local dirs=(
         "$base_dir"
         "$base_dir/error_logs"
-        "$base_dir/recon_all"
         "$base_dir/logs"
         "$base_dir/results"
     )
@@ -337,6 +337,9 @@ initialize_pipelines() {
     PIPELINE_REGISTRY=""
 
     # fMRI pipeline definition
+    register_shell_step "fmri" "recon_all" "FreeSurfer recon-all" \
+        build_fmri_recon_command fmri_has_recon_output
+
     register_shell_step "fmri" "anatomical" "Anatomical preprocessing" \
         build_fmri_anatomical_command fmri_has_anatomical_output
 
@@ -354,6 +357,23 @@ initialize_pipelines() {
 }
 
 # ---------------------------- Step Builders & Checks -----------------------
+
+fmri_has_recon_output() {
+    local subject="$1"
+    local session="${2:-}"
+    if [ "$session" = "\"\"" ]; then
+        session=""
+    fi
+
+    local recon_subject="$subject"
+    if [ -n "$session" ]; then
+        recon_subject="${subject}_${session}"
+    fi
+
+    local brain_path
+    printf -v brain_path '%s/%s/mri/brain.mgz' "$RECONALL_DIR" "$recon_subject"
+    [ -f "$brain_path" ]
+}
 
 fmri_has_anatomical_output() {
     local subject="$1"
@@ -379,6 +399,18 @@ fmri_has_segmentation_output() {
     [ -f "$(subject_func_dir "$subject")/seg/wm_mask.nii.gz" ]
 }
 
+build_fmri_recon_command() {
+    local subject="$1"
+    local session="${2:-}"
+    local flags=$(format_general_flags)
+    local session_arg
+    printf -v session_arg ' %q' "$session"
+    local command
+    printf -v command 'bash FC_step0 -i %q -o %q -c %q -l %q%s %q%s' \
+        "$INPUT_DIR" "$RECONALL_DIR" "$NUM_THREADS" "$LOG_DIR" "$flags" "$subject" "$session_arg"
+    printf '%s' "$command"
+}
+
 build_fmri_anatomical_command() {
     local subject="$1"
     local session="${2:-}"
@@ -398,8 +430,8 @@ build_fmri_functional_command() {
     local session_arg
     printf -v session_arg ' %q' "$session"
     local command
-    printf -v command 'bash FC_step2 -i %q -o %q -n %q -w %q -g %q -h %q -l %q -d %q%s -v %q%s' \
-        "$INPUT_DIR" "$OUTPUT_DIR" "$NUM_THREADS" "$FWHM" "$SIGMA" "$HIGHP" "$LOWP" "$LOG_DIR" "$flags" "$subject" "$session_arg"
+    printf -v command 'bash FC_step2 -i %q -o %q -n %q -w %q -g %q -h %q -l %q -d %q -p %q%s -v %q%s' \
+        "$INPUT_DIR" "$OUTPUT_DIR" "$NUM_THREADS" "$FWHM" "$SIGMA" "$HIGHP" "$LOWP" "$LOG_DIR" "$FUNC_FILE_PATTERN" "$flags" "$subject" "$session_arg"
     printf '%s' "$command"
 }
 
@@ -701,6 +733,7 @@ generate_report() {
 
         echo "-------------------------"
         echo "FSF Types Processed: ${FSF_TYPES[*]}"
+        echo "Functional File Pattern: $FUNC_FILE_PATTERN"
         echo "Processing Parameters:"
         echo "  - Threads per subject: $NUM_THREADS"
         echo "  - FWHM: $FWHM"
@@ -778,14 +811,14 @@ main() {
     export PIPELINES_TO_RUN_STRING FSF_TYPES_STRING GENERAL_FLAGS_STRING
     export PIPELINE_REGISTRY
 
-    export INPUT_DIR OUTPUT_DIR STANDARD_DIR TEMPLATE_DIR TISSUES_DIR RECONALL_DIR
+    export INPUT_DIR OUTPUT_DIR STANDARD_DIR TEMPLATE_DIR TISSUES_DIR RECONALL_DIR FUNC_FILE_PATTERN
     export NUM_THREADS FWHM SIGMA HIGHP LOWP TR TE N_VOLS
     export SKIP_EXISTING DRY_RUN VERBOSE LOG_DIR ERROR_LOG_DIR ERROR_SUBJECTS_FILE CURRENT_DATE
 
     export -f log record_error hydrate_runtime_arrays format_general_flags format_subject_session
     export -f subject_output_dir subject_anat_dir subject_func_dir prepare_fmri_subject prepare_pipeline_subject
-    export -f fmri_has_anatomical_output fmri_has_functional_output fmri_has_registration_output fmri_has_segmentation_output
-    export -f build_fmri_anatomical_command build_fmri_functional_command build_fmri_registration_command build_fmri_segmentation_command build_fmri_fsf_command
+    export -f fmri_has_recon_output fmri_has_anatomical_output fmri_has_functional_output fmri_has_registration_output fmri_has_segmentation_output
+    export -f build_fmri_recon_command build_fmri_anatomical_command build_fmri_functional_command build_fmri_registration_command build_fmri_segmentation_command build_fmri_fsf_command
     export -f execute_fmri_fsf_step run_step run_pipeline process_subject process_subject_parallel check_mask_validity
 
     parallel --jobs "$max_parallel_jobs" --colsep '\t' \

@@ -32,6 +32,7 @@ LOG_DIR=""
 SKIP_EXISTING=false
 DRY_RUN=false
 VERBOSE=false
+FUNC_FILE_PATTERN='*rest*.nii*'  # Comma-separated glob patterns searched under func/
 
 # ---------------------------- Usage Function --------------------------------
 
@@ -50,6 +51,7 @@ usage() {
     echo "  -h    High-pass filter frequency in Hz (default: $HIGHP)"
     echo "  -l    Low-pass filter frequency in Hz (default: $LOWP)"
     echo "  -d    Log directory (default: output_dir/logs)"
+    echo "  -p    Functional file glob pattern(s) (comma-separated, default: $FUNC_FILE_PATTERN)"
     echo "  -x    Skip existing processed subjects"
     echo "  -r    Dry run (show commands without executing)"
     echo "  -v    Verbose output"
@@ -131,16 +133,55 @@ validate_input() {
 }
 
 
+find_functional_input() {
+    local search_dir="$1"
+    local pattern_string="$2"
+    local pattern
+    local candidate=""
+
+    if [ -z "$pattern_string" ]; then
+        pattern_string='*rest*.nii*'
+    fi
+
+    IFS=',' read -r -a pattern_array <<< "$pattern_string"
+    if [ ${#pattern_array[@]} -eq 0 ]; then
+        pattern_array=('*rest*.nii*')
+    fi
+
+    for pattern in "${pattern_array[@]}"; do
+        # Trim leading/trailing whitespace without invoking external tools
+        pattern="${pattern#${pattern%%[![:space:]]*}}"
+        pattern="${pattern%${pattern##*[![:space:]]}}"
+        if [ -z "$pattern" ]; then
+            continue
+        fi
+        candidate=$(find "$search_dir" -maxdepth 1 -type f -name "$pattern" | head -n 1)
+        if [ -n "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    printf '%s' ""
+    return 1
+}
+
+
 process_subject() {
     local subject_id="$1"
     local session="$2"
     local input_dir="$3"
     
+    if [ "$session" = "\"\"" ]; then
+        session=""
+    fi
+
     local output_dir
     local func_output_dir
+    local func_input_dir
     
     output_dir="${OUTPUT_DIR}/${subject_id}"
-    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+    if [ -z "$session" ]; then
         # No session - create func directory directly under subject directory
         func_output_dir="${output_dir}/func"
     else
@@ -156,11 +197,22 @@ process_subject() {
 
     cd "$func_output_dir" || { log "ERROR" "Cannot change to directory $func_output_dir"; return 1; }
 
-    # Find rest file
-    local rest_file
-    rest_file=$(find "$input_dir" -type f -name '*rest*.nii*' | head -n 1)
-    if [ -z "$rest_file" ]; then
-        log "ERROR" "No rest file found for subject $subject_id${session:+ session $session}"
+    if [ -z "$session" ]; then
+        func_input_dir="${input_dir}/func"
+    else
+        func_input_dir="${input_dir}/${session}/func"
+    fi
+
+    if [ ! -d "$func_input_dir" ]; then
+        log "ERROR" "Functional directory not found: $func_input_dir"
+        return 1
+    fi
+
+    # Locate the functional input using configured pattern(s)
+    local func_input
+    func_input=$(find_functional_input "$func_input_dir" "$FUNC_FILE_PATTERN") || true
+    if [ -z "$func_input" ]; then
+        log "ERROR" "No functional file matching pattern '$FUNC_FILE_PATTERN' found under $func_input_dir"
         return 1
     fi
 
@@ -172,7 +224,7 @@ process_subject() {
 
     # Get number of TRs
     local nTRs nTRs_minus_one
-    nTRs=$(3dinfo -nt "$rest_file")
+    nTRs=$(3dinfo -nt "$func_input")
     nTRs_minus_one=$((nTRs - 1))
 
     # Preprocessing steps
@@ -183,7 +235,7 @@ process_subject() {
 
     # Step 1: Drop first TR
     log "INFO" "Dropping first TR..."
-    3dcalc -a "${rest_file}[0..$nTRs_minus_one]" -expr 'a' -prefix rest_dr.nii
+    3dcalc -a "${func_input}[0..$nTRs_minus_one]" -expr 'a' -prefix rest_dr.nii
 
     # Step 2: Deoblique
     log "INFO" "Deobliquing..."
@@ -253,7 +305,7 @@ process_subject() {
 # ---------------------------- Main Script ----------------------------------
 
 # Process command line arguments
-while getopts "i:o:n:w:g:h:l:d:xrvu" opt; do
+while getopts "i:o:n:w:g:h:l:d:p:xrvu" opt; do
     case ${opt} in
         i) INPUT_DIR="$OPTARG";;
         o) OUTPUT_DIR="$OPTARG";;
@@ -263,6 +315,7 @@ while getopts "i:o:n:w:g:h:l:d:xrvu" opt; do
         h) HIGHP="$OPTARG";;
         l) LOWP="$OPTARG";;
         d) LOG_DIR="$OPTARG";;
+        p) FUNC_FILE_PATTERN="$OPTARG";;
         x) SKIP_EXISTING=true;;
         r) DRY_RUN=true;;
         v) VERBOSE=true;;
@@ -294,21 +347,13 @@ subject_id="$1"
 session="${2:-\"\"}"
 subject_path="${3:-${INPUT_DIR}/${subject_id}}"
 
+if [ "$session" = "\"\"" ]; then
+    session=""
+fi
+
 # Validate subject directory exists
 if [ ! -d "$subject_path" ]; then
     log "ERROR" "Subject directory not found: $subject_path"
-    exit 1
-fi
-
-# Validate functional directory exists
-if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
-    func_path="${subject_path}/func"
-else
-    func_path="${subject_path}/func"
-fi
-
-if [ ! -d "$func_path" ]; then
-    log "ERROR" "Functional directory not found: $func_path"
     exit 1
 fi
 

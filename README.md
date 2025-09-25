@@ -58,11 +58,16 @@ A per-run summary is written to `processing_report_YYYYMMDD.txt`.
 Key settings reside near the top of `main.sh`:
 - `INPUT_DIR`, `OUTPUT_DIR`, `STANDARD_DIR`, `TISSUES_DIR`, `TEMPLATE_DIR`, `RECONALL_DIR`
 - Processing parameters (`NUM_THREADS`, `FWHM`, `SIGMA`, `HIGHP`, `LOWP`, `TR`, `TE`, `N_VOLS`)
-- Pipeline controls (`PIPELINES_TO_RUN`, `FSF_TYPES`, `GENERAL_FLAGS`, `SKIP_EXISTING`, `DRY_RUN`, `VERBOSE`)
+- Pipeline controls (`PIPELINES_TO_RUN`, `FSF_TYPES`, `GENERAL_FLAGS`, `FUNC_FILE_PATTERN`, `SKIP_EXISTING`, `DRY_RUN`, `VERBOSE`)
+
+`FUNC_FILE_PATTERN` accepts one or more comma-separated glob patterns (e.g., `*rest*.nii*,*task-sternberg_bold*.nii*`) that are searched under each subject's `func/` directory when locating the functional run.
 
 Override any variable at invocation time by exporting or prefixing the call:
 ```bash
 DRY_RUN=true PIPELINES_TO_RUN="fmri" bash main.sh
+
+# Locate task-specific runs
+FUNC_FILE_PATTERN="*task-sternberg_bold*.nii*" bash main.sh
 ```
 
 ## Usage

@@ -269,9 +269,13 @@ fi
 subject_id="$1"
 session="${2:-\"\"}"
 
+if [ "$session" = "\"\"" ] || [ "$session" = "''" ]; then
+    session=""
+fi
+
 # Find anatomical file for the subject
 anat_file=""
-if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+if [ -z "$session" ]; then
     anat_file=$(find "$INPUT_DIR/$subject_id" -type f -name "$FILE_PATTERN" | head -n 1)
 else
     anat_file=$(find "$INPUT_DIR/$subject_id/$session" -type f -name "$FILE_PATTERN" | head -n 1)
