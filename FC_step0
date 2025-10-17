@@ -14,7 +14,7 @@ set -euo pipefail
 
 INPUT_DIR=""
 OUTPUT_DIR=""
-CORES_PER_SUBJECT=2
+CORES_PER_SUBJECT=4
 LOG_DIR=""
 FILE_PATTERN="*T1w.nii*"
 SKIP_EXISTING=false
@@ -167,14 +167,19 @@ process_subject() {
     fi
     
     local subject_log_file="$LOG_DIR/${subj_sess_id}_$(date +'%Y%m%d').log"
-    
+
     if [ "$SKIP_EXISTING" = true ] && [ -d "$OUTPUT_DIR/$subj_sess_id" ]; then
         if [ -f "$OUTPUT_DIR/$subj_sess_id/mri/brain.mgz" ]; then
             log "INFO" "Subject-Session '$subj_sess_id' already processed. Skipping..."
             return 0
         fi
     fi
-    
+
+    if [ -d "$OUTPUT_DIR/$subj_sess_id" ] && [ ! -f "$OUTPUT_DIR/$subj_sess_id/mri/brain.mgz" ]; then
+        log "WARNING" "Subject-Session '$subj_sess_id' has incomplete recon-all output; cleaning before restart"
+        rm -rf "$OUTPUT_DIR/$subj_sess_id"
+    fi
+
     log "INFO" "Processing Subject: $subject_id | Session: ${session:-None}"
     log "INFO" "Anatomical File: $anat_file"
     
@@ -269,9 +274,13 @@ fi
 subject_id="$1"
 session="${2:-\"\"}"
 
+if [ "$session" = "\"\"" ] || [ "$session" = "''" ]; then
+    session=""
+fi
+
 # Find anatomical file for the subject
 anat_file=""
-if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+if [ -z "$session" ]; then
     anat_file=$(find "$INPUT_DIR/$subject_id" -type f -name "$FILE_PATTERN" | head -n 1)
 else
     anat_file=$(find "$INPUT_DIR/$subject_id/$session" -type f -name "$FILE_PATTERN" | head -n 1)
