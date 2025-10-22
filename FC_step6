@@ -1,0 +1,365 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+INPUT_DIR=""
+OUTPUT_DIR=""
+LOG_DIR=""
+NUM_JOBS=4
+ATLAS_NAME="ThomasYeo100"
+ATLAS_PATH=""
+FSF_TYPES_INPUT=""
+FSF_TYPES_LIST=""
+SKIP_EXISTING=false
+DRY_RUN=false
+VERBOSE=false
+
+usage() {
+    cat <<EOF >&2
+Usage: $0 -i <input_dir> -o <output_dir> [options] subject [session]
+
+Required options
+  -i   BIDS input directory (same as main pipeline input)
+  -o   Processing output directory (same as main pipeline output)
+
+Optional arguments
+  -n   Parallel jobs (default: ${NUM_JOBS})
+  -l   Log directory (default: <output_dir>/logs)
+  -T   Atlas name (default: ${ATLAS_NAME})
+  -A   Atlas file path (overrides default lookup)
+  -F   FSF types (space separated; default: NoGRS Retain_GRS)
+  -x   Skip subjects with existing time series
+  -d   Dry run
+  -v   Verbose
+  -h   Help
+EOF
+    exit 1
+}
+
+log() {
+    local level="$1"; shift
+    local msg="[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*"
+    case "$level" in
+        ERROR)   echo -e "\033[31m${msg}\033[0m" ;;
+        WARNING) echo -e "\033[33m${msg}\033[0m" ;;
+        SUCCESS) echo -e "\033[32m${msg}\033[0m" ;;
+        INFO)    echo -e "\033[36m${msg}\033[0m" ;;
+        *)       echo "$msg" ;;
+    esac
+    if [[ -n "$LOG_DIR" ]]; then
+        mkdir -p "$LOG_DIR"
+        echo "$msg" >> "$LOG_DIR/timeseries_$(date +'%Y%m%d').log"
+    fi
+}
+
+resolve_atlas() {
+    if [[ -n "$ATLAS_PATH" ]]; then
+        if [[ ! -f "$ATLAS_PATH" ]]; then
+            log "ERROR" "Provided atlas path does not exist: $ATLAS_PATH"
+            exit 1
+        fi
+        ATLAS_PATH="$(cd "$(dirname "$ATLAS_PATH")" && pwd)/$(basename "$ATLAS_PATH")"
+        return
+    fi
+
+    if [[ -z "$ATLAS_NAME" || "$ATLAS_NAME" == "\"\"" ]]; then
+        ATLAS_NAME="ThomasYeo100"
+    fi
+
+    if [[ "$ATLAS_NAME" == -* ]]; then
+        log "WARNING" "Atlas name '$ATLAS_NAME' looks like an option; defaulting to ThomasYeo100."
+        ATLAS_NAME="ThomasYeo100"
+    fi
+
+    local project_root
+    project_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+    local -a base_names=()
+    case "${ATLAS_NAME,,}" in
+        thomasyeo100|thomas100|yeo100|thomas_yeo_100|thomas\ yeo\ 100)
+            base_names=("ThomasYeo_100" "ThomasYeo100" "Thomas_Yeo_100" "Thomas Yeo 100")
+            ;;
+        schaefer2018_100parcels_7networks_order_fslmni152_2mm|schaefer2018|schaefer100)
+            base_names=("Schaefer2018_100Parcels_7Networks_order_FSLMNI152_2mm" "Schaefer2018_100")
+            ;;
+        *)
+            base_names=("$ATLAS_NAME")
+            ;;
+    esac
+
+    local candidate
+    for candidate in "$ATLAS_NAME" "${SCRIPT_DIR}/${ATLAS_NAME}"; do
+        if [[ -f "$candidate" ]]; then
+            ATLAS_PATH="$(cd "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+            base_names=()
+            break
+        fi
+    done
+
+    local -a search_dirs=(
+        "$SCRIPT_DIR/parcellations"
+        "$SCRIPT_DIR"
+        "$project_root/parcellations"
+        "$project_root"
+        "$(pwd)"
+    )
+    if [[ -n "$OUTPUT_DIR" ]]; then
+        search_dirs+=("$OUTPUT_DIR/parcellations")
+    fi
+
+    if [[ -z "$ATLAS_PATH" ]]; then
+        local dir base
+        for dir in "${search_dirs[@]}"; do
+            [[ -d "$dir" ]] || continue
+            for base in "${base_names[@]}"; do
+                [[ -n "$base" ]] || continue
+                for candidate in "$dir/$base" "$dir/${base}.nii.gz" "$dir/${base}.nii" "$dir/${base}.nii.GZ"; do
+                    if [[ -f "$candidate" ]]; then
+                        ATLAS_PATH="$(cd "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+                        base_names=()
+                        break 3
+                    fi
+                done
+            done
+        done
+    fi
+
+    if [[ -z "$ATLAS_PATH" ]]; then
+        log "ERROR" "Atlas file for '$ATLAS_NAME' not found. Place it alongside FC_step6 or provide -A <path>. Searched: ${search_dirs[*]}"
+        exit 1
+    fi
+
+    log "INFO" "Using atlas '$ATLAS_NAME' at $ATLAS_PATH"
+}
+
+discover_subjects() {
+    local outfile="$1"
+    : > "$outfile"
+    while IFS= read -r subj_dir; do
+        local subj
+        subj="$(basename "$subj_dir")"
+        if [[ -d "$subj_dir/anat" ]]; then
+            printf '%s\t-\n' "$subj" >> "$outfile"
+        else
+            while IFS= read -r session_dir; do
+                local session
+                session="$(basename "$session_dir")"
+                if [[ -d "$session_dir/anat" ]]; then
+                    printf '%s\t%s\n' "$subj" "$session" >> "$outfile"
+                fi
+            done < <(find "$subj_dir" -mindepth 1 -maxdepth 1 -type d)
+        fi
+    done < <(find "$INPUT_DIR" -mindepth 1 -maxdepth 1 -type d -name 'sub-*')
+}
+
+atlas_safe_name() {
+    local safe="${ATLAS_NAME//[^[:alnum:]]/_}"
+    echo "$safe"
+}
+
+extract_roi_series() {
+    local dataset="$1"
+    local mask="$2"
+    local label="$3"
+    3dmaskave -quiet -mask "$mask" -mrange "$label" "$label" "$dataset"
+}
+
+process_subject() {
+    local subject="$1"
+    local session="${2:-}"
+    [[ "$session" == "-" ]] && session=""
+
+    local base_dir="$OUTPUT_DIR/$subject"
+    if [[ -n "$session" && "$session" != "\"\"" ]]; then
+        base_dir="$base_dir/ses-${session}"
+    fi
+    local func_dir="$base_dir/func"
+    local ts_dir="$func_dir/ts"
+    local template_safe
+    template_safe="$(atlas_safe_name)"
+    local atlas_res="$ts_dir/${template_safe}_results_space.nii.gz"
+    local labels_file="$ts_dir/${template_safe}_labels.txt"
+
+    mkdir -p "$ts_dir"
+
+    local -a fsf_types
+    read -r -a fsf_types <<< "$FSF_TYPES_LIST"
+    if [[ ${#fsf_types[@]} -eq 0 ]]; then
+        fsf_types=(NoGRS Retain_GRS)
+    fi
+
+    local -a fsf_entries=()
+    local ref_dataset=""
+
+    for fsf in "${fsf_types[@]}"; do
+        local results_root="$OUTPUT_DIR/results/$fsf"
+        local base_name
+        if [[ -z "$session" || "$session" == "\"\"" ]]; then
+            base_name="${subject}_${fsf}"
+        else
+            base_name="${subject}_${session}_${fsf}"
+        fi
+
+        local dataset_path="$results_root/${base_name}.nii.gz"
+        [[ -f "$dataset_path" ]] || dataset_path="$results_root/${base_name}.nii"
+        if [[ ! -f "$dataset_path" ]]; then
+            log "WARNING" "[$subject${session:+ ses-${session}}][$fsf] residual dataset not found in $results_root"
+            continue
+        fi
+
+        local ts_output_dir="$results_root/timeseries"
+        mkdir -p "$ts_output_dir"
+        local ts_output="$ts_output_dir/${base_name}_timeseries.1D"
+
+        fsf_entries+=("$fsf|$dataset_path|$ts_output|$results_root")
+        if [[ -z "$ref_dataset" ]]; then
+            ref_dataset="$dataset_path"
+        fi
+    done
+
+    if [[ ${#fsf_entries[@]} -eq 0 ]]; then
+        log "ERROR" "[$subject${session:+ ses-${session}}] No residual datasets found under $OUTPUT_DIR/results"
+        return 1
+    fi
+
+    local pending_extraction=false
+    local entry
+    for entry in "${fsf_entries[@]}"; do
+        IFS='|' read -r _ _ ts_output _ <<< "$entry"
+        if [[ "$SKIP_EXISTING" == true && -s "$ts_output" ]]; then
+            continue
+        fi
+        pending_extraction=true
+        break
+    done
+
+    if [[ "$pending_extraction" = false ]]; then
+        log "INFO" "[$subject${session:+ ses-${session}}] timeseries already exist for requested FSF types; skipping."
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log "DRY-RUN" "Would extract atlas timeseries for $subject${session:+ ses-${session}} (${#fsf_entries[@]} residual dataset(s))"
+        return 0
+    fi
+
+    log "INFO" "[$subject${session:+ ses-${session}}] resampling atlas to match ${ref_dataset##*/}"
+    local atlas_tmp="${ts_dir}/${template_safe}_results_space_tmp.nii.gz"
+    rm -f "$atlas_tmp"
+    if ! 3dresample -overwrite -master "$ref_dataset" -rmode NN -prefix "$atlas_tmp" -input "$ATLAS_PATH" >/dev/null; then
+        log "ERROR" "[$subject${session:+ ses-${session}}] atlas resample command failed."
+        rm -f "$atlas_tmp"
+        return 1
+    fi
+    if [[ ! -f "$atlas_tmp" ]]; then
+        log "ERROR" "[$subject${session:+ ses-${session}}] atlas resample did not produce an output file."
+        return 1
+    fi
+    if ! 3dcalc -a "$atlas_tmp" -expr 'int(a)' -datum short -prefix "$atlas_res" >/dev/null; then
+        log "ERROR" "[$subject${session:+ ses-${session}}] atlas integerisation failed."
+        rm -f "$atlas_tmp" "$atlas_res"
+        return 1
+    fi
+    rm -f "$atlas_tmp"
+
+    3dmaskdump -mask "$atlas_res" -noijk "$atlas_res" | sort -nu | awk '$1>0' > "$labels_file"
+    if [[ ! -s "$labels_file" ]]; then
+        log "ERROR" "[$subject${session:+ ses-${session}}] atlas resample produced no valid labels."
+        return 1
+    fi
+
+    local any_success=0
+    for entry in "${fsf_entries[@]}"; do
+        IFS='|' read -r fsf dataset_path ts_output results_root <<< "$entry"
+
+        if [[ "$SKIP_EXISTING" == true && -s "$ts_output" ]]; then
+            log "INFO" "[$subject${session:+ ses-${session}}][$fsf] timeseries exists; skipping."
+            any_success=1
+            continue
+        fi
+
+        local roi_dir="$ts_dir/${template_safe}_${fsf}_rois"
+        rm -rf "$roi_dir"
+        mkdir -p "$roi_dir"
+        local -a cat_list=()
+        while read -r label; do
+            local roi_file="$roi_dir/roi_${label}.1D"
+            extract_roi_series "$dataset_path" "$atlas_res" "$label" > "$roi_file"
+            cat_list+=("$roi_file")
+        done < "$labels_file"
+
+        if [[ ${#cat_list[@]} -eq 0 ]]; then
+            log "WARNING" "[$subject${session:+ ses-${session}}][$fsf] atlas produced empty ROI set."
+            rm -rf "$roi_dir"
+            continue
+        fi
+
+        1dcat "${cat_list[@]}" > "$ts_output"
+        log "SUCCESS" "[$subject${session:+ ses-${session}}][$fsf] wrote $ts_output"
+        rm -f "${cat_list[@]}"
+        rmdir "$roi_dir" 2>/dev/null || true
+        any_success=1
+    done
+
+    if [[ $any_success -eq 0 ]]; then
+        log "ERROR" "[$subject${session:+ ses-${session}}] No time-series extracted for any FSF type."
+        return 1
+    fi
+}
+
+while getopts ":i:o:n:l:T:A:F:xdvh" opt; do
+    case "$opt" in
+        i) INPUT_DIR="$OPTARG" ;;
+        o) OUTPUT_DIR="$OPTARG" ;;
+        n) NUM_JOBS="$OPTARG" ;;
+        l) LOG_DIR="$OPTARG" ;;
+        T) ATLAS_NAME="$OPTARG" ;;
+        A) ATLAS_PATH="$OPTARG" ;;
+        F) FSF_TYPES_INPUT="$OPTARG" ;;
+        x) SKIP_EXISTING=true ;;
+        d) DRY_RUN=true ;;
+        v) VERBOSE=true ;;
+        h) usage ;;
+        :) log "ERROR" "Option -$OPTARG requires an argument."; usage ;;
+        \?) log "ERROR" "Invalid option: -$OPTARG"; usage ;;
+    esac
+done
+shift $((OPTIND-1))
+
+if [[ -n "$FSF_TYPES_INPUT" ]]; then
+    FSF_TYPES_LIST="$FSF_TYPES_INPUT"
+elif [[ -n "${FSF_TYPES:-}" ]]; then
+    FSF_TYPES_LIST="$FSF_TYPES"
+else
+    FSF_TYPES_LIST="NoGRS Retain_GRS"
+fi
+
+if [[ -z "$INPUT_DIR" || -z "$OUTPUT_DIR" ]]; then
+    log "ERROR" "Both -i and -o are required."
+    usage
+fi
+
+LOG_DIR="${LOG_DIR:-$OUTPUT_DIR/logs}"
+resolve_atlas
+
+subjects_file=$(mktemp)
+if [[ $# -gt 0 ]]; then
+    subject="$1"
+    session="${2:-}"
+    if [[ -z "$session" || "$session" == "\"\"" ]]; then
+        printf '%s\t-\n' "$subject" > "$subjects_file"
+    else
+        printf '%s\t%s\n' "$subject" "$session" > "$subjects_file"
+    fi
+else
+    discover_subjects "$subjects_file"
+fi
+
+export INPUT_DIR OUTPUT_DIR LOG_DIR ATLAS_NAME ATLAS_PATH FSF_TYPES_LIST SKIP_EXISTING DRY_RUN VERBOSE
+export -f log atlas_safe_name process_subject extract_roi_series
+
+parallel --colsep '\t' --jobs "$NUM_JOBS" process_subject :::: "$subjects_file"
+
+rm -f "$subjects_file"
+log "SUCCESS" "Atlas time-series extraction finished."
