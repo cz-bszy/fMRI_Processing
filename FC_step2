@@ -32,6 +32,7 @@ LOG_DIR=""
 SKIP_EXISTING=false
 DRY_RUN=false
 VERBOSE=false
+FUNC_FILE_PATTERN='*rest*.nii*'  # Comma-separated glob patterns searched under func/
 
 # ---------------------------- Usage Function --------------------------------
 
@@ -50,6 +51,7 @@ usage() {
     echo "  -h    High-pass filter frequency in Hz (default: $HIGHP)"
     echo "  -l    Low-pass filter frequency in Hz (default: $LOWP)"
     echo "  -d    Log directory (default: output_dir/logs)"
+    echo "  -p    Functional file glob pattern(s) (comma-separated, default: $FUNC_FILE_PATTERN)"
     echo "  -x    Skip existing processed subjects"
     echo "  -r    Dry run (show commands without executing)"
     echo "  -v    Verbose output"
@@ -73,6 +75,7 @@ log() {
     esac
     
     if [ ! -z "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR"
         echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $*" >> "$LOG_DIR/preproc_$(date +'%Y%m%d').log"
     fi
 }
@@ -90,6 +93,15 @@ check_prerequisites() {
     # Check for FSL
     if ! command -v fslmaths >/dev/null 2>&1; then
         missing_prereqs+=("FSL (fslmaths)")
+    fi
+    if ! command -v flirt >/dev/null 2>&1; then
+        missing_prereqs+=("FSL (flirt)")
+    fi
+    if ! command -v convert_xfm >/dev/null 2>&1; then
+        missing_prereqs+=("FSL (convert_xfm)")
+    fi
+    if ! command -v fslstats >/dev/null 2>&1; then
+        missing_prereqs+=("FSL (fslstats)")
     fi
     
     if [ ${#missing_prereqs[@]} -ne 0 ]; then
@@ -131,86 +143,389 @@ validate_input() {
 }
 
 
+find_functional_input() {
+    local search_dir="$1"
+    local pattern_string="$2"
+    local pattern
+    local candidate=""
+
+    if [ -z "$pattern_string" ]; then
+        pattern_string='*rest*.nii*'
+    fi
+
+    IFS=',' read -r -a pattern_array <<< "$pattern_string"
+    if [ ${#pattern_array[@]} -eq 0 ]; then
+        pattern_array=('*rest*.nii*')
+    fi
+
+    for pattern in "${pattern_array[@]}"; do
+        # Trim leading/trailing whitespace without invoking external tools
+        pattern="${pattern#${pattern%%[![:space:]]*}}"
+        pattern="${pattern%${pattern##*[![:space:]]}}"
+        if [ -z "$pattern" ]; then
+            continue
+        fi
+        candidate=$(find "$search_dir" -maxdepth 1 -type f -name "$pattern" | head -n 1)
+        if [ -n "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    printf '%s' ""
+    return 1
+}
+
+find_first_existing() {
+    for path in "$@"; do
+        if [ -f "$path" ]; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+to_abs_path() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        return 1
+    fi
+    case "$target" in
+        /*)
+            printf '%s\n' "$target"
+            return 0
+            ;;
+    esac
+    local dir base
+    dir=$(dirname "$target")
+    base=$(basename "$target")
+    if ! dir=$(cd "$dir" && pwd); then
+        return 1
+    fi
+    printf '%s/%s\n' "$dir" "$base"
+    return 0
+}
+
+normalize_session_dir() {
+    local value="$1"
+    if [ -z "$value" ] || [ "$value" = "\"\"" ]; then
+        printf ''
+    elif [[ "$value" == ses-* ]]; then
+        printf '%s' "$value"
+    else
+        printf 'ses-%s' "$value"
+    fi
+}
+
+
 process_subject() {
     local subject_id="$1"
     local session="$2"
     local input_dir="$3"
     
+    if [ "$session" = "\"\"" ]; then
+        session=""
+    fi
+
+    local session_dir
+    session_dir="$(normalize_session_dir "$session")"
+    local session_label="$session"
+    if [ -n "$session_dir" ]; then
+        session_label="$session_dir"
+    fi
+
     local output_dir
     local func_output_dir
-    
+    local func_input_dir
+
     output_dir="${OUTPUT_DIR}/${subject_id}"
-    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
-        # No session - create func directory directly under subject directory
-        func_output_dir="${output_dir}/func"
-    else
-        # With session
-        func_output_dir="${output_dir}/${session}/func"
+    if [ -n "$session_dir" ]; then
+        output_dir="${output_dir}/${session_dir}"
     fi
-    
+
+    func_output_dir="${output_dir}/func"
+
     mkdir -p "$func_output_dir"
-    
+
     if [ "$VERBOSE" = true ]; then
-        log "INFO" "Processing subject $subject_id${session:+ session $session}"
+        log "INFO" "Processing subject $subject_id${session_label:+ session $session_label}"
+    fi
+
+    local func_input_dir_raw
+    if [ -n "$session_dir" ]; then
+        func_input_dir_raw="${input_dir}/${session_dir}/func"
+        if [ ! -d "$func_input_dir_raw" ] && [ -n "$session" ]; then
+            func_input_dir_raw="${input_dir}/${session}/func"
+        fi
+    else
+        func_input_dir_raw="${input_dir}/func"
+    fi
+
+    if [ ! -d "$func_input_dir_raw" ]; then
+        log "ERROR" "Functional directory not found: $func_input_dir_raw"
+        return 1
+    fi
+
+    local func_input_dir
+    if ! func_input_dir=$(cd "$func_input_dir_raw" && pwd); then
+        log "ERROR" "Unable to resolve absolute path for $func_input_dir_raw"
+        return 1
+    fi
+
+    # Locate the functional input using configured pattern(s)
+    local func_input
+    func_input=$(find_functional_input "$func_input_dir" "$FUNC_FILE_PATTERN") || true
+    if [ -z "$func_input" ]; then
+        log "ERROR" "No functional file matching pattern '$FUNC_FILE_PATTERN' found under $func_input_dir"
+        return 1
+    fi
+
+    local anat_dir_input
+    local anat_dir_fallback
+    if [ -n "$session_dir" ]; then
+        anat_dir_input="${input_dir}/${session_dir}/anat"
+        anat_dir_fallback="${OUTPUT_DIR}/${subject_id}/${session_dir}/anat"
+        if [ ! -d "$anat_dir_input" ] && [ -n "$session" ]; then
+            anat_dir_input="${input_dir}/${session}/anat"
+        fi
+    else
+        anat_dir_input="${input_dir}/anat"
+        anat_dir_fallback="${OUTPUT_DIR}/${subject_id}/anat"
+    fi
+
+    local anat_dir="$anat_dir_input"
+    if [ ! -d "$anat_dir" ] && [ -d "$anat_dir_fallback" ]; then
+        log "WARNING" "Anatomical directory not found at $anat_dir_input; using $anat_dir_fallback instead."
+        anat_dir="$anat_dir_fallback"
+    fi
+
+    if [ ! -d "$anat_dir" ]; then
+        log "ERROR" "Anatomical directory not found: $anat_dir_input"
+        return 1
+    fi
+
+    local stru_brain=""
+    if ! stru_brain=$(find_first_existing \
+        "${anat_dir}/Stru_Brain.nii.gz" \
+        "${anat_dir}/Stru_Brain.nii" \
+        "${anat_dir_fallback}/Stru_Brain.nii.gz" \
+        "${anat_dir_fallback}/Stru_Brain.nii"); then
+        log "ERROR" "Stru_Brain image not found under $anat_dir or $anat_dir_fallback"
+        return 1
+    fi
+    if ! stru_brain=$(to_abs_path "$stru_brain"); then
+        log "ERROR" "Unable to resolve absolute path for Stru_Brain image ($stru_brain)"
+        return 1
+    fi
+
+    local gm_prob=""
+    if ! gm_prob=$(find_first_existing \
+        "${anat_dir}/segment_prob_1.nii.gz" \
+        "${anat_dir}/segment_prob_1.nii" \
+        "${anat_dir_fallback}/segment_prob_1.nii.gz" \
+        "${anat_dir_fallback}/segment_prob_1.nii"); then
+        log "ERROR" "FAST grey-matter probability map not found under $anat_dir or $anat_dir_fallback"
+        return 1
+    fi
+    if ! gm_prob=$(to_abs_path "$gm_prob"); then
+        log "ERROR" "Unable to resolve absolute path for grey-matter probability map ($gm_prob)"
+        return 1
+    fi
+
+    local wm_prob=""
+    if ! wm_prob=$(find_first_existing \
+        "${anat_dir}/segment_prob_2.nii.gz" \
+        "${anat_dir}/segment_prob_2.nii" \
+        "${anat_dir_fallback}/segment_prob_2.nii.gz" \
+        "${anat_dir_fallback}/segment_prob_2.nii"); then
+        log "ERROR" "FAST white-matter probability map not found under $anat_dir or $anat_dir_fallback"
+        return 1
+    fi
+    if ! wm_prob=$(to_abs_path "$wm_prob"); then
+        log "ERROR" "Unable to resolve absolute path for white-matter probability map ($wm_prob)"
+        return 1
+    fi
+
+    if [ -z "${FSLDIR:-}" ]; then
+        log "ERROR" "FSLDIR environment variable is not set."
+        return 1
+    fi
+
+    local bbr_schedule="${FSLDIR}/etc/flirtsch/bbr.sch"
+    if [ ! -f "$bbr_schedule" ]; then
+        log "ERROR" "BBR schedule file not found: $bbr_schedule"
+        return 1
     fi
 
     cd "$func_output_dir" || { log "ERROR" "Cannot change to directory $func_output_dir"; return 1; }
 
-    # Find rest file
-    local rest_file
-    rest_file=$(find "$input_dir" -type f -name '*rest*.nii*' | head -n 1)
-    if [ -z "$rest_file" ]; then
-        log "ERROR" "No rest file found for subject $subject_id${session:+ session $session}"
-        return 1
-    fi
+    local reg_dir="reg_dir"
+    mkdir -p "$reg_dir"
+
+    local rest_mc_mean="rest_mc_mean.nii.gz"
+    local automask="rest_automask.nii.gz"
+    local combined_mask="rest_mask_combined.nii.gz"
+    local refined_mask="rest_mask_refined.nii.gz"
+    local final_mask="rest_mask.nii.gz"
+
+    local struct_mask_t1="${reg_dir}/struct_brain_mask_t1.nii.gz"
+    local struct_mask_epi="${reg_dir}/struct_brain_mask_func.nii.gz"
+    local epi2struct_init="${reg_dir}/func2struct_init.mat"
+    local epi2struct_mat="${reg_dir}/func2struct.mat"
+    local struct2epi_mat="${reg_dir}/struct2func.mat"
+    local epi2struct_vol="${reg_dir}/func_mean_in_struct.nii.gz"
+    local mask_erode="${reg_dir}/struct_mask_erode1.nii.gz"
+    local mask_edge="${reg_dir}/struct_mask_edge.nii.gz"
+    local qc_overlay="${reg_dir}/func_mean_with_mask.nii.gz"
 
     # Skip if already processed
-    if [ "$SKIP_EXISTING" = true ] && [ -f "${func_output_dir}/rest_pp.nii.gz" ]; then
-        log "INFO" "Subject $subject_id${session:+ session $session} already processed. Skipping."
+    if [ "$SKIP_EXISTING" = true ] && [ -f "${func_output_dir}/rest_pp.nii.gz" ] && [ -f "$final_mask" ]; then
+        log "INFO" "Subject $subject_id${session_label:+ session $session_label} already processed. Skipping."
         return 0
     fi
 
     # Get number of TRs
     local nTRs nTRs_minus_one
-    nTRs=$(3dinfo -nt "$rest_file")
+    nTRs=$(3dinfo -nt "$func_input")
     nTRs_minus_one=$((nTRs - 1))
 
     # Preprocessing steps
     if [ "$DRY_RUN" = true ]; then
-        log "DRY-RUN" "Would process subject $subject_id${session:+ session $session}"
+        log "DRY-RUN" "Would process subject $subject_id${session_label:+ session $session_label}"
         return 0
     fi
 
+    local intermediates=(
+        rest_dr.nii
+        rest_dr.nii.gz
+        rest_ro.nii.gz
+        rest_ro_mean.nii.gz
+        rest_mc.nii.gz
+        rest_mc.1D
+        "$rest_mc_mean"
+        "$final_mask"
+        "$automask"
+        "$combined_mask"
+        "$refined_mask"
+        rest_ss.nii.gz
+        example_func.nii.gz
+        rest_sm.nii.gz
+        rest_gms.nii.gz
+        rest_filt.nii.gz
+        rest_filt_mean.nii.gz
+        rest_pp.nii.gz
+        rest_pp_mask.nii.gz
+        "$epi2struct_init"
+        "$epi2struct_mat"
+        "$struct2epi_mat"
+        "$epi2struct_vol"
+        "$struct_mask_t1"
+        "$struct_mask_epi"
+        "$mask_erode"
+        "$mask_edge"
+        "$qc_overlay"
+    )
+    rm -f "${intermediates[@]}"
+
     # Step 1: Drop first TR
     log "INFO" "Dropping first TR..."
-    3dcalc -a "${rest_file}[0..$nTRs_minus_one]" -expr 'a' -prefix rest_dr.nii
+    3dcalc -overwrite -a "${func_input}[0..$nTRs_minus_one]" -expr 'a' -prefix rest_dr.nii.gz
 
     # Step 2: Deoblique
     log "INFO" "Deobliquing..."
-    3drefit -deoblique rest_dr.nii
+    3drefit -deoblique rest_dr.nii.gz
 
     # Step 3: Reorient to RPI
     log "INFO" "Reorienting to RPI..."
-    3dresample -orient RPI -inset rest_dr.nii -prefix rest_ro.nii.gz
+    3dresample -overwrite -orient RPI -inset rest_dr.nii.gz -prefix rest_ro.nii.gz
 
     # Step 4: Motion correction
     log "INFO" "Performing motion correction..."
-    3dTstat -mean -prefix rest_ro_mean.nii.gz rest_ro.nii.gz
-    3dvolreg -Fourier -twopass -base rest_ro_mean.nii.gz -zpad 4 \
+    3dTstat -overwrite -mean -prefix rest_ro_mean.nii.gz rest_ro.nii.gz
+    3dvolreg -overwrite -Fourier -twopass -base rest_ro_mean.nii.gz -zpad 4 \
              -prefix rest_mc.nii.gz -1Dfile rest_mc.1D rest_ro.nii.gz
+    3dTstat -overwrite -mean -prefix "$rest_mc_mean" rest_mc.nii.gz
 
-    # Step 5: Skull stripping
-    log "INFO" "Performing skull stripping..."
-    3dAutomask -prefix rest_mask.nii.gz -dilate 1 rest_mc.nii.gz
-    3dcalc -a rest_mc.nii.gz -b rest_mask.nii.gz -expr 'a*b' -prefix rest_ss.nii.gz
+    # Step 5: Structural-informed skull stripping
+    log "INFO" "Creating structural brain mask in T1 space..."
+    fslmaths "$gm_prob" -add "$wm_prob" -thr 0.5 -bin "$struct_mask_t1"
+
+    log "INFO" "Registering mean functional image to T1 (initial affine)..."
+    flirt -in "$rest_mc_mean" -ref "$stru_brain" -omat "$epi2struct_init" -dof 6 -cost mutualinfo
+
+    log "INFO" "Refining functional-to-structural registration with BBR..."
+    if ! flirt -in "$rest_mc_mean" -ref "$stru_brain" -init "$epi2struct_init" \
+        -omat "$epi2struct_mat" -out "$epi2struct_vol" -dof 6 -cost bbr \
+        -wmseg "$wm_prob" -schedule "$bbr_schedule"; then
+        log "WARNING" "BBR refinement failed; falling back to mutual information cost."
+        if ! flirt -in "$rest_mc_mean" -ref "$stru_brain" -init "$epi2struct_init" \
+            -omat "$epi2struct_mat" -out "$epi2struct_vol" -dof 6 -cost mutualinfo; then
+            log "ERROR" "Functional to structural registration failed."
+            return 1
+        fi
+    fi
+    log "INFO" "Saved functional-to-structural transform: $epi2struct_mat"
+
+    if ! convert_xfm -omat "$struct2epi_mat" -inverse "$epi2struct_mat"; then
+        log "ERROR" "Failed to invert functional-to-structural transform."
+        return 1
+    fi
+    log "INFO" "Saved structural-to-functional transform: $struct2epi_mat"
+
+    log "INFO" "Mapping structural mask into functional space..."
+    flirt -in "$struct_mask_t1" -ref "$rest_mc_mean" -applyxfm -init "$struct2epi_mat" \
+        -interp nearestneighbour -out "$struct_mask_epi"
+
+    log "INFO" "Generating conservative functional automask..."
+    3dAutomask -overwrite -peels 2 -prefix "$automask" rest_mc.nii.gz
+
+    log "INFO" "Combining structural and functional masks..."
+    3dcalc -overwrite -a "$struct_mask_epi" -b "$automask" -expr 'step(a)*step(b)' -prefix "$combined_mask"
+
+    log "INFO" "Refining combined mask (fill holes, light erosion)..."
+    3dmask_tool -overwrite -input "$combined_mask" -prefix "$refined_mask" \
+        -fill_holes -dilate_inputs 1 -dilate_result -1
+
+    3dcalc -overwrite -a "$refined_mask" -expr 'step(a)' -prefix "$final_mask"
+
+    local mask_stats=""
+    mask_stats=$(fslstats "$final_mask" -V)
+    local mask_voxels
+    mask_voxels=$(echo "$mask_stats" | awk '{print $1}')
+    if [ -z "$mask_voxels" ]; then
+        log "ERROR" "Unable to compute voxel count for derived brain mask."
+        return 1
+    fi
+
+    local dim_i dim_j dim_k total_voxels mask_ratio ratio_low ratio_high
+    dim_i=$(3dinfo -ni "$final_mask")
+    dim_j=$(3dinfo -nj "$final_mask")
+    dim_k=$(3dinfo -nk "$final_mask")
+    total_voxels=$((dim_i * dim_j * dim_k))
+    mask_ratio=$(echo "scale=6; $mask_voxels / $total_voxels" | bc -l)
+    ratio_low=$(echo "$mask_ratio < 0.05" | bc -l)
+    ratio_high=$(echo "$mask_ratio > 0.50" | bc -l)
+    if [ "$ratio_low" -eq 1 ] || [ "$ratio_high" -eq 1 ]; then
+        log "ERROR" "Derived brain mask ratio ($mask_ratio) out of expected range (0.05-0.50)."
+        return 1
+    fi
+    log "INFO" "Brain mask voxels: $mask_voxels of $total_voxels (ratio $mask_ratio)"
+
+    3dmask_tool -overwrite -input "$final_mask" -dilate_result -1 -prefix "$mask_erode"
+    3dcalc -overwrite -a "$final_mask" -b "$mask_erode" -expr 'step(a)-step(b)' -prefix "$mask_edge"
+    3dcalc -overwrite -a "$rest_mc_mean" -b "$mask_edge" -expr 'a + 1000*b' -prefix "$qc_overlay"
+    log "INFO" "Saved QA overlay image for mask inspection: $qc_overlay"
+
+    3dcalc -overwrite -a rest_mc.nii.gz -b "$final_mask" -expr 'a*b' -prefix rest_ss.nii.gz
 
     # Step 6: Extract example functional
     log "INFO" "Extracting example functional..."
-    3dcalc -a rest_ss.nii.gz'[7]' -expr 'a' -prefix example_func.nii.gz
+    3dcalc -overwrite -a rest_ss.nii.gz'[7]' -expr 'a' -prefix example_func.nii.gz
 
     # Step 7: Spatial smoothing
     log "INFO" "Performing spatial smoothing..."
-    fslmaths rest_ss.nii.gz -kernel gauss "$SIGMA" -fmean -mas rest_mask.nii.gz rest_sm.nii.gz
+    fslmaths rest_ss.nii.gz -kernel gauss "$SIGMA" -fmean -mas "$final_mask" rest_sm.nii.gz
 
     # Step 8: Grand-mean scaling
     log "INFO" "Performing grand-mean scaling..."
@@ -223,17 +538,22 @@ process_subject() {
 
     # Step 10: Detrending
     log "INFO" "Performing detrending..."
-    3dTstat -mean -prefix rest_filt_mean.nii.gz rest_filt.nii.gz
-    3dcalc -a rest_filt_mean.nii.gz -b rest_filt.nii.gz -expr 'a+b' -prefix rest_pp.nii.gz
+    3dTstat -overwrite -mean -prefix rest_filt_mean.nii.gz rest_filt.nii.gz
+    3dcalc -overwrite -a rest_filt_mean.nii.gz -b rest_filt.nii.gz -expr 'a+b' -prefix rest_pp.nii.gz
 
-    # Step 11: Create final mask
-    log "INFO" "Creating final mask..."
-    3dAutomask -prefix rest_pp_mask.nii.gz rest_pp.nii.gz
+    # Step 11: Create final mask for processed series
+    log "INFO" "Creating final mask for preprocessed series..."
+    3dcalc -overwrite -a rest_pp.nii.gz -b "$final_mask" -expr 'step(a)*step(b)' -prefix rest_pp_mask.nii.gz
 
     # Verify outputs
     local required_files=(
         "rest_pp.nii.gz"
         "rest_pp_mask.nii.gz"
+        "rest_mask.nii.gz"
+        "rest_mc_mean.nii.gz"
+        "reg_dir/func2struct.mat"
+        "reg_dir/struct2func.mat"
+        "reg_dir/func_mean_with_mask.nii.gz"
         "example_func.nii.gz"
     )
 
@@ -244,7 +564,7 @@ process_subject() {
         fi
     done
 
-    log "SUCCESS" "Preprocessing completed for subject $subject_id${session:+ session $session}"
+    log "SUCCESS" "Preprocessing completed for subject $subject_id${session_label:+ session $session_label}"
     return 0
 }
 
@@ -253,7 +573,7 @@ process_subject() {
 # ---------------------------- Main Script ----------------------------------
 
 # Process command line arguments
-while getopts "i:o:n:w:g:h:l:d:xrvu" opt; do
+while getopts "i:o:n:w:g:h:l:d:p:xrvu" opt; do
     case ${opt} in
         i) INPUT_DIR="$OPTARG";;
         o) OUTPUT_DIR="$OPTARG";;
@@ -263,6 +583,7 @@ while getopts "i:o:n:w:g:h:l:d:xrvu" opt; do
         h) HIGHP="$OPTARG";;
         l) LOWP="$OPTARG";;
         d) LOG_DIR="$OPTARG";;
+        p) FUNC_FILE_PATTERN="$OPTARG";;
         x) SKIP_EXISTING=true;;
         r) DRY_RUN=true;;
         v) VERBOSE=true;;
@@ -294,33 +615,30 @@ subject_id="$1"
 session="${2:-\"\"}"
 subject_path="${3:-${INPUT_DIR}/${subject_id}}"
 
+if [ "$session" = "\"\"" ]; then
+    session=""
+fi
+
+session_dir="$(normalize_session_dir "$session")"
+session_label="$session"
+if [ -n "$session_dir" ]; then
+    session_label="$session_dir"
+fi
+
 # Validate subject directory exists
 if [ ! -d "$subject_path" ]; then
     log "ERROR" "Subject directory not found: $subject_path"
     exit 1
 fi
 
-# Validate functional directory exists
-if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
-    func_path="${subject_path}/func"
-else
-    func_path="${subject_path}/func"
-fi
-
-if [ ! -d "$func_path" ]; then
-    log "ERROR" "Functional directory not found: $func_path"
-    exit 1
-fi
-
 if [ "$DRY_RUN" = true ]; then
-    log "DRY-RUN" "Would process subject: $subject_id${session:+ session $session}"
+    log "DRY-RUN" "Would process subject: $subject_id${session_label:+ session $session_label}"
     exit 0
 fi
 
 # Process the single subject
 if ! process_subject "$subject_id" "$session" "$subject_path"; then
-    log "ERROR" "Preprocessing failed for subject $subject_id${session:+ session $session}"
+    log "ERROR" "Preprocessing failed for subject $subject_id${session_label:+ session $session_label}"
     exit 1
 fi
-
-log "SUCCESS" "Preprocessing completed for subject $subject_id${session:+ session $session}"
+log "SUCCESS" "Preprocessing completed for subject $subject_id${session_label:+ session $session_label}"

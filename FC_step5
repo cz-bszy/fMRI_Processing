@@ -102,18 +102,13 @@ check_prerequisites() {
 
 validate_input() {
     if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$TEMPLATE_DIR" ] || \
-       [ -z "$TR" ] || [ -z "$TE" ] || [ -z "$N_VOLS" ] || [ -z "$FSF_TYPE" ]; then
+       [ -z "$TR" ] || [ -z "$TE" ] || [ -z "$FSF_TYPE" ]; then
         log "ERROR" "All required parameters must be specified."
         usage
     fi
 
     if ! [[ "$FSF_TYPE" =~ ^(NoGRS|Retain_GRS)$ ]]; then
         log "ERROR" "FSF_TYPE must be either NoGRS or Retain_GRS"
-        exit 1
-    fi
-
-    if ! [[ "$N_VOLS" =~ ^[0-9]+$ ]]; then
-        log "ERROR" "Number of volumes must be a positive integer"
         exit 1
     fi
 
@@ -197,6 +192,29 @@ process_subject() {
         fi
     done
     
+    # Determine actual volume count from preprocessed data
+    local actual_vols
+    if ! actual_vols=$(3dinfo -nt "${func_dir}/rest_pp.nii.gz" 2>/dev/null); then
+        log "ERROR" "Unable to determine number of volumes from ${func_dir}/rest_pp.nii.gz"
+        return 1
+    fi
+
+    if ! [[ "$actual_vols" =~ ^[0-9]+$ ]]; then
+        log "ERROR" "Non-integer volume count reported for ${func_dir}/rest_pp.nii.gz ($actual_vols)"
+        return 1
+    fi
+
+    local design_vols="$actual_vols"
+    if [ -n "$N_VOLS" ]; then
+        if [[ "$N_VOLS" =~ ^[0-9]+$ ]]; then
+            if [ "$N_VOLS" -ne "$actual_vols" ]; then
+                log "WARNING" "Configured N_VOLS=$N_VOLS differs from detected $actual_vols; using detected value"
+            fi
+        else
+            log "WARNING" "Configured N_VOLS ('$N_VOLS') is not numeric; using detected value $actual_vols"
+        fi
+    fi
+
     # Process nuisance regression
     log "INFO" "Processing nuisance regression..."
     
@@ -219,7 +237,7 @@ process_subject() {
         sed -e "s:nuisance_dir:${nuisance_dir}:g" \
             -e "s:nuisance_model_outputdir:${nuisance_dir}/residuals.feat:g" \
             -e "s:nuisance_model_TR:${TR}:g" \
-            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
+            -e "s:nuisance_model_numTRs:${design_vols}:g" \
             -e "s:nuisance_model_input_data:${nuisance_dir}/rest_pp.nii.gz:g" \
             -e "s:nuisance_model_TE:${TE}:g" \
             -e "s:standard_mni_2mm:${regstandard_path}:g" \
@@ -236,7 +254,7 @@ process_subject() {
             -e "s:fmri_6:${nuisance_dir}/mc4.1D:g" \
             -e "s:fmri_7:${nuisance_dir}/mc5.1D:g" \
             -e "s:nuisance_model_TR:${TR}:g" \
-            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
+            -e "s:nuisance_model_numTRs:${design_vols}:g" \
             -e "s:nuisance_model_TE:${TE}:g" \
             -e "s:fmri_8:${nuisance_dir}/mc6.1D:g" \
             "${TEMPLATE_DIR}/nuisance_R.fsf" > "${nuisance_dir}/nuisance.fsf"

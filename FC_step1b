@@ -1,0 +1,285 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# =============================================================================
+# Script: FC_step1b
+# Description:
+#   Structural preprocessing for T1w/T2w modalities inspired by the
+#   HCP PreFreeSurfer stage. Generates bias-corrected, brain-extracted
+#   volumes in a common space so downstream FreeSurfer and FAST segmentations
+#   can leverage multi-contrast information.
+# =============================================================================
+
+# ---------------------------- Configuration ----------------------------------
+
+INPUT_DIR=""
+OUTPUT_DIR=""
+LOG_DIR=""
+T1_PATTERN="*T1w*.nii*"
+T2_PATTERN="*T2w*.nii*"
+BET_FRACTION=0.25
+SKIP_EXISTING=false
+DRY_RUN=false
+VERBOSE=false
+
+# ---------------------------- Logging Helpers --------------------------------
+
+timestamp() {
+    date +'%Y-%m-%d %H:%M:%S'
+}
+
+log() {
+    local level="$1"
+    shift
+    local message="[$(timestamp)] [$level] $*"
+    echo -e "$message"
+    if [ -n "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR"
+        echo "$message" >> "$LOG_DIR/structural_preproc_$(date +%Y%m%d).log"
+    fi
+}
+
+die() {
+    log "ERROR" "$*"
+    exit 1
+}
+
+# ---------------------------- Utility Functions ------------------------------
+
+usage() {
+    cat <<EOF
+Structural preprocessing for T1w/T2w data
+
+Usage: $0 -i INPUT -o OUTPUT [options] SUBJECT [SESSION]
+
+Required arguments:
+  -i    Input BIDS directory
+  -o    Output derivatives directory
+
+Optional arguments:
+  -l    Log directory (default: OUTPUT/logs)
+  -p    T1w file pattern (default: $T1_PATTERN)
+  -t    T2w file pattern (default: $T2_PATTERN)
+  -f    BET fractional intensity threshold (default: $BET_FRACTION)
+  -x    Skip subjects with existing outputs
+  -d    Dry run (show planned actions only)
+  -v    Verbose logging
+  -h    Show this help message
+EOF
+    exit 1
+}
+
+check_prerequisites() {
+    local missing=()
+    local binary
+    for binary in bet fast flirt fslmaths; do
+        if ! command -v "$binary" >/dev/null 2>&1; then
+            missing+=("$binary")
+        fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        die "Missing required FSL tools: ${missing[*]}"
+    fi
+}
+
+to_absolute() {
+    local path="$1"
+    if [ -z "$path" ]; then
+        return 1
+    fi
+    case "$path" in
+        /*) printf '%s\n' "$path"; return 0 ;;
+    esac
+    local dir base
+    dir="$(dirname "$path")"
+    base="$(basename "$path")"
+    if ! dir="$(cd "$dir" && pwd)"; then
+        return 1
+    fi
+    printf '%s/%s\n' "$dir" "$base"
+}
+
+find_image() {
+    local search_dir="$1"
+    local pattern_string="$2"
+    local pattern candidate
+
+    if [ -z "$pattern_string" ]; then
+        return 1
+    fi
+
+    IFS=',' read -r -a pattern_array <<< "$pattern_string"
+    if [ ${#pattern_array[@]} -eq 0 ]; then
+        pattern_array=("$pattern_string")
+    fi
+
+    for pattern in "${pattern_array[@]}"; do
+        pattern="${pattern#${pattern%%[![:space:]]*}}"
+        pattern="${pattern%${pattern##*[![:space:]]}}"
+        if [ -z "$pattern" ]; then
+            continue
+        fi
+        candidate="$(find "$search_dir" -maxdepth 1 -type f -name "$pattern" | head -n 1 || true)"
+        if [ -n "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+remove_if_exists() {
+    local path="$1"
+    if [ -d "$path" ] || [ -f "$path" ]; then
+        rm -rf "$path"
+    fi
+}
+
+# ---------------------------- Core Processing --------------------------------
+
+preprocess_subject() {
+    local subject="$1"
+    local session="${2:-}"
+
+    local session_dir_alt=""
+    if [ -n "$session" ] && [[ "$session" != ses-* ]]; then
+        session_dir_alt="ses-${session}"
+    fi
+
+    local anat_input_candidates=()
+
+    if [ -n "$session" ]; then
+        anat_input_candidates+=("${INPUT_DIR}/${subject}/${session}/anat")
+        if [ -n "$session_dir_alt" ]; then
+            anat_input_candidates+=("${INPUT_DIR}/${subject}/${session_dir_alt}/anat")
+        fi
+    fi
+    anat_input_candidates+=("${INPUT_DIR}/${subject}/anat")
+
+    local anat_input=""
+    local candidate
+    for candidate in "${anat_input_candidates[@]}"; do
+        if [ -d "$candidate" ]; then
+            anat_input="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$anat_input" ]; then
+        die "Anatomical directory not found for ${subject}${session:+/$session}"
+    fi
+
+    local output_subject_dir="${OUTPUT_DIR}/${subject}"
+    if [ -n "$session" ]; then
+        output_subject_dir="${output_subject_dir}/${session}"
+    fi
+    local anat_output_dir="${output_subject_dir}/anat"
+    local preproc_dir="${anat_output_dir}/preproc"
+    mkdir -p "$preproc_dir"
+
+    local t1_path
+    if ! t1_path="$(find_image "$anat_input" "$T1_PATTERN")"; then
+        die "No T1w image matching '$T1_PATTERN' found under $anat_input"
+    fi
+    t1_path="$(to_absolute "$t1_path")" || die "Unable to resolve absolute path for $t1_path"
+
+    local t2_path=""
+    if ! t2_path="$(find_image "$anat_input" "$T2_PATTERN")"; then
+        log "WARNING" "No T2w image matching '$T2_PATTERN' found for ${subject}${session:+/$session}; continuing with T1w only."
+        t2_path=""
+    else
+        t2_path="$(to_absolute "$t2_path")" || die "Unable to resolve absolute path for $t2_path"
+    fi
+
+    local t1_out="${preproc_dir}/T1w_preproc.nii.gz"
+    local t1_brain="${preproc_dir}/T1w_brain.nii.gz"
+    local t1_mask="${preproc_dir}/T1w_brain_mask.nii.gz"
+    local t2_out="${preproc_dir}/T2w_preproc.nii.gz"
+    local t2_brain="${preproc_dir}/T2w_brain.nii.gz"
+    local t1t2_mean="${preproc_dir}/T1T2w_mean.nii.gz"
+    local t2_to_t1_mat="${preproc_dir}/T2w_to_T1w.mat"
+
+    if [ "$SKIP_EXISTING" = true ] && [ -f "$t1_out" ] && [ -f "$t1_mask" ]; then
+        if [ -z "$t2_path" ] || [ -f "$t2_out" ]; then
+            log "INFO" "Outputs already exist for ${subject}${session:+/$session}; skipping."
+            return 0
+        fi
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN" "Would preprocess ${subject}${session:+/$session}"
+        log "DRY-RUN" "  T1w source: $t1_path"
+        if [ -n "$t2_path" ]; then
+            log "DRY-RUN" "  T2w source: $t2_path"
+        fi
+        log "DRY-RUN" "  Output directory: $preproc_dir"
+        return 0
+    fi
+
+    local work_dir
+    work_dir="$(mktemp -d)"
+
+    log "INFO" "Preprocessing T1w for ${subject}${session:+/$session}"
+    bet "$t1_path" "${work_dir}/t1_brain" -f "$BET_FRACTION" -g 0 -m >/dev/null 2>&1 || die "BET failed on $t1_path"
+    fast -B -t 1 -o "${work_dir}/t1_fast" "$t1_path" >/dev/null 2>&1 || die "FAST bias correction failed on $t1_path"
+
+    fslmaths "${work_dir}/t1_fast_restore.nii.gz" -mas "${work_dir}/t1_brain_mask.nii.gz" "$t1_out" >/dev/null 2>&1 || die "Failed to apply T1 brain mask"
+    fslmaths "$t1_path" -mas "${work_dir}/t1_brain_mask.nii.gz" "$t1_brain" >/dev/null 2>&1 || die "Failed to derive T1 brain image"
+    cp "${work_dir}/t1_brain_mask.nii.gz" "$t1_mask"
+
+    if [ -n "$t2_path" ]; then
+        log "INFO" "Preprocessing T2w for ${subject}${session:+/$session}"
+        flirt -in "$t2_path" -ref "$t1_out" -dof 6 -omat "$t2_to_t1_mat" -out "${work_dir}/t2_in_t1.nii.gz" >/dev/null 2>&1 || die "FLIRT alignment of T2 to T1 failed"
+        fast -B -t 2 -o "${work_dir}/t2_fast" "${work_dir}/t2_in_t1.nii.gz" >/dev/null 2>&1 || die "FAST bias correction failed on T2w image"
+        fslmaths "${work_dir}/t2_fast_restore.nii.gz" -mas "$t1_mask" "$t2_out" >/dev/null 2>&1 || die "Failed to apply T1 mask to T2w image"
+        cp "$t2_out" "$t2_brain"
+        fslmaths "$t1_out" -add "$t2_out" -div 2 "$t1t2_mean" >/dev/null 2>&1 || log "WARNING" "Unable to compute T1/T2 mean for ${subject}${session:+/$session}"
+    else
+        remove_if_exists "$t2_out"
+        remove_if_exists "$t2_brain"
+        remove_if_exists "$t1t2_mean"
+        remove_if_exists "$t2_to_t1_mat"
+    fi
+
+    log "SUCCESS" "Structural preprocessing complete for ${subject}${session:+/$session}"
+    remove_if_exists "$work_dir"
+}
+
+# ---------------------------- Argument Parsing -------------------------------
+
+while getopts ":i:o:l:p:t:f:xdvh" opt; do
+    case "$opt" in
+        i) INPUT_DIR="$OPTARG";;
+        o) OUTPUT_DIR="$OPTARG";;
+        l) LOG_DIR="$OPTARG";;
+        p) T1_PATTERN="$OPTARG";;
+        t) T2_PATTERN="$OPTARG";;
+        f) BET_FRACTION="$OPTARG";;
+        x) SKIP_EXISTING=true;;
+        d) DRY_RUN=true;;
+        v) VERBOSE=true;;
+        h) usage;;
+        :) die "Option -$OPTARG requires an argument.";;
+        \?) die "Invalid option: -$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+[ -z "$INPUT_DIR" ] && usage
+[ -z "$OUTPUT_DIR" ] && usage
+
+if [ -z "$LOG_DIR" ]; then
+    LOG_DIR="${OUTPUT_DIR}/logs"
+fi
+
+check_prerequisites
+
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+subject="$1"
+session="${2:-}"
+
+preprocess_subject "$subject" "$session"

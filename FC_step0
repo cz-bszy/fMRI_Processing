@@ -14,9 +14,10 @@ set -euo pipefail
 
 INPUT_DIR=""
 OUTPUT_DIR=""
-CORES_PER_SUBJECT=2
+CORES_PER_SUBJECT=4
 LOG_DIR=""
 FILE_PATTERN="*T1w.nii*"
+STRUCT_PREPROC_ROOT=""
 SKIP_EXISTING=false
 PROCESSING_MODE="default"
 EXPERT_FILE=""
@@ -45,6 +46,7 @@ usage() {
     echo "  -l    Log directory (default: output_dir/logs)"
     echo "  -e    Expert options file"
     echo "  -t    Maximum time per subject (format: HH:MM:SS)"
+    echo "  -S    Structural preprocessing root directory (expects anat/preproc outputs)"
     echo "  -x    Skip existing subjects"
     echo "  -d    Dry run (show commands without executing)"
     echo "  -v    Verbose output"
@@ -54,7 +56,7 @@ usage() {
 
 # ---------------------------- Argument Parsing ------------------------------
 
-while getopts ":i:o:c:p:m:l:e:t:xdvh" opt; do
+while getopts ":i:o:c:p:m:l:e:t:S:xdvh" opt; do
     case ${opt} in
         i) INPUT_DIR="$OPTARG";;
         o) OUTPUT_DIR="$OPTARG";;
@@ -64,6 +66,7 @@ while getopts ":i:o:c:p:m:l:e:t:xdvh" opt; do
         l) LOG_DIR="$OPTARG";;
         e) EXPERT_FILE="$OPTARG";;
         t) MAX_TIME="$OPTARG";;
+        S) STRUCT_PREPROC_ROOT="$OPTARG";;
         x) SKIP_EXISTING=true;;
         d) DRY_RUN=true;;
         v) VERBOSE=true;;
@@ -158,6 +161,7 @@ process_subject() {
     local subject_id="$1"
     local anat_file="$2"
     local session="${3:-}"
+    local t2_file="${4:-}"
     local subj_sess_id
     
     if [ ! -z "$session" ]; then
@@ -167,28 +171,49 @@ process_subject() {
     fi
     
     local subject_log_file="$LOG_DIR/${subj_sess_id}_$(date +'%Y%m%d').log"
-    
+
     if [ "$SKIP_EXISTING" = true ] && [ -d "$OUTPUT_DIR/$subj_sess_id" ]; then
         if [ -f "$OUTPUT_DIR/$subj_sess_id/mri/brain.mgz" ]; then
             log "INFO" "Subject-Session '$subj_sess_id' already processed. Skipping..."
             return 0
         fi
     fi
-    
+
+    if [ -d "$OUTPUT_DIR/$subj_sess_id" ] && [ ! -f "$OUTPUT_DIR/$subj_sess_id/mri/brain.mgz" ]; then
+        log "WARNING" "Subject-Session '$subj_sess_id' has incomplete recon-all output; cleaning before restart"
+        rm -rf "$OUTPUT_DIR/$subj_sess_id"
+    fi
+
     log "INFO" "Processing Subject: $subject_id | Session: ${session:-None}"
     log "INFO" "Anatomical File: $anat_file"
+    if [ -n "$t2_file" ]; then
+        log "INFO" "T2w support file: $t2_file"
+    fi
     
     if [ "$DRY_RUN" = true ]; then
         log "DRY-RUN" "Would process $subj_sess_id"
+        if [ -n "$t2_file" ]; then
+            log "DRY-RUN" "Would supply T2w: $t2_file"
+        fi
         return 0
     fi
 
     # Define processing steps based on mode
     local steps
+    local import_args
+    local quoted_t1
+    printf -v quoted_t1 '%q' "$anat_file"
+    import_args="-i ${quoted_t1}"
+    if [ -n "$t2_file" ]; then
+        local quoted_t2
+        printf -v quoted_t2 '%q' "$t2_file"
+        import_args="${import_args} -T2 ${quoted_t2} -T2pial ${quoted_t2} -nuintensitycor-3T"
+    fi
+
     case "$PROCESSING_MODE" in
         "default")
             steps=(
-                "-i \"$anat_file\" -autorecon1"
+                "$import_args -autorecon1"
                 "-gcareg"
                 "-canorm"
                 "-careg"
@@ -197,14 +222,16 @@ process_subject() {
             )
             ;;
         "minimal")
-            steps=("-i \"$anat_file\" -autorecon1")
+            steps=("$import_args -autorecon1")
             ;;
         "complete")
-            steps=("-i \"$anat_file\" -all")
+            steps=("$import_args -all")
             ;;
         "custom")
             if [ ! -z "$EXPERT_FILE" ]; then
-                steps=("-i \"$anat_file\" -expert \"$EXPERT_FILE\"")
+                local expert_step
+                printf -v expert_step '%s -expert %q' "$import_args" "$EXPERT_FILE"
+                steps=("$expert_step")
             else
                 log "ERROR" "Custom mode requires expert options file"
                 return 1
@@ -269,12 +296,44 @@ fi
 subject_id="$1"
 session="${2:-\"\"}"
 
-# Find anatomical file for the subject
-anat_file=""
-if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
-    anat_file=$(find "$INPUT_DIR/$subject_id" -type f -name "$FILE_PATTERN" | head -n 1)
-else
-    anat_file=$(find "$INPUT_DIR/$subject_id/$session" -type f -name "$FILE_PATTERN" | head -n 1)
+if [ "$session" = "\"\"" ] || [ "$session" = "''" ]; then
+    session=""
+fi
+
+# Resolve structural preprocessing outputs if available
+preproc_dir=""
+if [ -n "$STRUCT_PREPROC_ROOT" ]; then
+    preproc_dir="${STRUCT_PREPROC_ROOT}/${subject_id}"
+    if [ -n "$session" ]; then
+        preproc_dir="${preproc_dir}/${session}"
+    fi
+    preproc_dir="${preproc_dir}/anat/preproc"
+    if [ ! -d "$preproc_dir" ]; then
+        preproc_dir=""
+    fi
+fi
+
+t1_preproc=""
+t2_preproc=""
+if [ -n "$preproc_dir" ]; then
+    if [ -f "${preproc_dir}/T1w_preproc.nii.gz" ]; then
+        t1_preproc="${preproc_dir}/T1w_preproc.nii.gz"
+    fi
+    if [ -f "${preproc_dir}/T2w_preproc.nii.gz" ]; then
+        t2_preproc="${preproc_dir}/T2w_preproc.nii.gz"
+    fi
+fi
+
+anat_file="$t1_preproc"
+if [ -z "$anat_file" ]; then
+    if [ -z "$session" ]; then
+        anat_file=$(find "$INPUT_DIR/$subject_id" -type f -name "$FILE_PATTERN" | head -n 1)
+    else
+        anat_file=$(find "$INPUT_DIR/$subject_id/$session" -type f -name "$FILE_PATTERN" | head -n 1)
+        if [ -z "$anat_file" ] && [[ "$session" != ses-* ]]; then
+            anat_file=$(find "$INPUT_DIR/$subject_id/ses-$session" -type f -name "$FILE_PATTERN" | head -n 1)
+        fi
+    fi
 fi
 
 if [ -z "$anat_file" ]; then
@@ -283,11 +342,17 @@ if [ -z "$anat_file" ]; then
 fi
 
 if [ "$VERBOSE" = true ]; then
-    log "DEBUG" "Found anatomical file: $anat_file"
+    log "DEBUG" "Using anatomical import: $anat_file"
+    if [ -n "$t2_preproc" ]; then
+        log "DEBUG" "Using T2w support: $t2_preproc"
+    fi
 fi
 
 if [ "$DRY_RUN" = true ]; then
     log "DRY-RUN" "Would process anatomical file: $anat_file"
+    if [ -n "$t2_preproc" ]; then
+        log "DRY-RUN" "Would include T2w support: $t2_preproc"
+    fi
     log "DRY-RUN" "Subject: $subject_id${session:+ Session: $session}"
     exit 0
 fi
@@ -295,7 +360,7 @@ fi
 # Process the single subject
 export OUTPUT_DIR LOG_DIR PROCESSING_MODE EXPERT_FILE MAX_TIME CORES_PER_SUBJECT SKIP_EXISTING DRY_RUN VERBOSE
 
-if ! process_subject "$subject_id" "$anat_file" "$session"; then
+if ! process_subject "$subject_id" "$anat_file" "$session" "$t2_preproc"; then
     log "ERROR" "ReconAll processing failed for subject $subject_id${session:+ session $session}"
     exit 1
 fi

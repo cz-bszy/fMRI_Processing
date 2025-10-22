@@ -100,9 +100,12 @@ check_prerequisites() {
         missing_prereqs+=("FreeSurfer (mri_convert)")
     fi
     
-    # Check for FSL's fast
+    # Check for FSL utilities
     if ! command -v fast >/dev/null 2>&1; then
         missing_prereqs+=("FSL (fast)")
+    fi
+    if ! command -v flirt >/dev/null 2>&1; then
+        missing_prereqs+=("FSL (flirt)")
     fi
     
     # Check for GNU Parallel
@@ -116,37 +119,100 @@ check_prerequisites() {
     fi
 }
 
+normalize_session_dir() {
+    local value="$1"
+    if [ -z "$value" ] || [ "$value" = "\"\"" ]; then
+        printf ''
+    elif [[ "$value" == ses-* ]]; then
+        printf '%s' "$value"
+    else
+        printf 'ses-%s' "$value"
+    fi
+}
+
 process_subject() {
     local subject_id="$1"
     local session="$2"
     local recon_subj_dir="$3"
-    
-    # Create output directory structure with sub- prefix
-    local output_dir
-    local anat_output_dir
-    
-    if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
-        output_dir="${OUTPUT_DIR}/${subject_id}"
-        anat_output_dir="${output_dir}/anat"
-    else
-        output_dir="${OUTPUT_DIR}/${subject_id}/ses-${session}"
-        anat_output_dir="${output_dir}/anat"
+
+    local session_dir="$(normalize_session_dir "$session")"
+
+    # Promote legacy "ses-ses-*" folders into the canonical location
+    if [ -n "$session" ] && [[ "$session" == ses-* ]]; then
+        local legacy_dir="${OUTPUT_DIR}/${subject_id}/ses-${session}"
+        local canonical_dir="${OUTPUT_DIR}/${subject_id}/${session}"
+        if [ -d "$legacy_dir" ] && [ ! -d "$canonical_dir" ]; then
+            log "INFO" "Migrating legacy session directory '$legacy_dir' -> '$canonical_dir'"
+            mv "$legacy_dir" "$canonical_dir"
+        fi
     fi
-    
+
+    local output_dir="${OUTPUT_DIR}/${subject_id}"
+    if [ -n "$session_dir" ]; then
+        output_dir="${output_dir}/${session_dir}"
+    fi
+
+    local anat_output_dir="${output_dir}/anat"
+
     mkdir -p "$anat_output_dir"
+    mkdir -p "$anat_output_dir/preproc"
+
+    local preproc_dir="${anat_output_dir}/preproc"
+    local preproc_t1="${preproc_dir}/T1w_preproc.nii.gz"
+    local preproc_t2="${preproc_dir}/T2w_preproc.nii.gz"
+    local preproc_mask="${preproc_dir}/T1w_brain_mask.nii.gz"
     
     if [ "$VERBOSE" = true ]; then
         log "INFO" "Creating output directory: $anat_output_dir"
+    fi
+
+    if [ -f "$preproc_t1" ]; then
+        cp -f "$preproc_t1" "${anat_output_dir}/T1w_preproc.nii.gz"
+    fi
+    if [ -f "$preproc_t2" ]; then
+        cp -f "$preproc_t2" "${anat_output_dir}/T2w_preproc.nii.gz"
+    fi
+    if [ -f "$preproc_mask" ]; then
+        cp -f "$preproc_mask" "${anat_output_dir}/T1w_brain_mask.nii.gz"
     fi
     
     # Set up input/output files
     local mri_dir="${recon_subj_dir}/mri"
     local input_file="${mri_dir}/brain.mgz"
     local output_file="${anat_output_dir}/Stru_Brain.nii.gz"
-    local segment_prefix="${anat_output_dir}/segment"
+    local std2sub_mat="${anat_output_dir}/std2sub.mat"
+    local fast_init_prefix="${anat_output_dir}/segment_init"
+    local fast_prior_prefix="${anat_output_dir}/segment_prior"
+
+    if [ -z "${FSLDIR:-}" ]; then
+        log "ERROR" "FSLDIR environment variable is not set."
+        return 1
+    fi
+
+    local standard_ref=""
+    local standard_candidates=(
+        "${FSLDIR}/data/standard/MNI152_T1_1mm.nii.gz"
+        "${FSLDIR}/data/standard/MNI152_T1_1mm.nii"
+        "${FSLDIR}/data/standard/MNI152_T1_1mm"
+    )
+
+    for candidate in "${standard_candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            standard_ref="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$standard_ref" ]; then
+        log "ERROR" "Standard reference not found under \$FSLDIR/data/standard"
+        log "ERROR" "Checked: ${standard_candidates[*]}"
+        return 1
+    fi
+
+    [ "$VERBOSE" = true ] && log "INFO" "Using standard reference: $standard_ref"
     
     # Check if processing can be skipped
-    if [ "$SKIP_EXISTING" = true ] && [ -f "$output_file" ] && [ -f "${segment_prefix}_seg.nii.gz" ]; then
+    if [ "$SKIP_EXISTING" = true ] && [ -f "$output_file" ] && [ -f "${fast_prior_prefix}_pve_0.nii.gz" ] && [ -f "${fast_prior_prefix}_pve_2.nii.gz" ]; then
         log "INFO" "Output files already exist for subject $subject_id${session:+ session $session}. Skipping."
         return 0
     fi
@@ -160,7 +226,16 @@ process_subject() {
     # Print commands if in verbose mode
     if [ "$VERBOSE" = true ]; then
         log "COMMAND" "mri_convert \"$input_file\" \"$output_file\""
-        log "COMMAND" "fast -t 1 -g -p -o \"$segment_prefix\" \"$output_file\""
+        log "COMMAND" "flirt -in \"$output_file\" -ref \"$standard_ref\" -omat \"$std2sub_mat\""
+        local fast_inputs_log="$output_file"
+        if [ -f "$preproc_t2" ]; then
+            fast_inputs_log="$fast_inputs_log $preproc_t2"
+            log "COMMAND" "fast -t 1 -n 3 -S 2 -a \"$std2sub_mat\" -o \"$fast_init_prefix\" $fast_inputs_log"
+            log "COMMAND" "fast -t 1 -n 3 -P -S 2 -a \"$std2sub_mat\" -o \"$fast_prior_prefix\" $fast_inputs_log"
+        else
+            log "COMMAND" "fast -t 1 -n 3 -a \"$std2sub_mat\" -o \"$fast_init_prefix\" $fast_inputs_log"
+            log "COMMAND" "fast -t 1 -n 3 -P -a \"$std2sub_mat\" -o \"$fast_prior_prefix\" $fast_inputs_log"
+        fi
     fi
     
     # Exit if dry run
@@ -177,21 +252,60 @@ process_subject() {
     fi
     log "SUCCESS" "Successfully converted to '$output_file'"
     
-    # Perform segmentation
-    log "INFO" "Running FSL FAST segmentation for subject $subject_id${session:+ session $session}..."
-    if ! fast -t 1 -g -p -o "$segment_prefix" "$output_file"; then
-        log "ERROR" "FSL FAST segmentation failed for subject $subject_id${session:+ session $session}"
+    # Ensure standard reference exists
+    if [ ! -f "$standard_ref" ]; then
+        log "ERROR" "Standard reference not found at $standard_ref"
         return 1
     fi
-    log "SUCCESS" "Successfully completed FSL FAST segmentation"
+
+    # Estimate affine between subject T1 and standard space
+    log "INFO" "Estimating affine transform to standard space for subject $subject_id${session:+ session $session}..."
+    if ! flirt -in "$output_file" -ref "$standard_ref" -omat "$std2sub_mat"; then
+        log "ERROR" "FLIRT standard-space registration failed for subject $subject_id${session:+ session $session}"
+        return 1
+    fi
+    log "SUCCESS" "Saved affine matrix to $std2sub_mat"
+
+    local -a fast_inputs=("$output_file")
+    if [ -f "$preproc_t2" ]; then
+        fast_inputs+=("$preproc_t2")
+    fi
+    local -a fast_channel_args=()
+    if [ ${#fast_inputs[@]} -gt 1 ]; then
+        fast_channel_args=(-S ${#fast_inputs[@]})
+        log "INFO" "FAST will use ${#fast_inputs[@]} structural channels (including T2w) for subject $subject_id${session:+ session $session}"
+    fi
+
+    # FAST initialisation with standard priors
+    log "INFO" "Running FAST (initialisation with priors) for subject $subject_id${session:+ session $session}..."
+    if ! fast -t 1 -n 3 "${fast_channel_args[@]}" -a "$std2sub_mat" -o "$fast_init_prefix" "${fast_inputs[@]}"; then
+        log "ERROR" "FAST initialisation failed for subject $subject_id${session:+ session $session}"
+        return 1
+    fi
+
+    # FAST with priors enabled throughout
+    log "INFO" "Running FAST (full prior) for subject $subject_id${session:+ session $session}..."
+    if ! fast -t 1 -n 3 -P "${fast_channel_args[@]}" -a "$std2sub_mat" -o "$fast_prior_prefix" "${fast_inputs[@]}"; then
+        log "ERROR" "FAST prior-guided segmentation failed for subject $subject_id${session:+ session $session}"
+        return 1
+    fi
+
+    # Provide compatibility copies for downstream steps expecting segment_prob_*.nii.gz
+    cp -f "${fast_prior_prefix}_pve_0.nii.gz" "${anat_output_dir}/segment_prob_0.nii.gz"
+    cp -f "${fast_prior_prefix}_pve_1.nii.gz" "${anat_output_dir}/segment_prob_1.nii.gz"
+    cp -f "${fast_prior_prefix}_pve_2.nii.gz" "${anat_output_dir}/segment_prob_2.nii.gz"
+    log "SUCCESS" "Completed FAST segmentation with prior guidance"
     
     # Verify output files
     local required_files=(
         "$output_file"
-        "${segment_prefix}_seg.nii.gz"
-        "${segment_prefix}_pve_0.nii.gz"
-        "${segment_prefix}_pve_1.nii.gz"
-        "${segment_prefix}_pve_2.nii.gz"
+        "$std2sub_mat"
+        "${fast_prior_prefix}_pve_0.nii.gz"
+        "${fast_prior_prefix}_pve_1.nii.gz"
+        "${fast_prior_prefix}_pve_2.nii.gz"
+        "${anat_output_dir}/segment_prob_0.nii.gz"
+        "${anat_output_dir}/segment_prob_1.nii.gz"
+        "${anat_output_dir}/segment_prob_2.nii.gz"
     )
     
     for file in "${required_files[@]}"; do
@@ -269,7 +383,31 @@ fi
 
 subject_id="$1"
 session="${2:-\"\"}"
-recon_path="${RECON_ALL_DIR}/${subject_id}"
+recon_subject=""
+recon_path=""
+session_no_prefix=""
+if [ "$session" = "\"\"" ]; then
+    session=""
+fi
+
+recon_subject="$subject_id"
+if [ -n "$session" ]; then
+    recon_subject="${subject_id}_${session}"
+fi
+
+recon_path="${RECON_ALL_DIR}/${recon_subject}"
+if [ ! -d "$recon_path" ] && [[ "$session" == ses-* ]]; then
+    session_no_prefix="${session#ses-}"
+    if [ -n "$session_no_prefix" ]; then
+        recon_subject="${subject_id}_${session_no_prefix}"
+        recon_path="${RECON_ALL_DIR}/${recon_subject}"
+    fi
+fi
+
+if [ ! -d "$recon_path" ]; then
+    recon_subject="$subject_id"
+    recon_path="${RECON_ALL_DIR}/${recon_subject}"
+fi
 
 # Validate subject directory exists
 subject_path="${INPUT_DIR}/${subject_id}"
@@ -308,4 +446,3 @@ if ! process_subject "$subject_id" "$session" "$recon_path"; then
 fi
 
 log "SUCCESS" "Anatomical preprocessing completed for subject $subject_id${session:+ session $session}"
-
