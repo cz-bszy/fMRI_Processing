@@ -4,8 +4,9 @@
 
 The local `codex/adni-preprocessing-pilot` branch starts from historical commit
 `2eaa2ba2eda5ae6792bbf4331201159f5d112c27`. Session-path and per-run metadata
-handling were brought forward from the existing CNS-001 CN scripts. This branch
-is undergoing real-data validation; it is not a validated cohort release.
+handling were brought forward from the existing CNS-001 CN scripts. A bounded
+real-data pilot has completed across GE, Philips, and Siemens long-TR and
+multiband acquisitions. This is not a validated cohort release.
 
 The corrected path reuses completed FreeSurfer `brain.mgz` and `T1.mgz` without
 running `recon-all`. Structural voxel storage is reoriented to the standard
@@ -53,10 +54,15 @@ bash /project/pipeline/run_adni_pilot.sh /project sub-example ses-example
 Inputs are staged under `/project/input`; saved FreeSurfer inputs are under
 `/project/recon`; an existing FreeSurfer license is read from `/project/license.txt`.
 The private validation launcher bounds CPU/RAM per scan and concurrency.
-FC_step1–6 produce registration QC and `quality.json`. Validation includes
-long-TR and multiband ADNI acquisitions; run logs, participant identifiers,
-licenses and images stay outside this repository. A representative complete
-run is validated before expanding the batch.
+FC_step1–6 produce registration QC and `quality.json`. The completed pilot
+passed output-dimension and ROI extraction checks for both denoising branches;
+the shared spatial transforms passed positive brain-Jacobian checks.
+Saved native residuals also passed the recorded
+numerical projection check. Canonically oriented QC and old/new spatial outputs
+were visually reviewed. These checks establish execution on the sampled
+protocols, not anatomical ground truth or suitability of every scan for analysis.
+Motion and incomplete regional coverage still require explicit inclusion rules.
+Run logs, participant identifiers, licenses and images stay outside this repository.
 
 For a verified checkpoint in the same run, `START_STEP=5` reruns only nuisance
 regression, ROI extraction and checks. Reuse requires unchanged upstream inputs,
@@ -65,8 +71,11 @@ with GNU Parallel; use `--jobs` to bound concurrency and retain per-scan logs.
 
 `python test_helpers.py` checks multiband times, negative slice-axis ordering,
 rejection of missing timing, and ROI means with constant/missing voxels. Bash
-syntax checks pass. Runtime and visual QC are recorded with the pilot outputs;
-these checks alone do not establish improved registration on ADNI.
+syntax checks pass. Runtime and visual QC are recorded with the pilot outputs.
+The input-scaled projection check uses a float32 accumulation reference; it is
+neither a formal error bound for the full fitting algorithm nor a measure of
+biological denoising. Larger masks and higher fitted-template similarity alone
+do not establish recovery of true signal or independent registration accuracy.
 
 ## Status
 This repository has been consolidated into **MRI_Processing**.
