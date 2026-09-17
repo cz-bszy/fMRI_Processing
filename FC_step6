@@ -172,7 +172,7 @@ process_subject() {
 
     local base_dir="$OUTPUT_DIR/$subject"
     if [[ -n "$session" && "$session" != "\"\"" ]]; then
-        base_dir="$base_dir/ses-${session}"
+        base_dir="$base_dir/$session"
     fi
     local func_dir="$base_dir/func"
     local ts_dir="$func_dir/ts"
@@ -204,7 +204,7 @@ process_subject() {
         local dataset_path="$results_root/${base_name}.nii.gz"
         [[ -f "$dataset_path" ]] || dataset_path="$results_root/${base_name}.nii"
         if [[ ! -f "$dataset_path" ]]; then
-            log "WARNING" "[$subject${session:+ ses-${session}}][$fsf] residual dataset not found in $results_root"
+            log "WARNING" "[$subject${session:+ session $session}][$fsf] residual dataset not found in $results_root"
             continue
         fi
 
@@ -219,7 +219,7 @@ process_subject() {
     done
 
     if [[ ${#fsf_entries[@]} -eq 0 ]]; then
-        log "ERROR" "[$subject${session:+ ses-${session}}] No residual datasets found under $OUTPUT_DIR/results"
+        log "ERROR" "[$subject${session:+ session $session}] No residual datasets found under $OUTPUT_DIR/results"
         return 1
     fi
 
@@ -235,29 +235,29 @@ process_subject() {
     done
 
     if [[ "$pending_extraction" = false ]]; then
-        log "INFO" "[$subject${session:+ ses-${session}}] timeseries already exist for requested FSF types; skipping."
+        log "INFO" "[$subject${session:+ session $session}] timeseries already exist for requested FSF types; skipping."
         return 0
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
-        log "DRY-RUN" "Would extract atlas timeseries for $subject${session:+ ses-${session}} (${#fsf_entries[@]} residual dataset(s))"
+        log "DRY-RUN" "Would extract atlas timeseries for $subject${session:+ session $session} (${#fsf_entries[@]} residual dataset(s))"
         return 0
     fi
 
-    log "INFO" "[$subject${session:+ ses-${session}}] resampling atlas to match ${ref_dataset##*/}"
+    log "INFO" "[$subject${session:+ session $session}] resampling atlas to match ${ref_dataset##*/}"
     local atlas_tmp="${ts_dir}/${template_safe}_results_space_tmp.nii.gz"
     rm -f "$atlas_tmp"
     if ! 3dresample -overwrite -master "$ref_dataset" -rmode NN -prefix "$atlas_tmp" -input "$ATLAS_PATH" >/dev/null; then
-        log "ERROR" "[$subject${session:+ ses-${session}}] atlas resample command failed."
+        log "ERROR" "[$subject${session:+ session $session}] atlas resample command failed."
         rm -f "$atlas_tmp"
         return 1
     fi
     if [[ ! -f "$atlas_tmp" ]]; then
-        log "ERROR" "[$subject${session:+ ses-${session}}] atlas resample did not produce an output file."
+        log "ERROR" "[$subject${session:+ session $session}] atlas resample did not produce an output file."
         return 1
     fi
-    if ! 3dcalc -a "$atlas_tmp" -expr 'int(a)' -datum short -prefix "$atlas_res" >/dev/null; then
-        log "ERROR" "[$subject${session:+ ses-${session}}] atlas integerisation failed."
+    if ! 3dcalc -overwrite -a "$atlas_tmp" -expr 'int(a)' -datum short -prefix "$atlas_res" >/dev/null; then
+        log "ERROR" "[$subject${session:+ session $session}] atlas integerisation failed."
         rm -f "$atlas_tmp" "$atlas_res"
         return 1
     fi
@@ -265,7 +265,7 @@ process_subject() {
 
     3dmaskdump -mask "$atlas_res" -noijk "$atlas_res" | sort -nu | awk '$1>0' > "$labels_file"
     if [[ ! -s "$labels_file" ]]; then
-        log "ERROR" "[$subject${session:+ ses-${session}}] atlas resample produced no valid labels."
+        log "ERROR" "[$subject${session:+ session $session}] atlas resample produced no valid labels."
         return 1
     fi
 
@@ -274,36 +274,19 @@ process_subject() {
         IFS='|' read -r fsf dataset_path ts_output results_root <<< "$entry"
 
         if [[ "$SKIP_EXISTING" == true && -s "$ts_output" ]]; then
-            log "INFO" "[$subject${session:+ ses-${session}}][$fsf] timeseries exists; skipping."
+            log "INFO" "[$subject${session:+ session $session}][$fsf] timeseries exists; skipping."
             any_success=1
             continue
         fi
 
-        local roi_dir="$ts_dir/${template_safe}_${fsf}_rois"
-        rm -rf "$roi_dir"
-        mkdir -p "$roi_dir"
-        local -a cat_list=()
-        while read -r label; do
-            local roi_file="$roi_dir/roi_${label}.1D"
-            extract_roi_series "$dataset_path" "$atlas_res" "$label" > "$roi_file"
-            cat_list+=("$roi_file")
-        done < "$labels_file"
-
-        if [[ ${#cat_list[@]} -eq 0 ]]; then
-            log "WARNING" "[$subject${session:+ ses-${session}}][$fsf] atlas produced empty ROI set."
-            rm -rf "$roi_dir"
-            continue
-        fi
-
-        1dcat "${cat_list[@]}" > "$ts_output"
-        log "SUCCESS" "[$subject${session:+ ses-${session}}][$fsf] wrote $ts_output"
-        rm -f "${cat_list[@]}"
-        rmdir "$roi_dir" 2>/dev/null || true
+        python3 "${SCRIPT_DIR}/extract_roi_timeseries.py" "$dataset_path" "$atlas_res" \
+            "${func_dir}/reg_dir/mask2standard.nii.gz" "$ts_output" || return 1
+        log "SUCCESS" "[$subject${session:+ session $session}][$fsf] wrote $ts_output"
         any_success=1
     done
 
     if [[ $any_success -eq 0 ]]; then
-        log "ERROR" "[$subject${session:+ ses-${session}}] No time-series extracted for any FSF type."
+        log "ERROR" "[$subject${session:+ session $session}] No time-series extracted for any FSF type."
         return 1
     fi
 }
@@ -356,7 +339,7 @@ else
     discover_subjects "$subjects_file"
 fi
 
-export INPUT_DIR OUTPUT_DIR LOG_DIR ATLAS_NAME ATLAS_PATH FSF_TYPES_LIST SKIP_EXISTING DRY_RUN VERBOSE
+export SCRIPT_DIR INPUT_DIR OUTPUT_DIR LOG_DIR ATLAS_NAME ATLAS_PATH FSF_TYPES_LIST SKIP_EXISTING DRY_RUN VERBOSE
 export -f log atlas_safe_name process_subject extract_roi_series
 
 parallel --colsep '\t' --jobs "$NUM_JOBS" process_subject :::: "$subjects_file"

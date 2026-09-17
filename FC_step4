@@ -141,8 +141,6 @@ process_tissue_maps() {
         "$func_dir/rest_pp_mask.nii.gz"
         "$reg_dir/example_func.nii.gz"
         "$reg_dir/highres2example_func.mat"
-        "$reg_dir/example_func2standard.mat"
-        "$reg_dir/standard2example_func.mat"
         "$anat_dir/segment_prob_0.nii.gz"
         "$anat_dir/segment_prob_2.nii.gz"
     )
@@ -165,91 +163,26 @@ process_tissue_maps() {
         return 0
     fi
     
-    # Copy global mask
-    cp "${func_dir}/rest_pp_mask.nii.gz" "${segment_dir}/global_mask.nii.gz"
-    
-    # Process CSF
-    log "INFO" "Processing CSF maps..."
-    
-    # Register CSF to functional space
-    if ! flirt -in "${anat_dir}/segment_prob_0.nii.gz" \
-               -ref "${reg_dir}/example_func.nii.gz" \
-               -applyxfm -init "${reg_dir}/highres2example_func.mat" \
-               -out "${segment_dir}/csf2func.nii.gz"; then
-        log "ERROR" "Failed to register CSF to functional space"
-        return 1
-    fi
-    
-    # Smooth CSF
-    fslmaths "${segment_dir}/csf2func.nii.gz" \
-             -kernel gauss "$SIGMA" -fmean "${segment_dir}/csf_sm.nii.gz"
-    
-    # Register to standard space
-    flirt -in "${segment_dir}/csf_sm.nii.gz" \
-          -ref "${reg_dir}/standard.nii.gz" \
-          -applyxfm -init "${reg_dir}/example_func2standard.mat" \
-          -out "${segment_dir}/csf2standard.nii.gz"
-    
-    # Apply tissue prior
-    fslmaths "${segment_dir}/csf2standard.nii.gz" \
-             -mas "${STANDARD_DIR}/3mm/avg152T1_csf_bin.nii.gz" \
-             "${segment_dir}/csf_masked.nii.gz"
-    
-    # Back to functional space
-    flirt -in "${segment_dir}/csf_masked.nii.gz" \
-          -ref "${reg_dir}/example_func.nii.gz" \
-          -applyxfm -init "${reg_dir}/standard2example_func.mat" \
-          -out "${segment_dir}/csf_native.nii.gz"
-    
-    # Threshold and mask
-    fslmaths "${segment_dir}/csf_native.nii.gz" \
-             -thr 0.4 -bin "${segment_dir}/csf_bin.nii.gz"
-    
-    fslmaths "${segment_dir}/csf_bin.nii.gz" \
-             -mas "${segment_dir}/global_mask.nii.gz" \
-             "${segment_dir}/csf_mask.nii.gz"
-    
-    # Process WM
-    log "INFO" "Processing WM maps..."
-    
-    # Register WM to functional space
-    if ! flirt -in "${anat_dir}/segment_prob_2.nii.gz" \
-               -ref "${reg_dir}/example_func.nii.gz" \
-               -applyxfm -init "${reg_dir}/highres2example_func.mat" \
-               -out "${segment_dir}/wm2func.nii.gz"; then
-        log "ERROR" "Failed to register WM to functional space"
-        return 1
-    fi
-    
-    # Smooth WM
-    fslmaths "${segment_dir}/wm2func.nii.gz" \
-             -kernel gauss "$SIGMA" -fmean "${segment_dir}/wm_sm.nii.gz"
-    
-    # Register to standard space
-    flirt -in "${segment_dir}/wm_sm.nii.gz" \
-          -ref "${reg_dir}/standard.nii.gz" \
-          -applyxfm -init "${reg_dir}/example_func2standard.mat" \
-          -out "${segment_dir}/wm2standard.nii.gz"
-    
-    # Apply tissue prior
-    fslmaths "${segment_dir}/wm2standard.nii.gz" \
-             -mas "${STANDARD_DIR}/3mm/avg152T1_white_bin.nii.gz" \
-             "${segment_dir}/wm_masked.nii.gz"
-    
-    # Back to functional space
-    flirt -in "${segment_dir}/wm_masked.nii.gz" \
-          -ref "${reg_dir}/example_func.nii.gz" \
-          -applyxfm -init "${reg_dir}/standard2example_func.mat" \
-          -out "${segment_dir}/wm_native.nii.gz"
-    
-    # Threshold and mask
-    fslmaths "${segment_dir}/wm_native.nii.gz" \
-             -thr 0.66 -bin "${segment_dir}/wm_bin.nii.gz"
-    
-    fslmaths "${segment_dir}/wm_bin.nii.gz" \
-             -mas "${segment_dir}/global_mask.nii.gz" \
-             "${segment_dir}/wm_mask.nii.gz"
-    
+    # Tissue masks are created once in T1 and mapped once, without MNI round trips.
+    cp "${func_dir}/rest_pp_mask.nii.gz" "${segment_dir}/global_mask.nii.gz" || return 1
+    [[ "$(fslnvols "${segment_dir}/global_mask.nii.gz")" == 1 ]] || return 1
+    local tissue class threshold
+    for tissue in csf wm; do
+        class=0; threshold=0.9
+        [[ "$tissue" == wm ]] && class=2
+        fslmaths "${anat_dir}/segment_prob_${class}.nii.gz" -thr "$threshold" -bin -ero \
+            "${segment_dir}/${tissue}_t1.nii.gz" || return 1
+        flirt -in "${segment_dir}/${tissue}_t1.nii.gz" -ref "${reg_dir}/example_func.nii.gz" \
+            -applyxfm -init "${reg_dir}/highres2example_func.mat" -interp nearestneighbour \
+            -out "${segment_dir}/${tissue}_native.nii.gz" || return 1
+        fslmaths "${segment_dir}/${tissue}_native.nii.gz" -mas "${segment_dir}/global_mask.nii.gz" \
+            "${segment_dir}/${tissue}_mask.nii.gz" || return 1
+        local count
+        count=$(fslstats "${segment_dir}/${tissue}_mask.nii.gz" -V | awk '{print $1}')
+        [[ "$count" -gt 0 ]] || { log ERROR "Empty $tissue nuisance mask"; return 1; }
+        log INFO "$tissue mask: $count native EPI voxels"
+    done
+
     # Verify outputs
     local required_outputs=(
         "${segment_dir}/csf_mask.nii.gz"
@@ -335,9 +268,6 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # Process the single subject
-if ! process_tissue_maps "$subject_id" "$session"; then
-    log "ERROR" "Tissue processing failed for subject $subject_id${session:+ session $session}"
-    exit 1
-fi
+process_tissue_maps "$subject_id" "$session"
 
 log "SUCCESS" "Tissue processing completed for subject $subject_id${session:+ session $session}"

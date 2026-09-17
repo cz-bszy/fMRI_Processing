@@ -159,29 +159,40 @@ process_subject() {
     local anat_file="$2"
     local session="${3:-}"
     local subj_sess_id
+    local subjects_dir
+    local recon_label="recon-all"
+    local recon_dir
     
     if [ ! -z "$session" ]; then
         subj_sess_id="${subject_id}_${session}"
     else
         subj_sess_id="${subject_id}"
     fi
+
+    subjects_dir="${OUTPUT_DIR}/${subject_id}"
+    if [ -n "$session" ]; then
+        subjects_dir="${OUTPUT_DIR}/${subject_id}/${session}"
+    fi
+    recon_dir="${subjects_dir}/${recon_label}"
+    mkdir -p "$subjects_dir"
     
     local subject_log_file="$LOG_DIR/${subj_sess_id}_$(date +'%Y%m%d').log"
 
-    if [ "$SKIP_EXISTING" = true ] && [ -d "$OUTPUT_DIR/$subj_sess_id" ]; then
-        if [ -f "$OUTPUT_DIR/$subj_sess_id/mri/brain.mgz" ]; then
+    if [ "$SKIP_EXISTING" = true ] && [ -d "$recon_dir" ]; then
+        if [ -f "$recon_dir/mri/brain.mgz" ]; then
             log "INFO" "Subject-Session '$subj_sess_id' already processed. Skipping..."
             return 0
         fi
     fi
 
-    if [ -d "$OUTPUT_DIR/$subj_sess_id" ] && [ ! -f "$OUTPUT_DIR/$subj_sess_id/mri/brain.mgz" ]; then
+    if [ -d "$recon_dir" ] && [ ! -f "$recon_dir/mri/brain.mgz" ]; then
         log "WARNING" "Subject-Session '$subj_sess_id' has incomplete recon-all output; cleaning before restart"
-        rm -rf "$OUTPUT_DIR/$subj_sess_id"
+        rm -rf "$recon_dir"
     fi
 
     log "INFO" "Processing Subject: $subject_id | Session: ${session:-None}"
     log "INFO" "Anatomical File: $anat_file"
+    log "INFO" "Recon-all output: $recon_dir"
     
     if [ "$DRY_RUN" = true ]; then
         log "DRY-RUN" "Would process $subj_sess_id"
@@ -228,7 +239,7 @@ process_subject() {
             cmd_with_timeout="timeout $MAX_TIME $step"
         fi
         
-        if ! run_recon_all_step "$subj_sess_id" "$OUTPUT_DIR" "$cmd_with_timeout" "$CORES_PER_SUBJECT" "$subject_log_file"; then
+        if ! run_recon_all_step "$recon_label" "$subjects_dir" "$cmd_with_timeout" "$CORES_PER_SUBJECT" "$subject_log_file"; then
             log "ERROR" "Processing failed for subject $subj_sess_id at step: $step"
             return 1
         fi
@@ -236,7 +247,7 @@ process_subject() {
     
     # Verify brain.mgz was created (for default and complete modes)
     if [[ "$PROCESSING_MODE" != "custom" ]]; then
-        if [ ! -f "$OUTPUT_DIR/$subj_sess_id/mri/brain.mgz" ]; then
+        if [ ! -f "$recon_dir/mri/brain.mgz" ]; then
             log "ERROR" "brain.mgz was not generated for subject $subj_sess_id"
             return 1
         fi

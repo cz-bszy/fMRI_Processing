@@ -132,7 +132,7 @@ process_subject() {
         output_dir="${OUTPUT_DIR}/${subject_id}"
         anat_output_dir="${output_dir}/anat"
     else
-        output_dir="${OUTPUT_DIR}/${subject_id}/ses-${session}"
+        output_dir="${OUTPUT_DIR}/${subject_id}/${session}"
         anat_output_dir="${output_dir}/anat"
     fi
     
@@ -147,7 +147,7 @@ process_subject() {
     local input_file="${mri_dir}/brain.mgz"
     local output_file="${anat_output_dir}/Stru_Brain.nii.gz"
     local std2sub_mat="${anat_output_dir}/std2sub.mat"
-    local fast_init_prefix="${anat_output_dir}/segment_init"
+    local sub2std_mat="${anat_output_dir}/sub2std.mat"
     local fast_prior_prefix="${anat_output_dir}/segment_prior"
 
     if [ -z "${FSLDIR:-}" ]; then
@@ -157,9 +157,9 @@ process_subject() {
 
     local standard_ref=""
     local standard_candidates=(
-        "${FSLDIR}/data/standard/MNI152_T1_1mm.nii.gz"
-        "${FSLDIR}/data/standard/MNI152_T1_1mm.nii"
-        "${FSLDIR}/data/standard/MNI152_T1_1mm"
+        "${FSLDIR}/data/standard/MNI152_T1_1mm_brain.nii.gz"
+        "${FSLDIR}/data/standard/MNI152_T1_1mm_brain.nii"
+        "${FSLDIR}/data/standard/MNI152_T1_1mm_brain"
     )
 
     for candidate in "${standard_candidates[@]}"; do
@@ -192,8 +192,8 @@ process_subject() {
     # Print commands if in verbose mode
     if [ "$VERBOSE" = true ]; then
         log "COMMAND" "mri_convert \"$input_file\" \"$output_file\""
-        log "COMMAND" "flirt -in \"$output_file\" -ref \"$standard_ref\" -omat \"$std2sub_mat\""
-        log "COMMAND" "fast -t 1 -n 3 -a \"$std2sub_mat\" -o \"$fast_init_prefix\" \"$output_file\""
+        log "COMMAND" "flirt -in \"$output_file\" -ref \"$standard_ref\" -omat \"$sub2std_mat\""
+        log "COMMAND" "convert_xfm -inverse -omat \"$std2sub_mat\" \"$sub2std_mat\""
         log "COMMAND" "fast -t 1 -n 3 -P -a \"$std2sub_mat\" -o \"$fast_prior_prefix\" \"$output_file\""
     fi
     
@@ -210,6 +210,15 @@ process_subject() {
         return 1
     fi
     log "SUCCESS" "Successfully converted to '$output_file'"
+    mri_convert "${mri_dir}/T1.mgz" "${anat_output_dir}/Stru_Head.nii.gz" || return 1
+    # Standard voxel storage improves the affine search without changing world anatomy.
+    # Apply it to both conformed images before estimating transforms or tissue priors.
+    local image oriented
+    for image in "$output_file" "${anat_output_dir}/Stru_Head.nii.gz"; do
+        oriented="${image%.nii.gz}_oriented.nii.gz"
+        fslreorient2std "$image" "$oriented" || return 1
+        mv "$oriented" "$image" || return 1
+    done
     
     # Ensure standard reference exists
     if [ ! -f "$standard_ref" ]; then
@@ -219,20 +228,14 @@ process_subject() {
 
     # Estimate affine between subject T1 and standard space
     log "INFO" "Estimating affine transform to standard space for subject $subject_id${session:+ session $session}..."
-    if ! flirt -in "$output_file" -ref "$standard_ref" -omat "$std2sub_mat"; then
+    if ! flirt -in "$output_file" -ref "$standard_ref" -omat "$sub2std_mat"; then
         log "ERROR" "FLIRT standard-space registration failed for subject $subject_id${session:+ session $session}"
         return 1
     fi
-    log "SUCCESS" "Saved affine matrix to $std2sub_mat"
+    convert_xfm -inverse -omat "$std2sub_mat" "$sub2std_mat" || return 1
+    log "SUCCESS" "Saved standard-to-subject prior matrix to $std2sub_mat"
 
-    # FAST initialisation with standard priors
-    log "INFO" "Running FAST (initialisation with priors) for subject $subject_id${session:+ session $session}..."
-    if ! fast -t 1 -n 3 -a "$std2sub_mat" -o "$fast_init_prefix" "$output_file"; then
-        log "ERROR" "FAST initialisation failed for subject $subject_id${session:+ session $session}"
-        return 1
-    fi
-
-    # FAST with priors enabled throughout
+    # -a already initializes this fit. A separate preceding FAST fit was unused.
     log "INFO" "Running FAST (full prior) for subject $subject_id${session:+ session $session}..."
     if ! fast -t 1 -n 3 -P -a "$std2sub_mat" -o "$fast_prior_prefix" "$output_file"; then
         log "ERROR" "FAST prior-guided segmentation failed for subject $subject_id${session:+ session $session}"
@@ -244,6 +247,8 @@ process_subject() {
     cp -f "${fast_prior_prefix}_pve_1.nii.gz" "${anat_output_dir}/segment_prob_1.nii.gz"
     cp -f "${fast_prior_prefix}_pve_2.nii.gz" "${anat_output_dir}/segment_prob_2.nii.gz"
     log "SUCCESS" "Completed FAST segmentation with prior guidance"
+
+    generate_structural_qc "$anat_output_dir" "$output_file" "$fast_prior_prefix"
     
     # Verify output files
     local required_files=(
@@ -266,6 +271,48 @@ process_subject() {
     
     log "SUCCESS" "Processing completed for subject $subject_id${session:+ session $session}"
     return 0
+}
+
+generate_structural_qc() {
+    local anat_output_dir="$1"
+    local stru_brain="$2"
+    local fast_prior_prefix="$3"
+
+    local qc_dir="${anat_output_dir}/QC"
+    mkdir -p "$qc_dir"
+
+    if ! command -v slicer >/dev/null 2>&1; then
+        log "WARNING" "FSL slicer not available; skipping structural QC images."
+        return 0
+    fi
+    if ! command -v fslmaths >/dev/null 2>&1; then
+        log "WARNING" "fslmaths not available; skipping structural QC overlay."
+        return 0
+    fi
+
+    local brain_png="${qc_dir}/Stru_Brain.png"
+    if ! slicer "$stru_brain" -a "$brain_png" >/dev/null 2>&1; then
+        log "WARNING" "Failed to generate structural QC mosaic: $brain_png"
+        return 0
+    fi
+
+    local seg_file="${fast_prior_prefix}_seg.nii.gz"
+    if [ -f "$seg_file" ]; then
+        local seg_edges="${qc_dir}/seg_edges.nii.gz"
+        local overlay="${qc_dir}/Stru_Brain_seg_overlay.nii.gz"
+        local overlay_png="${qc_dir}/Stru_Brain_seg_overlay.png"
+
+        if fslmaths "$seg_file" -edge -bin "$seg_edges" >/dev/null 2>&1 && \
+           fslmaths "$stru_brain" -add "$seg_edges" "$overlay" >/dev/null 2>&1 && \
+           slicer "$overlay" -a "$overlay_png" >/dev/null 2>&1; then
+            rm -f "$seg_edges" "$overlay"
+        else
+            log "WARNING" "Failed to generate segmentation overlay QC image."
+            rm -f "$seg_edges" "$overlay"
+        fi
+    else
+        log "WARNING" "Segmentation file not found for QC overlay: $seg_file"
+    fi
 }
 
 find_subjects() {
@@ -332,7 +379,11 @@ fi
 
 subject_id="$1"
 session="${2:-\"\"}"
-recon_path="${RECON_ALL_DIR}/${subject_id}"
+if [ -z "$session" ] || [ "$session" = "\"\"" ]; then
+    recon_path="${RECON_ALL_DIR}/${subject_id}/recon-all"
+else
+    recon_path="${RECON_ALL_DIR}/${subject_id}/${session}/recon-all"
+fi
 
 # Validate subject directory exists
 subject_path="${INPUT_DIR}/${subject_id}"
@@ -365,9 +416,6 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # Process the single subject
-if ! process_subject "$subject_id" "$session" "$recon_path"; then
-    log "ERROR" "Anatomical preprocessing failed for subject $subject_id${session:+ session $session}"
-    exit 1
-fi
+process_subject "$subject_id" "$session" "$recon_path"
 
 log "SUCCESS" "Anatomical preprocessing completed for subject $subject_id${session:+ session $session}"
