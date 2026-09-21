@@ -21,3 +21,11 @@ venv/
 
 # Logs
 *.log
+
+# Local inputs and credentials must never be published with the pipeline.
+license.txt
+*license*.txt
+input/
+output/
+recon/
+baseline/

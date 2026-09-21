@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+Generate DPABI-like normalization / registration QC figures from existing fMRI preprocessing outputs.
+
+Default input:
+  ../data/processing
+
+Default output:
+  ../data/processing/QC_nor
+
+Each subject/session gets one PNG with three registration checks:
+  1) fMRI -> T1:  gray = example_func2highres.nii.gz, shadow = highres.nii.gz
+  2) T1 -> MNI:   gray = highres2standard.nii.gz, shadow = standard.nii.gz
+  3) fMRI -> MNI: gray = example_func2standard.nii.gz, shadow = standard.nii.gz
+
+The red crosshair marks the displayed slice center/origin reference, and anatomical
+axis labels are drawn on each panel for visual checking.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import nibabel as nib
+import numpy as np
+
+
+@dataclass
+class Pair:
+    title: str
+    overlay: Path
+    background: Path
+    overlay_label: str
+    background_label: str
+    cmap: str = "turbo"
+    display: str = "overlay"
+
+
+def robust_limits(data: np.ndarray) -> tuple[float, float]:
+    vals = data[np.isfinite(data)]
+    vals = vals[vals != 0]
+    if vals.size == 0:
+        return 0.0, 1.0
+    lo, hi = np.percentile(vals, [1, 99])
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        lo, hi = float(vals.min()), float(vals.max())
+    if lo == hi:
+        hi = lo + 1.0
+    return float(lo), float(hi)
+
+
+def normalize_plane(data: np.ndarray) -> np.ndarray:
+    lo, hi = robust_limits(data)
+    return np.clip((data - lo) / (hi - lo), 0, 1)
+
+
+def checkerboard(background: np.ndarray, overlay: np.ndarray, block: int = 24) -> np.ndarray:
+    bg = normalize_plane(background)
+    ov = normalize_plane(overlay)
+    yy, xx = np.indices(bg.shape)
+    mask = ((xx // block + yy // block) % 2).astype(bool)
+    out = bg.copy()
+    out[mask] = ov[mask]
+    return out
+
+
+def open_img(path: Path):
+    img = nib.load(str(path))
+    if len(img.shape) not in (3, 4):
+        raise ValueError(f"{path} is not a 3D/4D NIfTI image")
+    # Reorder voxel axes without changing anatomical coordinates.
+    return nib.as_closest_canonical(img)
+
+
+def voxel_origin_or_center(img) -> tuple[int, int, int]:
+    shape = img.shape[:3]
+    try:
+        vox = np.linalg.inv(img.affine).dot(np.array([0.0, 0.0, 0.0, 1.0]))[:3]
+        vox = np.round(vox).astype(int)
+        if all(0 <= vox[i] < shape[i] for i in range(3)):
+            return int(vox[0]), int(vox[1]), int(vox[2])
+    except Exception:
+        pass
+    return int(shape[0] // 2), int(shape[1] // 2), int(shape[2] // 2)
+
+
+def plane_slice(img, plane: str, indices: tuple[int, int, int]) -> np.ndarray:
+    shape = img.shape
+    obj = img.dataobj
+    x, y, z = indices
+    if plane == "sagittal":
+        idx = max(0, min(int(x), shape[0] - 1))
+        arr = np.asanyarray(obj[idx, :, :] if len(shape) == 3 else obj[idx, :, :, :], dtype=np.float32)
+    elif plane == "coronal":
+        idx = max(0, min(int(y), shape[1] - 1))
+        arr = np.asanyarray(obj[:, idx, :] if len(shape) == 3 else obj[:, idx, :, :], dtype=np.float32)
+    elif plane == "axial":
+        idx = max(0, min(int(z), shape[2] - 1))
+        arr = np.asanyarray(obj[:, :, idx] if len(shape) == 3 else obj[:, :, idx, :], dtype=np.float32)
+    else:
+        raise ValueError(plane)
+    if arr.ndim == 3:
+        arr = np.nanmean(arr, axis=2)
+    arr = np.array(arr, dtype=np.float32, copy=True)
+    return np.rot90(np.nan_to_num(arr, copy=False))
+
+
+def crosshair_for_plane(shape2d: tuple[int, int], plane: str, indices: tuple[int, int, int], shape3d: tuple[int, int, int]) -> tuple[float, float]:
+    x, y, z = indices
+    nx, ny, nz = shape3d
+    # After np.rot90, displayed coordinates are approximately:
+    # sagittal: horizontal = y, vertical = nz - 1 - z
+    # coronal:  horizontal = x, vertical = nz - 1 - z
+    # axial:    horizontal = x, vertical = ny - 1 - y
+    if plane == "sagittal":
+        cx = y
+        cy = nz - 1 - z
+    elif plane == "coronal":
+        cx = x
+        cy = nz - 1 - z
+    else:
+        cx = x
+        cy = ny - 1 - y
+    h, w = shape2d
+    return float(max(0, min(cx, w - 1))), float(max(0, min(cy, h - 1)))
+
+
+def add_axis_labels(ax, plane: str) -> None:
+    kw = dict(transform=ax.transAxes, color="#ff2b2b", fontsize=8, fontweight="bold", ha="center", va="center")
+    if plane == "sagittal":
+        ax.text(0.50, 0.04, "I", **kw)
+        ax.text(0.50, 0.96, "S", **kw)
+        ax.text(0.04, 0.50, "P", **kw)
+        ax.text(0.96, 0.50, "A", **kw)
+    elif plane == "coronal":
+        ax.text(0.50, 0.04, "I", **kw)
+        ax.text(0.50, 0.96, "S", **kw)
+        ax.text(0.04, 0.50, "L", **kw)
+        ax.text(0.96, 0.50, "R", **kw)
+    else:
+        ax.text(0.50, 0.04, "P", **kw)
+        ax.text(0.50, 0.96, "A", **kw)
+        ax.text(0.04, 0.50, "L", **kw)
+        ax.text(0.96, 0.50, "R", **kw)
+
+
+def draw_pair_row(fig, axes, row: int, pair: Pair) -> bool:
+    if not pair.overlay.exists() or not pair.background.exists():
+        for ax in axes[row]:
+            ax.axis("off")
+        axes[row][0].set_title(f"{pair.title}\nmissing input", loc="left", fontsize=9)
+        return False
+
+    overlay_img = open_img(pair.overlay)
+    background_img = open_img(pair.background)
+    if overlay_img.shape[:3] != background_img.shape[:3]:
+        raise ValueError(f"Shape mismatch: {pair.overlay.name} {overlay_img.shape[:3]} vs {pair.background.name} {background_img.shape[:3]}")
+    if not np.allclose(overlay_img.affine, background_img.affine, atol=1e-4):
+        raise ValueError(f"Affine mismatch: {pair.overlay.name} vs {pair.background.name}")
+
+    indices = voxel_origin_or_center(overlay_img)
+    for col, plane in enumerate(("sagittal", "coronal", "axial")):
+        ax = axes[row][col]
+        overlay_plane = plane_slice(overlay_img, plane, indices)
+        background_plane = plane_slice(background_img, plane, indices)
+        if pair.display == "checkerboard":
+            checker = checkerboard(background_plane, overlay_plane, block=24)
+            ax.imshow(checker, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+        else:
+            overlay_norm = normalize_plane(overlay_plane)
+            overlay_alpha = np.where(overlay_norm > 0.06, 0.62 * overlay_norm, 0.0)
+            vmin, vmax = robust_limits(background_plane)
+            ax.imshow(background_plane, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+            ax.imshow(overlay_norm, cmap=pair.cmap, alpha=overlay_alpha, vmin=0, vmax=1, interpolation="nearest")
+
+        cx, cy = crosshair_for_plane(background_plane.shape, plane, indices, background_img.shape[:3])
+        ax.axvline(cx, color="#ff2b2b", linewidth=0.55, alpha=0.85)
+        ax.axhline(cy, color="#ff2b2b", linewidth=0.55, alpha=0.85)
+        add_axis_labels(ax, plane)
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if row == 0:
+            ax.set_title(plane, fontsize=10)
+        if col == 0:
+            ax.set_ylabel(pair.title, fontsize=10)
+    fig.text(0.01, 0.96 - row * 0.30, f"background: {pair.background_label}; moving: {pair.overlay_label}; display: {pair.display}", fontsize=7, color="#b13a00")
+    return True
+
+
+def iter_reg_dirs(processing_dir: Path) -> Iterable[Path]:
+    yield from sorted(processing_dir.glob("sub-*/ses-*/func/reg_dir"))
+    yield from sorted(processing_dir.glob("sub-*/func/reg_dir"))
+
+
+def label_from_reg_dir(reg_dir: Path, processing_dir: Path) -> str:
+    rel = reg_dir.relative_to(processing_dir)
+    parts = rel.parts
+    if len(parts) >= 4 and parts[0].startswith("sub-") and parts[1].startswith("ses-"):
+        return f"{parts[0]}_{parts[1]}"
+    if len(parts) >= 3 and parts[0].startswith("sub-"):
+        return parts[0]
+    return "_".join(parts[:-2]).replace("/", "_").replace("\\", "_")
+
+
+def make_qc(reg_dir: Path, processing_dir: Path, output_dir: Path, overwrite: bool) -> tuple[str, str]:
+    label = label_from_reg_dir(reg_dir, processing_dir)
+    out_png = output_dir / f"{label}_QC_nor.png"
+    if out_png.exists() and not overwrite:
+        return label, "exists"
+
+    func_dir = reg_dir.parent
+    mean_func_t1 = reg_dir / "func_mean_in_struct.nii.gz"
+    if not mean_func_t1.exists():
+        mean_func_t1 = reg_dir / "example_func2highres.nii.gz"
+
+    norm_func = reg_dir / "example_func2standard.nii.gz"
+    if not norm_func.exists():
+        norm_func = func_dir / "rest_res2standard.nii.gz"
+
+    pairs = [
+        Pair("fMRI -> T1", mean_func_t1, reg_dir / "highres.nii.gz", "mean fMRI in T1", "T1", "turbo", "overlay"),
+        Pair("T1 -> MNI", reg_dir / "highres2standard.nii.gz", reg_dir / "standard.nii.gz", "T1 in MNI", "MNI template", "plasma", "overlay"),
+        Pair("fMRI -> MNI", norm_func, reg_dir / "standard.nii.gz", "normalized fMRI", "MNI template", "turbo", "overlay"),
+    ]
+
+    fig, axes = plt.subplots(3, 3, figsize=(9.6, 8.2), constrained_layout=True)
+    fig.suptitle(label, fontsize=13)
+
+    ok_any = False
+    try:
+        for row, pair in enumerate(pairs):
+            ok_any = draw_pair_row(fig, axes, row, pair) or ok_any
+        if not ok_any:
+            plt.close(fig)
+            return label, "missing_all"
+        fig.savefig(out_png, dpi=160)
+        plt.close(fig)
+        return label, "ok"
+    except Exception as exc:
+        plt.close(fig)
+        return label, f"error: {exc}"
+
+
+def make_qc_worker(args_tuple) -> dict:
+    idx, reg_dir, processing_dir, output_dir, overwrite = args_tuple
+    reg_dir = Path(reg_dir)
+    processing_dir = Path(processing_dir)
+    output_dir = Path(output_dir)
+    label, status = make_qc(reg_dir, processing_dir, output_dir, overwrite)
+    return {"index": idx, "label": label, "reg_dir": str(reg_dir), "status": status}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate DPABI-like registration/normalization QC PNGs from existing outputs.")
+    default_processing = Path(__file__).resolve().parent.parent / "data" / "processing"
+    parser.add_argument("-p", "--processing-dir", type=Path, default=default_processing)
+    parser.add_argument("-o", "--output-dir", type=Path, default=None)
+    parser.add_argument("--limit", type=int, default=0, help="Only process the first N scans; 0 means all.")
+    parser.add_argument("--overwrite", action="store_true", help="Regenerate PNGs that already exist.")
+    parser.add_argument("--jobs", type=int, default=1, help="Number of parallel worker processes.")
+    parser.add_argument("--scan", help="Only this exact subject_session label; safe for parallel scan jobs.")
+    args = parser.parse_args()
+
+    processing_dir = args.processing_dir.resolve()
+    output_dir = (args.output_dir or (processing_dir / "QC_nor")).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    reg_dirs = list(iter_reg_dirs(processing_dir))
+    if args.scan:
+        reg_dirs = [r for r in reg_dirs if label_from_reg_dir(r, processing_dir) == args.scan]
+    if args.limit > 0:
+        reg_dirs = reg_dirs[: args.limit]
+
+    tasks = [(idx, str(reg_dir), str(processing_dir), str(output_dir), args.overwrite) for idx, reg_dir in enumerate(reg_dirs, 1)]
+    rows = []
+    jobs = max(1, int(args.jobs))
+    if jobs == 1:
+        for task in tasks:
+            row = make_qc_worker(task)
+            rows.append(row)
+            if row["index"] % 25 == 0 or row["status"] not in ("ok", "exists"):
+                print(f"[{row['index']}/{len(reg_dirs)}] {row['label']}: {row['status']}", flush=True)
+    else:
+        done = 0
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            futures = [ex.submit(make_qc_worker, task) for task in tasks]
+            for fut in as_completed(futures):
+                row = fut.result()
+                rows.append(row)
+                done += 1
+                if done % 25 == 0 or row["status"] not in ("ok", "exists"):
+                    print(f"[{done}/{len(reg_dirs)}] {row['label']}: {row['status']}", flush=True)
+        rows.sort(key=lambda row: row["index"])
+
+    manifest = output_dir / (f"{args.scan}_QC_nor_manifest.csv" if args.scan else "QC_nor_manifest.csv")
+    with manifest.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["index", "label", "reg_dir", "status"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    ok = sum(1 for row in rows if row["status"] in ("ok", "exists"))
+    failed = len(rows) - ok
+    print(f"QC_nor finished: ok_or_exists={ok}, failed_or_missing={failed}, output={output_dir}")
+    return 0 if ok > 0 and failed == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

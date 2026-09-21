@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # =============================================================================
 # Script: FC_step3
@@ -69,7 +70,7 @@ check_prerequisites() {
     local missing_prereqs=()
     
     # Check for FSL tools
-    for cmd in flirt convert_xfm; do
+    for cmd in flirt convert_xfm fnirt fnirtfileutils applywarp convertwarp python3; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing_prereqs+=("FSL ($cmd)")
         fi
@@ -171,54 +172,30 @@ process_registration() {
     
     cd "$reg_dir" || { log "ERROR" "Cannot change to directory $reg_dir"; return 1; }
     
-    # Step 1: FUNC->T1
-    log "INFO" "Registering functional to anatomical..."
-    if ! flirt -ref highres.nii.gz -in example_func.nii.gz \
-               -out example_func2highres.nii.gz -omat example_func2highres.mat \
-               -cost corratio -dof 6 -interp trilinear; then
-        log "ERROR" "FUNC->T1 registration failed"
-        return 1
-    fi
-    
-    if ! convert_xfm -inverse -omat highres2example_func.mat example_func2highres.mat; then
-        log "ERROR" "Failed to invert FUNC->T1 transformation"
-        return 1
-    fi
-    
-    # Step 2: T1->STANDARD
-    log "INFO" "Registering anatomical to standard space..."
-    if ! flirt -ref standard.nii.gz -in highres.nii.gz \
-               -out highres2standard.nii.gz -omat highres2standard.mat \
-               -cost corratio -dof 12 -interp trilinear; then
-        log "ERROR" "T1->STANDARD registration failed"
-        return 1
-    fi
-    
-    if ! convert_xfm -inverse -omat standard2highres.mat highres2standard.mat; then
-        log "ERROR" "Failed to invert T1->STANDARD transformation"
-        return 1
-    fi
-    
-    # Step 3: FUNC->STANDARD
-    log "INFO" "Creating functional to standard transformation..."
-    if ! convert_xfm -omat example_func2standard.mat \
-                    -concat highres2standard.mat example_func2highres.mat; then
-        log "ERROR" "Failed to concatenate transformations"
-        return 1
-    fi
-    
-    if ! flirt -ref standard.nii.gz -in example_func.nii.gz \
-               -out example_func2standard.nii.gz -applyxfm \
-               -init example_func2standard.mat -interp trilinear; then
-        log "ERROR" "Failed to apply FUNC->STANDARD transformation"
-        return 1
-    fi
-    
-    if ! convert_xfm -inverse -omat standard2example_func.mat example_func2standard.mat; then
-        log "ERROR" "Failed to invert FUNC->STANDARD transformation"
-        return 1
-    fi
-    
+    # Reuse exactly the transform used for structural masking in FC_step2.
+    cp func2struct.mat example_func2highres.mat || return 1
+    cp struct2func.mat highres2example_func.mat || return 1
+    flirt -ref highres.nii.gz -in example_func.nii.gz -applyxfm -init example_func2highres.mat \
+        -out example_func2highres.nii.gz -interp trilinear || return 1
+    flirt -ref "$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz" -in highres.nii.gz \
+        -omat highres2standard.mat -cost corratio -dof 12 || return 1
+    fnirt --in="$anat_dir/Stru_Head.nii.gz" --aff=highres2standard.mat \
+        --config="$FSLDIR/etc/flirtsch/T1_2_MNI152_2mm.cnf" \
+        --ref="$FSLDIR/data/standard/MNI152_T1_2mm.nii.gz" \
+        --cout=highres2standard_warp.nii.gz --iout=highres_head2standard.nii.gz || return 1
+    fnirtfileutils --in=highres2standard_warp.nii.gz --ref="$FSLDIR/data/standard/MNI152_T1_2mm.nii.gz" \
+        --jac=highres_jacobian.nii.gz --withaff || return 1
+    python3 "$SCRIPT_DIR/check_warp.py" highres_jacobian.nii.gz \
+        "$FSLDIR/data/standard/MNI152_T1_2mm_brain_mask.nii.gz" warp_quality.json || return 1
+    applywarp --in=highres.nii.gz --ref=standard.nii.gz --warp=highres2standard_warp.nii.gz \
+        --out=highres2standard.nii.gz --interp=trilinear || return 1
+    convertwarp --ref=standard.nii.gz --premat=example_func2highres.mat \
+        --warp1=highres2standard_warp.nii.gz --out=example_func2standard_warp.nii.gz || return 1
+    applywarp --in=example_func.nii.gz --ref=standard.nii.gz --warp=example_func2standard_warp.nii.gz \
+        --out=example_func2standard.nii.gz --interp=trilinear || return 1
+    applywarp --in="$func_dir/rest_mask.nii.gz" --ref=standard.nii.gz \
+        --warp=example_func2standard_warp.nii.gz --out=mask2standard.nii.gz --interp=nn || return 1
+
     log "SUCCESS" "Registration completed for subject $subject_id${session:+ session $session}"
     return 0
 }
@@ -291,9 +268,6 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # Process the single subject's registration
-if ! process_registration "$subject_id" "$session"; then
-    log "ERROR" "Registration failed for subject $subject_id${session:+ session $session}"
-    exit 1
-fi
+process_registration "$subject_id" "$session"
 
 log "SUCCESS" "Registration completed for subject $subject_id${session:+ session $session}"

@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # =============================================================================
 # Script: FC_step5
@@ -81,14 +82,14 @@ check_prerequisites() {
     local missing_prereqs=()
     
     # Check for AFNI tools
-    for cmd in 3dmaskave 3dTstat 3dcalc 3dBrickStat; do
+    for cmd in 3dmaskave 3dTproject 3dTstat 3dcalc python3; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing_prereqs+=("AFNI ($cmd)")
         fi
     done
     
     # Check for FSL tools
-    for cmd in feat_model film_gls flirt; do
+    for cmd in applywarp fslmaths fslnvols; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing_prereqs+=("FSL ($cmd)")
         fi
@@ -197,100 +198,34 @@ process_subject() {
         fi
     done
     
-    # Process nuisance regression
-    log "INFO" "Processing nuisance regression..."
-    
-    # Split motion parameters
-    for i in {1..6}; do
-        awk -v col=$i '{print $col}' "${func_dir}/rest_mc.1D" > "${nuisance_dir}/mc${i}.1D"
+    # One simultaneous projection: trend, passband and nuisance regressors.
+    local band_low band_high
+    read -r band_low band_high < "${func_dir}/passband_hz.tsv"
+    local actual_n
+    actual_n=$(fslnvols "${func_dir}/rest_pp.nii.gz")
+    [[ "$actual_n" -eq "$N_VOLS" && "$(wc -l < "${func_dir}/rest_mc.1D")" -eq "$actual_n" ]] || return 1
+    local tissue
+    for tissue in global csf wm; do
+        3dmaskave -mask "${segment_dir}/${tissue}_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" \
+            > "${nuisance_dir}/${tissue}.1D" || return 1
     done
-    
-    # Extract signals
-    3dmaskave -mask "${segment_dir}/global_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/global.1D"
-    3dmaskave -mask "${segment_dir}/csf_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/csf.1D"
-    3dmaskave -mask "${segment_dir}/wm_mask.nii.gz" -quiet "${func_dir}/rest_pp.nii.gz" > "${nuisance_dir}/wm.1D"
-    
-    # Copy preprocessed data and create FSF file
-    cp "${func_dir}/rest_pp.nii.gz" "${nuisance_dir}/"
-    
-    local regstandard_path="$FSLDIR/data/standard/MNI152_T1_2mm_brain.nii.gz"
-    
-    if [ "$FSF_TYPE" = "NoGRS" ]; then
-        sed -e "s:nuisance_dir:${nuisance_dir}:g" \
-            -e "s:nuisance_model_outputdir:${nuisance_dir}/residuals.feat:g" \
-            -e "s:nuisance_model_TR:${TR}:g" \
-            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
-            -e "s:nuisance_model_input_data:${nuisance_dir}/rest_pp.nii.gz:g" \
-            -e "s:nuisance_model_TE:${TE}:g" \
-            -e "s:standard_mni_2mm:${regstandard_path}:g" \
-            "${TEMPLATE_DIR}/nuisance_N.fsf" > "${nuisance_dir}/nuisance.fsf"
-    else
-        sed -e "s:nuisance_output:${nuisance_dir}/residuals.feat:g" \
-            -e "s:standard_mni_2mm:${regstandard_path}:g" \
-            -e "s:feat_files_1:${nuisance_dir}/rest_pp:g" \
-            -e "s:fmri_1:${nuisance_dir}/csf.1D:g" \
-            -e "s:fmri_2:${nuisance_dir}/wm.1D:g" \
-            -e "s:fmri_3:${nuisance_dir}/mc1.1D:g" \
-            -e "s:fmri_4:${nuisance_dir}/mc2.1D:g" \
-            -e "s:fmri_5:${nuisance_dir}/mc3.1D:g" \
-            -e "s:fmri_6:${nuisance_dir}/mc4.1D:g" \
-            -e "s:fmri_7:${nuisance_dir}/mc5.1D:g" \
-            -e "s:nuisance_model_TR:${TR}:g" \
-            -e "s:nuisance_model_numTRs:${N_VOLS}:g" \
-            -e "s:nuisance_model_TE:${TE}:g" \
-            -e "s:fmri_8:${nuisance_dir}/mc6.1D:g" \
-            "${TEMPLATE_DIR}/nuisance_R.fsf" > "${nuisance_dir}/nuisance.fsf"
-    fi
-    
+    local -a regressors=("${func_dir}/rest_mc.1D" "${nuisance_dir}/csf.1D" "${nuisance_dir}/wm.1D")
+    [[ "$FSF_TYPE" == NoGRS ]] && regressors+=("${nuisance_dir}/global.1D")
+    python3 "$SCRIPT_DIR/prepare_regressors.py" "${nuisance_dir}/regressors.1D" "${regressors[@]}" || return 1
+    # The model contains a constant: pre-centering preserves its ideal residual
+    # while avoiding cancellation of a large baseline in float32 projection.
+    3dTstat -overwrite -mean -prefix "${nuisance_dir}/temporal_mean.nii.gz" "${func_dir}/rest_pp.nii.gz" || return 1
+    3dcalc -overwrite -a "${func_dir}/rest_pp.nii.gz" -b "${nuisance_dir}/temporal_mean.nii.gz" \
+        -expr 'a-b' -datum float -prefix "${nuisance_dir}/centered.nii.gz" || return 1
+    3dTproject -overwrite -input "${nuisance_dir}/centered.nii.gz" \
+        -mask "${func_dir}/rest_pp_mask.nii.gz" -polort 2 -passband "$band_low" "$band_high" \
+        -ort "${nuisance_dir}/regressors.1D" -prefix "${func_dir}/rest_res.nii.gz" || return 1
+    applywarp --ref="${reg_dir}/standard.nii.gz" --in="${func_dir}/rest_res.nii.gz" \
+        --out="${func_dir}/rest_res2standard.nii.gz" --warp="${reg_dir}/example_func2standard_warp.nii.gz" \
+        --interp=trilinear || return 1
+    fslmaths "${func_dir}/rest_res2standard.nii.gz" -mas "${reg_dir}/mask2standard.nii.gz" \
+        "${func_dir}/rest_res2standard.nii.gz" || return 1
 
-    log "INFO" "Running FEAT model and GLM..."
-    feat_model "${nuisance_dir}/nuisance"
-    
-    local minVal
-    minVal=$(3dBrickStat -min -mask "${func_dir}/rest_pp_mask.nii.gz" "${func_dir}/rest_pp.nii.gz" | tr -d '[:space:]')
-    
-    if ! film_gls --rn="${nuisance_dir}/stats" \
-              --noest --sa --ms=5 \
-              --in="${nuisance_dir}/rest_pp.nii.gz" \
-              --pd="${nuisance_dir}/nuisance.mat" \
-              --thr="${minVal}"; then
-        log "ERROR" "FILM GLM failed"
-        return 1
-    fi
-
-    sleep 5
-    
-    # Process and resample residuals
-    local res4d_file="${nuisance_dir}/stats/res4d.nii.gz"
-    
-    if [ ! -f "$res4d_file" ]; then
-        log "ERROR" "FILM GLM did not produce res4d.nii.gz"
-        return 1
-    fi
-    
-    log "INFO" "Processing residuals..."
-    3dTstat -mean -prefix "${nuisance_dir}/stats/res4d_mean.nii.gz" "$res4d_file"
-    
-    3dcalc -a "$res4d_file" \
-           -b "${nuisance_dir}/stats/res4d_mean.nii.gz" \
-           -expr '(a-b)+100' \
-           -prefix "${func_dir}/rest_res.nii.gz"
-    
-    if [ ! -f "${func_dir}/rest_res.nii.gz" ]; then
-        log "ERROR" "Failed to create rest_res.nii.gz"
-        return 1
-    fi
-    
-    log "INFO" "Resampling to standard space..."
-    if ! flirt -ref "${reg_dir}/standard.nii.gz" \
-              -in "${func_dir}/rest_res.nii.gz" \
-              -out "${func_dir}/rest_res2standard.nii.gz" \
-              -applyxfm -init "${reg_dir}/example_func2standard.mat" \
-              -interp trilinear; then
-        log "ERROR" "Standard space resampling failed"
-        return 1
-    fi
-    
     # Copy final results to results directory
     if ! cp "${func_dir}/rest_res2standard.nii.gz" "$target_file"; then
         log "ERROR" "Failed to copy final results"
@@ -372,9 +307,6 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # Process the single subject
-if ! process_subject "$subject_id" "$session"; then
-    log "ERROR" "Processing failed for subject $subject_id${session:+ session $session}"
-    exit 1
-fi
+process_subject "$subject_id" "$session"
 
 log "SUCCESS" "Processing completed for subject $subject_id${session:+ session $session}"

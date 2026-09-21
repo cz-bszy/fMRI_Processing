@@ -18,10 +18,14 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ---------------------------- Configuration ----------------------------------
 
 # Directory settings
-DATASET_LABEL="${DATASET_LABEL:-after}"                         # Default dataset selector
-DEFAULT_INPUT_DIR="${PROJECT_ROOT}/Outputs_${DATASET_LABEL}"
-if [ ! -d "$DEFAULT_INPUT_DIR" ] && [ -d "${PROJECT_ROOT}/Outputs" ]; then
-    DEFAULT_INPUT_DIR="${PROJECT_ROOT}/Outputs"
+DEFAULT_INPUT_DIR="${PROJECT_ROOT}/Data"
+if [ ! -d "$DEFAULT_INPUT_DIR" ]; then
+    for candidate in "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/Outputs" "${PROJECT_ROOT}/outputs"; do
+        if [ -d "$candidate" ]; then
+            DEFAULT_INPUT_DIR="$candidate"
+            break
+        fi
+    done
 fi
 INPUT_DIR="${INPUT_DIR:-${DEFAULT_INPUT_DIR}}"                  # BIDS dataset root
 OUTPUT_DIR="${OUTPUT_DIR:-${INPUT_DIR}/processing}"             # Pipeline outputs
@@ -46,17 +50,19 @@ mkdir -p "$RECONALL_DIR"
 NUM_THREADS=${NUM_THREADS:-4}               # Number of CPU threads to use per subject
 FWHM=${FWHM:-6.0}                           # Full Width at Half Maximum for smoothing
 SIGMA=${SIGMA:-2.548}                       # Sigma for smoothing (FWHM = 2.355 * SIGMA)
-HIGHP=${HIGHP:-0.1}                         # High-pass filter in Hz
-LOWP=${LOWP:-0.01}                          # Low-pass filter in Hz
-TR=${TR:-2.0}                               # Repetition Time (seconds)
+HIGHP=${HIGHP:-0.1}                         # Upper bandpass edge in Hz
+LOWP=${LOWP:-0.01}                          # Lower bandpass edge in Hz
+TR=${TR:-3.0}                               # Repetition Time (seconds)
 TE=${TE:-30}                                # Echo Time (milliseconds)
-N_VOLS=${N_VOLS:-96}                        # Number of volumes in functional run
+N_VOLS=${N_VOLS:-140}                        # Number of volumes in functional run
+AUTO_DETECT_FMRI_PARAMS=${AUTO_DETECT_FMRI_PARAMS:-true}  # Prefer JSON metadata when available
 
 # Pipeline and step configuration
 PIPELINES_TO_RUN=("fmri")                  # Pipelines to execute; extend with smri/pet
 FSF_TYPES=("NoGRS" "Retain_GRS")          # FSF flavours for fMRI step 5
 GENERAL_FLAGS=()                            # Additional flags forwarded to step scripts
-FUNC_FILE_PATTERN="${FUNC_FILE_PATTERN:-*task-rest*_bold.nii*}"  # Glob(s) searched for functional runs (comma-separated)
+# FUNC_FILE_PATTERN="${FUNC_FILE_PATTERN:-*task-rest*_bold.nii*}"  # Glob(s) searched for functional runs (comma-separated)
+FUNC_FILE_PATTERN="${FUNC_FILE_PATTERN:-*_bold.nii*}"  # Glob(s) searched for functional runs (comma-separated)
 TIMESERIES_ATLAS="${TIMESERIES_ATLAS:-ThomasYeo100}"
 TIMESERIES_ATLAS_PATH="${TIMESERIES_ATLAS_PATH:-}"
 
@@ -155,6 +161,211 @@ format_subject_session() {
     fi
 }
 
+normalize_session() {
+    local session="${1:-}"
+    if [ -z "$session" ] || [ "$session" = "\"\"" ] || [ "$session" = "''" ] || [ "$session" = "-" ]; then
+        printf '%s' ""
+    else
+        printf '%s' "$session"
+    fi
+}
+
+source "${SCRIPT_DIR}/pipeline_helpers.sh"
+
+resolve_json_sidecar() {
+    local func_file="$1"
+    local json_file=""
+
+    case "$func_file" in
+        *.nii.gz)
+            json_file="${func_file%.nii.gz}.json"
+            ;;
+        *.nii)
+            json_file="${func_file%.nii}.json"
+            ;;
+        *)
+            json_file="${func_file}.json"
+            ;;
+    esac
+
+    if [ -f "$json_file" ]; then
+        printf '%s' "$json_file"
+        return 0
+    fi
+
+    local base dir stem candidate
+    base=$(basename "$func_file")
+    dir=$(dirname "$func_file")
+    stem="${base%%.nii*}"
+    candidate="${dir}/${stem}.json"
+    if [ -f "$candidate" ]; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+
+    return 1
+}
+
+read_json_value() {
+    local json_file="$1"
+    local key="$2"
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$json_file" "$key" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    value = data.get(key, "")
+    if value is None:
+        value = ""
+    if isinstance(value, (list, dict)):
+        value = ""
+    print(value)
+except Exception:
+    print("")
+PY
+        return 0
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        python - "$json_file" "$key" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+try:
+    with open(path, "r") as fh:
+        data = json.load(fh)
+    value = data.get(key, "")
+    if value is None:
+        value = ""
+    if isinstance(value, (list, dict)):
+        value = ""
+    print(value)
+except Exception:
+    print("")
+PY
+        return 0
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -r --arg key "$key" '.[$key] // empty' "$json_file"
+        return 0
+    fi
+
+    log "ERROR" "No JSON parser available (python3, python, or jq)."
+    printf '%s' ""
+    return 0
+}
+
+get_nvols() {
+    local func_file="$1"
+    if command -v 3dinfo >/dev/null 2>&1; then
+        3dinfo -nt "$func_file"
+        return 0
+    fi
+    if command -v fslval >/dev/null 2>&1; then
+        fslval "$func_file" dim4
+        return 0
+    fi
+    if command -v fslnvols >/dev/null 2>&1; then
+        fslnvols "$func_file"
+        return 0
+    fi
+    return 1
+}
+
+is_numeric() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+
+resolve_fmri_params() {
+    local subject="$1"
+    local session
+    session=$(normalize_session "${2:-}")
+
+    local func_dir
+    if [ -n "$session" ]; then
+        func_dir="${INPUT_DIR}/${subject}/${session}/func"
+    else
+        func_dir="${INPUT_DIR}/${subject}/func"
+    fi
+
+    if [ ! -d "$func_dir" ]; then
+        log "ERROR" "Functional directory not found for metadata lookup: $func_dir"
+        return 1
+    fi
+
+    local func_file
+    func_file=$(find_functional_input "$func_dir" "$FUNC_FILE_PATTERN") || true
+    if [ -z "$func_file" ]; then
+        log "ERROR" "No functional file matching '$FUNC_FILE_PATTERN' found under $func_dir"
+        return 1
+    fi
+
+    local json_file
+    if ! json_file=$(resolve_json_sidecar "$func_file"); then
+        log "ERROR" "JSON sidecar not found for functional file: $func_file"
+        return 1
+    fi
+
+    local tr_sec te_sec n_vols
+    tr_sec=$(read_json_value "$json_file" "RepetitionTime")
+    te_sec=$(read_json_value "$json_file" "EchoTime")
+
+    if ! is_numeric "$tr_sec" || ! is_numeric "$te_sec"; then
+        log "ERROR" "Invalid TR/TE in JSON $json_file (RepetitionTime=$tr_sec, EchoTime=$te_sec)"
+        return 1
+    fi
+
+    if ! n_vols=$(get_nvols "$func_file"); then
+        log "ERROR" "Unable to determine volume count for $func_file"
+        return 1
+    fi
+
+    if ! [[ "$n_vols" =~ ^[0-9]+$ ]]; then
+        log "ERROR" "Invalid volume count '$n_vols' for $func_file"
+        return 1
+    fi
+
+    local te_ms
+    te_ms=$(awk "BEGIN { printf \"%.3f\", $te_sec * 1000 }")
+
+    printf '%s\t%s\t%s\t%s' "$func_file" "$tr_sec" "$te_ms" "$n_vols"
+}
+
+report_task_variants() {
+    local -a task_names=()
+    local file
+    while IFS= read -r file; do
+        local base
+        base=$(basename "$file")
+        if [[ "$base" =~ task-([^_]+) ]]; then
+            task_names+=("${BASH_REMATCH[1]}")
+        fi
+    done < <(find "$INPUT_DIR" -type f -name "*_task-*_bold.nii*" | head -n 2000)
+
+    if [ ${#task_names[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    local unique_tasks
+    unique_tasks=$(printf '%s\n' "${task_names[@]}" | sort -u)
+    local task_count
+    task_count=$(printf '%s\n' "$unique_tasks" | wc -l | tr -d ' ')
+    if [ "$task_count" -gt 1 ]; then
+        log "WARNING" "Multiple task runs detected: $(printf '%s' "$unique_tasks" | paste -sd ',' -)"
+        log "INFO" "Set FUNC_FILE_PATTERN (e.g. '*task-rest*_bold.nii*' or '*task-<name>*_bold.nii*') to choose a task/run."
+    fi
+}
+
 hydrate_runtime_arrays() {
     local IFS
     if [ -n "${PIPELINES_TO_RUN_STRING:-}" ]; then
@@ -178,24 +389,34 @@ hydrate_runtime_arrays() {
 
 subject_output_dir() {
     local subject="$1"
-    printf '%s/%s' "$OUTPUT_DIR" "$subject"
+    local session
+    session=$(normalize_session "${2:-}")
+
+    if [ -n "$session" ]; then
+        printf '%s/%s/%s' "$OUTPUT_DIR" "$subject" "$session"
+    else
+        printf '%s/%s' "$OUTPUT_DIR" "$subject"
+    fi
 }
 
 subject_anat_dir() {
     local subject="$1"
-    printf '%s/anat' "$(subject_output_dir "$subject")"
+    local session="${2:-}"
+    printf '%s/anat' "$(subject_output_dir "$subject" "$session")"
 }
 
 subject_func_dir() {
     local subject="$1"
-    printf '%s/func' "$(subject_output_dir "$subject")"
+    local session="${2:-}"
+    printf '%s/func' "$(subject_output_dir "$subject" "$session")"
 }
 
 prepare_fmri_subject() {
     local subject="$1"
-    local base_dir="$(subject_output_dir "$subject")"
+    local session="${2:-}"
+    local base_dir
+    base_dir="$(subject_output_dir "$subject" "$session")"
     mkdir -p "$base_dir/anat" "$base_dir/func"
-    chmod -R 775 "$base_dir"
 }
 
 # ---------------------------- Environment Checks ---------------------------
@@ -206,6 +427,7 @@ setup_environment() {
         "fslmaths"
         "parallel"
         "3dcalc"
+        "3dinfo"
         "flirt"
     )
 
@@ -269,10 +491,8 @@ setup_directories() {
         fi
 
         if [ ! -w "$dir" ]; then
-            if ! chmod -R 777 "$dir" 2>/dev/null; then
-                log "ERROR" "Directory not writable and permissions could not be adjusted: $dir"
-                return 1
-            fi
+            log "ERROR" "Output directory is not writable: $dir"
+            return 1
         fi
     done
     return 0
@@ -303,6 +523,11 @@ validate_parameters() {
     for param in "${num_params[@]}"; do
         name="${param%%:*}"
         value="${param#*:}"
+        if [ "$AUTO_DETECT_FMRI_PARAMS" = true ] && \
+           { [ "$name" = "TR" ] || [ "$name" = "TE" ] || [ "$name" = "N_VOLS" ]; } && \
+           { [ -z "$value" ] || [ "$value" = "auto" ]; }; then
+            continue
+        fi
         if ! [[ "$value" =~ ^[0-9]+\.?[0-9]*$ ]]; then
             log "ERROR" "Invalid $name: $value. Must be numeric."
             return 1
@@ -395,31 +620,26 @@ initialize_pipelines() {
 
 fmri_has_recon_output() {
     local subject="$1"
-    local session="${2:-}"
-    if [ "$session" = "\"\"" ]; then
-        session=""
-    fi
+    local session
+    session=$(normalize_session "${2:-}")
 
-    local recon_subject="$subject"
+    local recon_dir
     if [ -n "$session" ]; then
-        recon_subject="${subject}_${session}"
+        recon_dir="${RECONALL_DIR}/${subject}/${session}/recon-all"
+    else
+        recon_dir="${RECONALL_DIR}/${subject}/recon-all"
     fi
 
-    local brain_path
-    printf -v brain_path '%s/%s/mri/brain.mgz' "$RECONALL_DIR" "$recon_subject"
+    local brain_path="${recon_dir}/mri/brain.mgz"
     [ -f "$brain_path" ]
 }
 
 fmri_has_anatomical_output() {
     local subject="$1"
-    local session="${2:-}"
-
-    local base_dir
-    base_dir="$(subject_output_dir "$subject")"
-    if [ -n "$session" ] && [ "$session" != "\"\"" ]; then
-        base_dir="$base_dir/ses-${session}"
-    fi
-    local anat_dir="${base_dir}/anat"
+    local session
+    session=$(normalize_session "${2:-}")
+    local anat_dir
+    anat_dir="$(subject_anat_dir "$subject" "$session")"
 
     local required=(
         "$anat_dir/Stru_Brain.nii.gz"
@@ -438,28 +658,25 @@ fmri_has_anatomical_output() {
 fmri_has_functional_output() {
     local subject="$1"
     local session="${2:-}"
-    [ -f "$(subject_func_dir "$subject")/example_func.nii.gz" ]
+    [ -f "$(subject_func_dir "$subject" "$session")/example_func.nii.gz" ]
 }
 
 fmri_has_registration_output() {
     local subject="$1"
     local session="${2:-}"
-    [ -f "$(subject_func_dir "$subject")/reg_dir/example_func2standard.nii.gz" ]
+    [ -f "$(subject_func_dir "$subject" "$session")/reg_dir/example_func2standard.nii.gz" ]
 }
 
 fmri_has_segmentation_output() {
     local subject="$1"
     local session="${2:-}"
-    [ -f "$(subject_func_dir "$subject")/seg/wm_mask.nii.gz" ]
+    [ -f "$(subject_func_dir "$subject" "$session")/seg/wm_mask.nii.gz" ]
 }
 
 fmri_has_timeseries_output() {
     local subject="$1"
-    local session="${2:-}"
-
-    if [ "$session" = "\"\"" ]; then
-        session=""
-    fi
+    local session
+    session=$(normalize_session "${2:-}")
 
     local -a fsf_types=("${FSF_TYPES[@]}")
     if [ ${#fsf_types[@]} -eq 0 ]; then
@@ -686,14 +903,17 @@ build_fmri_fsf_command() {
     local subject="$1"
     local session="${2:-}"
     local fsf_type="$3"
+    local resolved_tr="$4"
+    local resolved_te="$5"
+    local resolved_n_vols="$6"
     local -a cmd=(
         "$FC_STEP5"
         -i "$INPUT_DIR"
         -o "$OUTPUT_DIR"
         -t "$TEMPLATE_DIR"
-        -r "$TR"
-        -e "$TE"
-        -s "$N_VOLS"
+        -r "$resolved_tr"
+        -e "$resolved_te"
+        -s "$resolved_n_vols"
         -f "$fsf_type"
         -l "$LOG_DIR"
     )
@@ -724,7 +944,8 @@ execute_fmri_fsf_step() {
     local subject="$4"
     local session="${5:-}"
 
-    local func_dir="$(subject_func_dir "$subject")"
+    local func_dir
+    func_dir="$(subject_func_dir "$subject" "$session")"
     local mask
     for mask in global csf wm; do
         local mask_file="$func_dir/seg/${mask}_mask.nii.gz"
@@ -740,9 +961,28 @@ execute_fmri_fsf_step() {
     log "INFO" "[$pipeline] Starting ${label} for $(format_subject_session "$subject" "$session")"
     log "INFO" "[$pipeline] FSF types: ${FSF_TYPES[*]}"
 
+    local resolved_tr="$TR"
+    local resolved_te="$TE"
+    local resolved_n_vols="$N_VOLS"
+    if [ "$AUTO_DETECT_FMRI_PARAMS" = true ]; then
+        local meta
+        if meta=$(resolve_fmri_params "$subject" "$session"); then
+            local func_file
+            IFS=$'\t' read -r func_file resolved_tr resolved_te resolved_n_vols <<< "$meta"
+            log "INFO" "[$pipeline] Auto-detected TR=${resolved_tr}s TE=${resolved_te}ms N_VOLS=${resolved_n_vols} from $(basename "$func_file")"
+        else
+            log "ERROR" "[$pipeline] Auto-detect failed; refusing a run with unresolved TR/TE/N_VOLS."; return 1
+        fi
+    fi
+
+    # Volume exclusion occurs in FC_step2; the design must use its actual count.
+    local processed_bold
+    processed_bold="$(subject_func_dir "$subject" "$session")/rest_pp.nii.gz"
+    resolved_n_vols=$(get_nvols "$processed_bold") || return 1
     local fsf_type
     for fsf_type in "${FSF_TYPES[@]}"; do
-        local command=$(build_fmri_fsf_command "$subject" "$session" "$fsf_type")
+        local command
+        command=$(build_fmri_fsf_command "$subject" "$session" "$fsf_type" "$resolved_tr" "$resolved_te" "$resolved_n_vols")
         local fsf_step_id="${step_id}_${fsf_type}"
         local fsf_label="${label} (${fsf_type})"
         if ! run_step "$pipeline" "$fsf_step_id" "$fsf_label" "$command" "$subject" "$session"; then
@@ -777,16 +1017,13 @@ run_step() {
     local status=0
     local error_code=0
 
-    if ! eval "$command" 2>&1 | tee "$temp_log"; then
-        status=1
-        error_code=$?
-    fi
+    set +e
+    eval "$command" 2>&1 | tee "$temp_log"
+    error_code=${PIPESTATUS[0]}
+    set -e
 
-    if grep -qi "error\|exception\|failed" "$temp_log"; then
+    if [ "$error_code" -ne 0 ]; then
         status=1
-        if [ $error_code -eq 0 ]; then
-            error_code=1
-        fi
     fi
 
     if [ $status -eq 0 ]; then
@@ -808,7 +1045,7 @@ prepare_pipeline_subject() {
     local session="${3:-}"
     case "$pipeline" in
         fmri)
-            prepare_fmri_subject "$subject"
+            prepare_fmri_subject "$subject" "$session"
             ;;
         # Additional pipelines (smri, pet, etc.) can be initialised here.
         *)
@@ -983,9 +1220,13 @@ generate_report() {
         echo "  - Threads per subject: $NUM_THREADS"
         echo "  - FWHM: $FWHM"
         echo "  - Sigma: $SIGMA"
-        echo "  - TR: $TR"
-        echo "  - TE: $TE"
-        echo "  - Number of volumes: $N_VOLS"
+        if [ "$AUTO_DETECT_FMRI_PARAMS" = true ]; then
+            echo "  - TR/TE/Volumes: auto (BIDS JSON + NIfTI metadata)"
+        else
+            echo "  - TR: $TR"
+            echo "  - TE: $TE"
+            echo "  - Number of volumes: $N_VOLS"
+        fi
         echo "  - Timeseries atlas: $TIMESERIES_ATLAS"
     } > "$report_file"
 
@@ -995,6 +1236,16 @@ generate_report() {
 # ---------------------------- Main -----------------------------------------
 
 main() {
+    # Corrected and legacy outputs cannot share a processing root.
+    local revision=adni_20260917
+    if compgen -G "$OUTPUT_DIR/sub-*" > /dev/null; then
+        if [[ ! -f "$OUTPUT_DIR/.pipeline_revision" ]] || [[ "$(cat "$OUTPUT_DIR/.pipeline_revision")" != "$revision" ]]; then
+            echo "Use a new OUTPUT_DIR for corrected processing; keep RECONALL_DIR pointing to saved FreeSurfer results." >&2
+            return 1
+        fi
+    fi
+    mkdir -p "$OUTPUT_DIR"
+    printf '%s\n' "$revision" > "$OUTPUT_DIR/.pipeline_revision"
     if [ -z "$LOG_DIR" ]; then
         LOG_DIR="$OUTPUT_DIR/logs"
     fi
@@ -1022,6 +1273,8 @@ main() {
         log "ERROR" "Validation failed. Check logs for details."
         exit 1
     fi
+
+    report_task_variants
 
     log "INFO" "Setting up directory structure..."
     if ! setup_directories "$OUTPUT_DIR"; then
@@ -1059,10 +1312,11 @@ main() {
 
     export INPUT_DIR OUTPUT_DIR STANDARD_DIR TEMPLATE_DIR TISSUES_DIR RECONALL_DIR FUNC_FILE_PATTERN
     export FC_STEP0 FC_STEP1 FC_STEP2 FC_STEP3 FC_STEP4 FC_STEP5 FC_STEP6
-    export NUM_THREADS FWHM SIGMA HIGHP LOWP TR TE N_VOLS
+    export NUM_THREADS FWHM SIGMA HIGHP LOWP TR TE N_VOLS AUTO_DETECT_FMRI_PARAMS
     export SKIP_EXISTING DRY_RUN VERBOSE LOG_DIR ERROR_LOG_DIR ERROR_SUBJECTS_FILE CURRENT_DATE
 
-    export -f log record_error hydrate_runtime_arrays format_subject_session
+    export -f log record_error hydrate_runtime_arrays format_subject_session normalize_session
+    export -f find_functional_input resolve_json_sidecar read_json_value get_nvols is_numeric resolve_fmri_params
     export -f subject_output_dir subject_anat_dir subject_func_dir prepare_fmri_subject prepare_pipeline_subject
     export -f fmri_has_recon_output fmri_has_anatomical_output fmri_has_functional_output fmri_has_registration_output fmri_has_segmentation_output fmri_has_timeseries_output
     export -f build_fmri_recon_command build_fmri_anatomical_command build_fmri_functional_command build_fmri_registration_command build_fmri_segmentation_command build_fmri_timeseries_command build_fmri_fsf_command
