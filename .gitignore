@@ -1,4 +1,4 @@
-﻿# OS
+# OS
 .DS_Store
 Thumbs.db
 
@@ -29,3 +29,18 @@ input/
 output/
 recon/
 baseline/
+
+# v2 pipeline outputs (OUT_DIR and its sub-directories, when created inside the repo)
+out/
+work/
+derivatives/
+freesurfer/
+freesurfer_export/
+resources/
+rawdata/
+logs/
+status_*.tsv
+tool_versions.json
+
+# Workstation-only recovery copies and their local inventory.
+archive/

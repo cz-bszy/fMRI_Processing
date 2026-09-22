@@ -1,0 +1,5 @@
+# Reduced local test set for abide_smoke.conf / abide_local_fs.conf (one id per line,
+# 'sub-' prefix optional, '#' starts a comment). Read by 00_ingest.sh (SUBJECT_LIST)
+# and by run_pipeline.sh (subject selection).
+sub-0028744   # ABIDEII-GU_1: 43 slices, IA, STC verified (tier A), 152 volumes, z-FOV 129 mm
+sub-0029150   # ABIDEII-NYU_2: 34 slices, slice order unresolved -> STC skipped, 180 volumes, short z-FOV 102 mm

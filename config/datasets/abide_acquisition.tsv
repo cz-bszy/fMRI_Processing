@@ -1,0 +1,16 @@
+group	tr	n_slices	slice_order	stc	drop_volumes	pe_dir	evidence	note
+ABIDEII-EMC_1	2	37	ID	skip	4	-	B:published_site_protocol	Default STC skipped: exact interleave order includes an unconfirmed manufacturer convention. DiMartino 2017 Table 3 only; start slice of interleaved-descending is the GE convention, not documented
+ABIDEII-GU_1	2	43	IA	apply	2	-	A:protocol_and_standard_sequence	Siemens product ep2d_bold, odd slice count; 2+2 volumes already discarded before sharing (152 of 154)
+ABIDEII-NYU_1	2	33	IA	apply	4	-	B:protocol_conflict_resolved_by_slice_count	website scan table appears swapped with NYU_2; resolved with the actual 33 slices
+ABIDEII-NYU_2	2	34	unknown	skip	4	-	C:NEEDS_SEQUENCE_PARITY_CONFIRMATION	custom cbi_seg_epi_gre sequence, even slice count: interleave parity unknown (IA2 is an unapproved candidate). Wrong parity is worse than no STC
+ABIDEII-TCD_1	2	37	SA	apply	4	-	B:published_site_protocol	-
+ABIDEII-UCD_1	2	36	IA2	skip	4	-	B:protocol_plus_standard_Siemens_rule	Default STC skipped: exact interleave order includes an unconfirmed manufacturer convention. even-first inferred from the Siemens even-slice rule, not documented
+ABIDEII-USM_1	2	40	IA2	skip	4	-	B:protocol_plus_standard_Siemens_rule	Default STC skipped: exact interleave order includes an unconfirmed manufacturer convention. subject 29504 also has 41 slices, inconsistent with the 40-slice site protocol
+NYU	2	33	IA	apply	4	-	A:direct_DPABI_subject_table	odd slice count, no parity ambiguity; EPI is ~23 deg oblique; TE 15 ms
+SDSU	2	42	IA	apply	4	-	A:direct_DPABI_subject_table	GE interleave is odd-first regardless of slice count; protocol agrees (Bottom/Up, interleaved)
+TRINITY	2	38	SA	apply	4	-	A:direct_DPABI_subject_table	Philips 'slice scan order = ascend'; scanner dummy scans = 0; only 150 volumes
+UM_1	2	40	SA	apply	4	-	B:direct_DPABI_subject_table	single source; reverse-spiral acquisition (no phase-encode axis)
+UM_2	2	40	SA	apply	4	-	B:direct_DPABI_subject_table	same protocol document as UM_1
+USM	2	40	IA2	apply	4	-	B:direct_DPABI_subject_table	-
+YALE	2	34	IA2	apply	4	-	B:direct_DPABI_subject_table	-
+*	-	-	unknown	skip	4	-	C:no_information	default row: no verified timing, STC skipped
