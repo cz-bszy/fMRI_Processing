@@ -320,7 +320,10 @@ def qcfc(deriv_dir: Path, table: pd.DataFrame, template: str, strategy: str, atl
     summary: dict[str, Any] = {"strategy": strategy, "atlas": atlas, "n_runs": 0, "n_edges": None, "pct_sig_p05": None,
                                "median_abs_r": None, "dist_dep_spearman": None, "dist_dep_p": None}
     matrices, fds, subjects, names = [], [], [], None
-    for subject, run, fd in zip(table["subject"], table["run"], pd.to_numeric(table.get("fd_mean"), errors="coerce")):
+    # no fd_mean column when no run reached QC: nothing to correlate
+    fd_mean = (pd.to_numeric(table["fd_mean"], errors="coerce") if "fd_mean" in table.columns
+               else pd.Series(np.nan, index=table.index, dtype=float))
+    for subject, run, fd in zip(table["subject"], table["run"], fd_mean):
         loaded = load_fc(Path(deriv_dir) / subject / "func" / f"{run}_space-{template}_atlas-{atlas}_desc-{strategy}_connectivity.tsv")
         if loaded is None or not np.isfinite(fd):
             continue

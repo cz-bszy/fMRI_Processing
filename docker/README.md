@@ -7,6 +7,56 @@ over a digest-pinned base**, not a reproducible reconstruction of that base.
 It checks the required command/Python environment without installing packages.
 Image builds and real Singularity execution have not yet been verified.
 
+## What the existing 79 GB image contains (measured 2026-09-24)
+
+`docker images` reports 79.3 GB because the containerd image store counts the
+compressed blobs and the unpacked layers; the layers themselves add up to about
+49 GB and the final filesystem to about 40 GB. `docker history` and `du` inside
+the image show where the space goes and what this pipeline never uses:
+
+| Item | Size | Used by the pipeline? |
+|---|---|---|
+| `COPY freesurfer-...tar.gz` layer (extracted in a later layer) | 9.5 GB | no - the tarball stays in the image forever |
+| `/opt/mcr` (MATLAB Runtime R2019b) | 5.8 GB | no (FreeSurfer subfield/thalamus tools only) |
+| `/opt/fsl/pkgs` (conda package cache, not hard-linked part) | ~1.8 GB | no |
+| `/opt/micromamba/pkgs` | 0.4 GB | no |
+| `/opt/freesurfer/trctrain` (TRACULA training data) | 1.4 GB | no |
+| `/opt/freesurfer/subjects/{bert,cvs_avg35*,V1_average,fsaverage_sym}` | ~1.3 GB | no (keep `fsaverage*`) |
+| `/opt/freesurfer/average/mult-comp-cor`, `average/samseg` | 1.8 GB | no |
+| FreeSurfer python `site-packages/nvidia` (CUDA) | 2.6 GB | no GPU is used; test `mri_synthstrip` (PyTorch) after removing |
+| `/opt/mrtrix3` | 0.2 GB | no |
+
+Recommendations, in order of value:
+
+1. **Non-root users cannot run AFNI.** AFNI is installed in `/root/abin` and
+   `/root` is `drwx------`; Singularity/Apptainer run as the calling user, so
+   every `3d*` program is "not found" on a cluster. `docker/Dockerfile` now runs
+   `chmod 755 /root` and checks the toolchain as user `nobody` (verified: with
+   `/root` opened, all tools and Python imports work for uid 65534). A rebuild
+   should install AFNI under `/opt/afni` instead.
+2. **Never `COPY` an archive and extract it in a later layer**: download and
+   extract in one `RUN` (or use a BuildKit bind mount), otherwise the archive
+   stays in the image (9.5 GB here). An existing image can be flattened with
+   `docker export <container> | docker import - <tag>` (re-add `ENV`/`CMD` with
+   `--change`), which also drops files deleted in later layers.
+3. Remove what the pipeline does not use (table above, ~13-15 GB) and clean the
+   conda caches (`conda clean -afy`, `micromamba clean -afy`) in the same `RUN`.
+4. Bake or mount the TemplateFlow/HCP/Schaefer resources (`stages/fetch_resources.sh`,
+   ~50 MB) so cluster jobs run offline.
+5. Keep `bash -lc` (tools are set up in `/etc/profile.d`), or put the full
+   environment in `ENV` so that `singularity exec` works without a login shell.
+6. Record the image digest with every run (the pipeline writes tool versions to
+   `logs/tool_versions.json` and the code to `logs/code_<run>/`).
+
+Local Docker Desktop (Windows, Hyper-V backend): a 12 GB VM runs the smoke test
+and two concurrent recon-all jobs on this 31 GB host; 20 GB failed to allocate.
+If Docker Desktop reports `remove ...\dockerInference` or `...\engine.sock: The
+file cannot be accessed by the system`, a previous crash left AF_UNIX socket files
+that Windows cannot delete: quit Docker Desktop, rename
+`%LOCALAPPDATA%\Docker\run` (and `%LOCALAPPDATA%\docker-secrets-engine`), start
+it again; the renamed folders can be deleted after a reboot. Never choose
+"Reset to factory defaults" there: it deletes all images.
+
 ## Next environment: clean build candidate
 
 `generate_runtime.sh` produces a Dockerfile on stdout using an **already installed

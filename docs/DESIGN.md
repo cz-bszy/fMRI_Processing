@@ -89,6 +89,7 @@ derivatives/sub-X.html                     per-subject QC report
 derivatives/group/                         group_qc.tsv, group_report.html, qcfc_*.tsv
 logs/sub-X/<stage>.log                     per-subject, per-stage log (no ANSI codes)
 logs/pipeline_<timestamp>.log
+logs/code_<run_id>/                        frozen copy of the code the run executed (FREEZE_CODE)
 ```
 
 `<RUN>` = `sub-X[_ses-Y]_task-<task>[_run-<N>]` (BIDS prefix, from the manifest).
@@ -176,6 +177,8 @@ Func (`derivatives/sub-X/func/`):
 <RUN>_space-<TPL>_res-<R>_desc-<S>sm<F>_bold.nii.gz   optional smoothed copy
 <RUN>_space-fsLR_den-91k_desc-preproc_bold.dtseries.nii       (surface branch; pre-denoise, scaled)
 <RUN>_space-fsLR_den-91k_desc-preproc_tsnr.dscalar.nii        (surface branch)
+<RUN>_space-fsLR_den-91k_desc-sampled_mask.dscalar.nii        (surface branch; 1 = sampled from own voxels,
+                                                               0 = only filled in by the dilation)
 <RUN>_desc-surfqc.json                                        (surface branch)
 <RUN>_space-fsLR_den-91k_desc-<S>_bold.dtseries.nii           (surface branch)
 <RUN>_space-<TPL>_atlas-<A>_desc-<S>_timeseries.tsv + _coverage.tsv + .json
@@ -203,7 +206,9 @@ acquisition table, write manifest/participants/ingest_report.
 
 **02 anat_prep** — freesurfer mode: `nu.mgz`→T1w, `brainmask.mgz`→mask
 (binarise, fill holes), `aseg.mgz`→dseg. synth mode: N4 → `mri_synthstrip` →
-`mri_synthseg --robust` resampled to the T1 grid. Tissue masks with
+`mri_synthseg $SYNTHSEG_FLAGS` (default `--robust`) on the T1 cropped to the
+SynthStrip brain box + 15 mm (`fslstats -w` + `fslroi`, world coordinates kept;
+the full head FOV exhausts 12 GB of RAM), resampled to the T1 grid. Tissue masks with
 `mri_binarize --match … --erode N`: WM = 2 41 (erode `WM_ERODE`), CSF = 4 43
 (erode `CSF_ERODE`), GM = 3 42 8 47 10 11 12 13 17 18 26 28 49 50 51 52 53 54 58 60.
 T1→MNI: `antsRegistrationSyN.sh` (`NORM_QUALITY=precise`) or
@@ -274,7 +279,11 @@ optional `-cifti-smoothing`. Requires `MNI_RES=2`.
 **07 timeseries** — volume: atlas on the BOLD grid (NN resample if needed),
 mean over covered, finite, non-constant voxels; ROI with coverage <
 `MIN_ROI_COVERAGE` ⇒ NaN; TSV with label header; FC on retained frames.
-CIFTI: `wb_command -cifti-parcellate` → TSV.
+CIFTI: `wb_command -cifti-parcellate` → TSV, with the same coverage rule on the
+grayordinates; vertices that stage 06 only filled in by the 10 mm dilation
+(`desc-sampled_mask` = 0) do not count as covered and are left out of the
+re-averaged parcel means, so a parcel outside the EPI field of view is NaN in
+both streams. Parcel names: label table, matched by atlas label key (section 12).
 
 **08 qc / 09 group_qc** — see section 9.
 
@@ -438,7 +447,16 @@ after all subjects). Python: `fmriproc.validate` (per run) and
 
 A *stream* is `volume` (`space-<TPL>` tables) or `surface` (`space-fsLR` tables).
 Schaefer volumetric atlases and their fsLR dlabels contain the same cortical
-parcels in the same order, so the two streams are compared parcel by parcel.
+parcels under the same label keys, so the two streams are compared parcel by
+parcel, matched by ROI name (never by position). The current CBIG fsLR dlabel names
+19 of the Schaefer-100 parcels differently from the TemplateFlow label table
+(anatomical re-labelling such as `Default_PCC_1` -> `Default_pCunPCC_1`; keys and
+boundaries unchanged). Stage 07 therefore gives every CIFTI parcel the label-table
+name of the same label key when both files hold exactly the same keys and every
+renamed key keeps its hemisphere and network (JSON: `roi_names_source`,
+`renamed_from_dlabel`); otherwise the dlabel names stay and the streams are not
+compared. Checked on real data: volume parcel k correlates best with surface parcel
+k for 97 of 99 keys (median r 0.94), all 19 renamed ones included.
 
 Per run x stream x strategy x atlas (`<RUN>_desc-validation.tsv`, long format:
 `stream strategy atlas metric value`; the JSON holds the same numbers nested):

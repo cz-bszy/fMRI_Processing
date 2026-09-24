@@ -164,10 +164,15 @@ marker `06_surface__<RUN>`，依赖 `05_denoise__<RUN>` 和 subject 级 marker�
    输入：preproc 用 `<RUN>_space-T1w_desc-preproc_bold.nii.gz` + `<RUN>_space-<TPL>_res-2_desc-preproc_bold.nii.gz`；
    strategy `S` 用 `work/.../denoise/<S>_space-T1w_bold.nii.gz` + `<RUN>_space-<TPL>_res-2_desc-<S>_bold.nii.gz`。
 
-4. **tSNR**：`wb_command -cifti-reduce <preproc dtseries> TSNR` → `desc-preproc_tsnr.dscalar.nii`
+4. **sampled mask**：原生网格上 `皮层 ROI 且 不是 bad vertex` → `ADAP_BARY_AREA` 重采样到 fsLR-32k → `≥ 0.5`
+   → `desc-sampled_mask.dscalar.nii`（皮层下全部为 1，因为不做膨胀）。ribbon 里没有 goodvoxel 的 vertex
+   只是被 10 mm 最近邻膨胀填上了邻居的值：阶段 07 不把它们算作覆盖，也不放进 parcel 均值，
+   这样 FOV 之外的 parcel 在 surface 流里和 volume 流里一样是 NaN（原则 8：不凭空造数据）。
+
+5. **tSNR**：`wb_command -cifti-reduce <preproc dtseries> TSNR` → `desc-preproc_tsnr.dscalar.nii`
    （mean / sample SD，沿时间；无数据的 vertex 为 0 或 NaN，QC 里不计）。
 
-5. **可选 smoothing**（`SURF_SMOOTH_FWHM > 0`，默认 5 mm）：
+6. **可选 smoothing**（`SURF_SMOOTH_FWHM > 0`，默认 5 mm）：
    ```
    wb_command -cifti-smoothing <S>.dtseries.nii F F COLUMN <S>sm<F>.dtseries.nii -fwhm \
        -left-surface sub-X_hemi-L_space-fsLR_den-32k_midthickness.surf.gii -right-surface ... \
@@ -205,6 +210,7 @@ derivatives/sub-X/anat/
 derivatives/sub-X/func/
   <RUN>_space-fsLR_den-91k_desc-preproc_bold.dtseries.nii         pre-denoise, scaled
   <RUN>_space-fsLR_den-91k_desc-preproc_tsnr.dscalar.nii
+  <RUN>_space-fsLR_den-91k_desc-sampled_mask.dscalar.nii        1 = 由自身体素采样，0 = 仅由膨胀填充
   <RUN>_space-fsLR_den-91k_desc-<S>_bold.dtseries.nii             每个 strategy，未平滑
   <RUN>_space-fsLR_den-91k_desc-<S>sm<F>_bold.dtseries.nii        SURF_SMOOTH_FWHM > 0 时
   <RUN>_desc-surfqc.json

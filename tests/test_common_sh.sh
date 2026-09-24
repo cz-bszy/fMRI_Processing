@@ -185,6 +185,20 @@ test_stage_markers() {
     check_status "upstream redone: downstream must run" 0 in_common "$init"'stage_should_run down sub-01 --dep up -- MYVAR' "$conf"
     check_status "missing upstream marker: must run" 0 in_common "$init"'stage_should_run down sub-01 --dep never_ran -- MYVAR' "$conf"
 
+    # location independence: the same code elsewhere (a frozen copy in
+    # logs/code_<run>) and values containing $REPO_DIR must give the same hash,
+    # otherwise every frozen run would redo every stage
+    local copy="$TMP/relocated" snippet h1 h2
+    mkdir -p "$copy"
+    cp -R "$(dirname "$COMMON")" "$copy/lib"
+    cp -R "$(dirname "$COMMON")/../config" "$copy/config"
+    cp -R "$(dirname "$COMMON")/../py" "$copy/py"
+    snippet='fp_init -c "$1" 2>/dev/null; exec 2>/dev/null; MYVAR="$REPO_DIR/parcellations/a.nii"; stage_should_run 03_func_prep sub-01 -- MYVAR || true; echo "$FP_STAGE_HASH"'
+    h1="$(bash -c "set -euo pipefail; source '$COMMON'; $snippet" "${BASH_SOURCE[0]}" "$conf")"
+    h2="$(bash -c "set -euo pipefail; source '$copy/lib/common.sh'; $snippet" "${BASH_SOURCE[0]}" "$conf")"
+    check "stage hash computed" test -n "$h1"
+    check_eq "stage hash does not depend on the code location" "$h1" "$h2"
+
     in_common "$init"'DRY_RUN=yes; stage_should_run dry sub-01 -- MYVAR; stage_mark_done dry sub-01' "$conf"
     check_not "DRY_RUN=yes writes no marker" test -e "$out/work/sub-01/.done/dry.hash"
     check_status "stage_should_run rejects unknown options" 1 in_common "$init"'stage_should_run st sub-01 --bogus x -- MYVAR' "$conf"
@@ -307,6 +321,7 @@ set -euo pipefail
 name="$(basename "$0")"
 [[ "$1" == -c ]] && shift 2
 echo "$name $*|${DRY_RUN:-unset}|${FORCE:-unset}" >> "$OUT_DIR/calls.txt"
+echo "$(cd "$(dirname "$0")" && pwd)|${FMRIPROC_CONFIG:-unset}" >> "$OUT_DIR/stage_dirs.txt"
 echo "fake $name $*"
 if [[ "$name" == 00_ingest.sh ]]; then
     mkdir -p "$OUT_DIR/rawdata"
@@ -351,8 +366,10 @@ status_of() {
 }
 
 latest_status() {   # OUT_DIR
+    # C collation: in UTF-8 locales sort ignores punctuation and would put
+    # status_<stamp>.tsv after status_<stamp>_1.tsv (same-second runs)
     # shellcheck disable=SC2012
-    ls -1 "$1"/logs/status_*.tsv | sort | tail -n 1
+    ls -1 "$1"/logs/status_*.tsv | LC_ALL=C sort | tail -n 1
 }
 
 test_pipeline_failure_isolation() {
@@ -465,6 +482,32 @@ test_pipeline_auto_fetch() {
         "$(grep '^fetch_resources.sh' "$out/calls.txt" | cut -d'|' -f1 | tr '\n' ',' | sed 's/,$//')"
 }
 
+# Every run executes a frozen copy of the code (logs/code_<run>), so editing the
+# repository during a run can neither corrupt the running stage (bash reads
+# scripts incrementally) nor mix code versions; FREEZE_CODE=no runs the repository.
+test_pipeline_frozen_code() {
+    local out="$TMP/pipe_frozen" rc=0 code_dir used
+    pipeline "$out" --stages "ingest confounds" -s A >/dev/null 2>&1 || rc=$?
+    check_eq "frozen code: exit status 0" 0 "$rc"
+    # shellcheck disable=SC2012
+    code_dir="$(ls -d "$out"/logs/code_* 2>/dev/null | head -n 1)"
+    check "frozen code: copy in logs/code_<run>" test -n "$code_dir"
+    check "frozen code: run_pipeline.sh copied" test -s "$code_dir/run_pipeline.sh"
+    # Linux md5sum writes '<hash>  ./file', Git Bash '<hash> *./file'
+    check "frozen code: md5 manifest" grep -Eq '[ *]\./stages/04_confounds\.sh$' "$code_dir/code_manifest.md5"
+    check "frozen code: external dataset conf copied" test -s "$code_dir/config/external/pipe_frozen.conf"
+    used="$(cut -d'|' -f1 "$out/stage_dirs.txt" | sort -u)"
+    check_eq "frozen code: every stage ran from the copy" "$(cd "$code_dir/stages" && pwd)" "$used"
+    used="$(cut -d'|' -f2 "$out/stage_dirs.txt" | sort -u)"
+    check_eq "frozen code: stages read the frozen conf" "$code_dir/config/external/pipe_frozen.conf" "$used"
+    rm -f "$out/stage_dirs.txt"
+    rc=0
+    FREEZE_CODE=no pipeline "$out" --stages confounds -s A >/dev/null 2>&1 || rc=$?
+    check_eq "FREEZE_CODE=no: exit status 0" 0 "$rc"
+    used="$(cut -d'|' -f1 "$out/stage_dirs.txt" | sort -u)"
+    check_eq "FREEZE_CODE=no: stages ran from the repository" "$(cd "$TMP/fake_stages" && pwd)" "$used"
+}
+
 # A stage script that does not exist (e.g. a module not yet written) must be
 # recorded as failed, not crash the orchestrator or pass silently.
 test_pipeline_missing_script() {
@@ -498,6 +541,7 @@ main() {
         test_pipeline_cli
         test_pipeline_auto_fetch
         test_pipeline_missing_script
+        test_pipeline_frozen_code
     fi
     echo
     echo "$N_PASS passed, $N_FAIL failed"

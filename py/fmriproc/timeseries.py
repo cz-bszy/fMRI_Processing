@@ -52,7 +52,9 @@ VOLUME_DEFINITION = (
 CIFTI_DEFINITION = (
     "Each column is the mean over the grayordinates of one dlabel parcel (wb_command "
     "-cifti-parcellate, method MEAN) of the unsmoothed dense series; columns follow the ascending "
-    "label keys of the dlabel and carry its label names. Parcels without data or with a constant "
+    "label keys of the dlabel and carry the label-table name of the same key when both files hold "
+    "the same keys with matching hemisphere and network (roi_names_source; the dlabel names "
+    "otherwise, renamed_from_dlabel lists the differences). Parcels without data or with a constant "
     "series are n/a. With coverage_checked=true the rule of the volume stream is applied as well: "
     "grayordinates that are non-finite or constant over time (outside the field of view) do not "
     "count, a parcel whose fraction of valid grayordinates is below min_coverage is n/a, and a "
@@ -115,6 +117,47 @@ def _clean_name(name: str, index: int) -> str:
     if text == "" or text.lower() in (NA, "nan"):
         return f"roi_{index}"
     return text
+
+
+HEMISPHERES = ("LH", "RH")
+
+
+def _hemi_network(name: str) -> tuple[str, str] | None:
+    """('LH' | 'RH', network) of a Schaefer-style name such as 7Networks_LH_Default_PCC_1."""
+    parts = str(name).split("_")
+    for i, part in enumerate(parts[:-1]):
+        if part in HEMISPHERES:
+            return part, parts[i + 1]
+    return None
+
+
+def canonical_names(parcels: pd.DataFrame, table: pd.DataFrame | None) -> tuple[dict[str, str], str]:
+    """dlabel parcel name -> label-table name of the same atlas label key.
+
+    The volumetric label table and the dlabel of one atlas release may spell the
+    same parcel differently: the CBIG fsLR dlabel renames 19 of the Schaefer-100
+    parcels (e.g. Default_PCC_1 -> Default_pCunPCC_1) with unchanged label keys and
+    boundaries. The label key is the parcel identity; the label-table names are
+    taken only when both files hold exactly the same keys, every renamed key keeps
+    its hemisphere and network, and the names stay unique. Otherwise ({}, reason).
+    """
+    if table is None:
+        return {}, "no label table"
+    by_key = {int(k): _clean_name(n, int(k)) for k, n in zip(table["index"], table["name"])}
+    keys = [int(k) for k in parcels["roi"]]
+    if set(keys) != set(by_key):
+        return {}, "the label keys of the dlabel and of the label table differ"
+    mapping: dict[str, str] = {}
+    for key, name in zip(keys, parcels["name"]):
+        canon = by_key[key]
+        if canon != name:
+            here, there = _hemi_network(name), _hemi_network(canon)
+            if here is None or here != there:
+                return {}, f"label key {key}: '{name}' (dlabel) and '{canon}' (label table) differ in hemisphere or network"
+        mapping[name] = canon
+    if len(set(mapping.values())) != len(mapping):
+        return {}, "the label-table names are not unique"
+    return mapping, "label table, matched by atlas label key"
 
 
 def _unique_names(names: list[str], indices: list[int]) -> list[str]:
@@ -411,13 +454,16 @@ def parcel_coverage(
     label_keys: np.ndarray,
     label_axis: nib.cifti2.BrainModelAxis,
     parcel_keys: np.ndarray,
+    sampled: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """Coverage of every parcel by a dense series (T, G).
 
     Returns (table [roi, atlas_voxels, data_voxels, valid_voxels], mean over all
     parcel grayordinates present in the series [T, P] (= what -cifti-parcellate
     computes), mean over the valid ones [T, P]). Valid = finite at every time
-    point and not constant, the rule of the volume stream.
+    point and not constant, the rule of the volume stream, and - with `sampled`
+    (bool per grayordinate of the series) - sampled from the grayordinate's own
+    data rather than filled in by the surface dilation.
     """
     codes = grayordinate_codes(data_axis)
     order = np.argsort(codes, kind="stable")
@@ -426,6 +472,8 @@ def parcel_coverage(
     found = codes[order][position] == wanted
     column = order[position]
     valid = np.isfinite(data).all(axis=0) & (np.ptp(data, axis=0) > 0)
+    if sampled is not None:
+        valid &= sampled
 
     mean_all = np.full((data.shape[0], len(parcel_keys)), np.nan, dtype=np.float64)
     mean_valid = mean_all.copy()
@@ -460,6 +508,22 @@ def expand_to_parcels(series: np.ndarray, names: list[str], expected: list[str])
     return out, list(expected), True
 
 
+def load_sampled_mask(path: str | Path, data_axis: nib.cifti2.BrainModelAxis) -> np.ndarray:
+    """Sampled-mask dscalar (stage 06) -> bool per grayordinate of `data_axis`,
+    matched by grayordinate identity (structure + vertex/voxel), never by position."""
+    img, axes = _cifti_axes(path, "sampled mask")
+    model_dim = _single_axis(path, axes, nib.cifti2.BrainModelAxis, "dscalar")
+    values = np.asarray(img.dataobj, dtype=np.float64)
+    values = values[0] if model_dim == 1 else values[:, 0]
+    codes = grayordinate_codes(axes[model_dim])
+    lookup = dict(zip(codes.tolist(), values.tolist()))
+    wanted = grayordinate_codes(data_axis).tolist()
+    missing = sum(code not in lookup for code in wanted)
+    if missing:
+        raise ValueError(f"{path}: {missing} grayordinates of the dense series are not in the sampled mask")
+    return np.array([lookup[code] > 0.5 for code in wanted], dtype=bool)
+
+
 def apply_cifti_coverage(
     series: np.ndarray,
     parcels: pd.DataFrame,
@@ -467,19 +531,23 @@ def apply_cifti_coverage(
     label_keys: np.ndarray,
     label_axis: nib.cifti2.BrainModelAxis,
     min_coverage: float,
+    sampled_mask: str | Path | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, dict]:
     """Coverage rule of the volume stream for parcellated CIFTI data.
 
     wb_command averages every grayordinate of a parcel, including those without
-    signal (outside the field of view of the EPI: constant series). Partly
-    covered parcels are re-averaged over their valid grayordinates, parcels below
-    `min_coverage` become n/a. All other parcels double as a check of
-    -cifti-parcellate against the mean computed here.
+    signal (outside the field of view of the EPI: constant series) and, on the
+    surface, vertices that only received a neighbour's copy through the dilation
+    of stage 06 (`sampled_mask`). Partly covered parcels are re-averaged over their
+    valid grayordinates, parcels below `min_coverage` become n/a. All other
+    parcels double as a check of -cifti-parcellate against the mean computed here.
     """
     data, data_axis = load_dtseries(dtseries)
     if data.shape[0] != series.shape[0]:
         raise ValueError(f"{dtseries}: {data.shape[0]} frames, but the parcellated series has {series.shape[0]}")
-    table, mean_all, mean_valid = parcel_coverage(data, data_axis, label_keys, label_axis, parcels["roi"].to_numpy())
+    sampled = None if is_none(sampled_mask) else load_sampled_mask(sampled_mask, data_axis)
+    table, mean_all, mean_valid = parcel_coverage(data, data_axis, label_keys, label_axis, parcels["roi"].to_numpy(),
+                                                  sampled)
     del data
     n_atlas = table["atlas_voxels"].to_numpy(dtype=np.float64)
     n_valid = table["valid_voxels"].to_numpy()
@@ -505,6 +573,8 @@ def apply_cifti_coverage(
     report = {
         "recomputed_rois": parcels.loc[partial, "name"].tolist(),
         "parcellate_max_abs_diff": max_diff,
+        "sampled_mask": None if sampled is None else str(sampled_mask),
+        "unsampled_grayordinates": None if sampled is None else int((~sampled).sum()),
     }
     return out, coverage, report
 
@@ -533,9 +603,26 @@ def run_cifti(args: argparse.Namespace) -> int:
             network = {} if table is None else dict(zip(table["index"].tolist(), table["network"].tolist()))
             parcels["network"] = [network.get(int(roi), NA) for roi in parcels["roi"]]
             series, coverage, report = apply_cifti_coverage(
-                series, parcels, args.dtseries, label_keys, label_axis, args.min_coverage)
+                series, parcels, args.dtseries, label_keys, label_axis, args.min_coverage, args.sampled_mask)
         elif not is_none(args.dtseries):
             log("WARNING: coverage not checked (the parcels could not be matched to the dlabel)")
+
+    # the volume stream names ROIs after the label table: same names here, so that
+    # stage 10 can pair the two streams by ROI identity
+    renamed: dict[str, str] = {}
+    names_source = "dlabel" if matched else "parcels axis of the ptseries"
+    if matched:
+        mapping, reason = canonical_names(parcels, table)
+        if mapping:
+            renamed = {mapping[n]: n for n in names if mapping.get(n, n) != n}
+            names = [mapping.get(n, n) for n in names]
+            if coverage is not None:
+                coverage["name"] = [mapping.get(n, n) for n in coverage["name"]]
+            names_source = reason
+            if renamed:
+                log(f"{len(renamed)} parcel(s) take the label-table name of their label key: {list(renamed)[:4]}")
+        elif table is not None:
+            log(f"NOTE: dlabel parcel names kept ({reason}): the volume and surface streams cannot be paired")
 
     keep, handling = retained_frames(series.shape[0], read_censor(args.censor), args.censor_mode)
     missing = [name for name, ok in zip(names, np.isfinite(series).all(axis=0)) if not ok]
@@ -553,6 +640,8 @@ def run_cifti(args: argparse.Namespace) -> int:
         "min_coverage": float(args.min_coverage),
         "coverage_checked": coverage is not None,
         "column_order": "dlabel label keys, ascending" if matched else "parcels axis of the ptseries",
+        "roi_names_source": names_source,
+        "renamed_from_dlabel": renamed,
         # the volumetric label table may spell the same parcels differently
         "label_table_names": None if table is None else table["name"].tolist(),
         "censor_mode": args.censor_mode,
@@ -612,6 +701,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="the dense series that was parcellated: enables the coverage table and the min-coverage rule")
     cif.add_argument("--labels", default="none",
                      help="volumetric label table (index, name, network): network column of the coverage table, names recorded in the JSON")
+    cif.add_argument("--sampled-mask", default="none",
+                     help="dscalar from stage 06: 1 = grayordinate sampled from its own data, 0 = only filled in "
+                          "by the surface dilation (does not count as covered); needs --dtseries")
     cif.add_argument("--censor", default="none")
     cif.add_argument("--censor-mode", default="NTRP", type=str.upper, choices=CENSOR_MODES)
     cif.add_argument("--min-coverage", type=float, default=0.5)

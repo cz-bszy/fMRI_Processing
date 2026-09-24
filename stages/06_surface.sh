@@ -197,7 +197,12 @@ convert_hemisphere() {
     run mris_convert --to-scanner "$FS_SUBJ/surf/$hemi.white" "$white"
     run mris_convert --to-scanner "$FS_SUBJ/surf/$hemi.pial" "$pial"
     run mris_convert "$FS_SUBJ/surf/$hemi.sphere.reg" "$sphere"
-    run mris_convert -c "$FS_SUBJ/surf/$hemi.thickness" "$FS_SUBJ/surf/$hemi.white" "$thick"
+    # mris_convert -c prepends the hemisphere to an output name that does not
+    # start with lh./rh. (L.thickness.shape.gii -> lh.L.thickness.shape.gii):
+    # write under the FreeSurfer-style name, then rename.
+    run mris_convert -c "$FS_SUBJ/surf/$hemi.thickness" "$FS_SUBJ/surf/$hemi.white" \
+        "$(dirname "$thick")/$hemi.thickness.shape.gii"
+    run mv -f "$(dirname "$thick")/$hemi.thickness.shape.gii" "$thick"
     wb -set-structure "$white" "$struct" -surface-type ANATOMICAL -surface-secondary-type GRAY_WHITE
     wb -set-structure "$pial" "$struct" -surface-type ANATOMICAL -surface-secondary-type PIAL
     wb -set-structure "$sphere" "$struct" -surface-type SPHERICAL
@@ -351,6 +356,30 @@ map_series() {
     done
 }
 
+# make_sampled_mask OUT WORKDIR : 1 on the grayordinates whose value comes from
+# their own data. Vertices without goodvoxels in their ribbon (badvert of the
+# preproc mapping) only receive a neighbour's copy through the dilation, and an
+# fsLR vertex inherits the area-weighted share of such native vertices: stage 07
+# does not count them as covered (principle 8). The subcortex is never dilated.
+make_sampled_mask() {
+    local out="$1" w="$2" H native fslr tmp="$2/sampled_mask.dscalar.nii"
+    for H in "${HEMIS[@]}"; do
+        native="$w/sampled_hemi-$H.native.shape.gii"
+        fslr="$w/sampled_hemi-$H.32k.shape.gii"
+        wb -metric-math "(roi > 0) * (bad == 0)" "$native" \
+            -var roi "$(cortex_roi "$H")" -var bad "$w/preproc_hemi-$H.badvert.shape.gii"
+        wb -metric-resample "$native" "$(sphere_reg "$H")" "${FSLR_SPHERE[$H]}" ADAP_BARY_AREA "$fslr" \
+            -area-surfs "$(surf_file "$H" midthickness)" "$(fslr_mid "$H")" -current-roi "$(cortex_roi "$H")"
+        wb -metric-math "x >= 0.5" "$fslr" -var x "$fslr"
+        wb -set-structure "$fslr" "${STRUCTURE[$H]}"
+    done
+    run fslmaths "$ATLAS_ROIS" -bin "$w/sampled_subcortex.nii.gz"
+    wb -cifti-create-dense-scalar "$tmp" -volume "$w/sampled_subcortex.nii.gz" "$ATLAS_ROIS" \
+        -left-metric "$w/sampled_hemi-L.32k.shape.gii" -roi-left "${ATLASROI[L]}" \
+        -right-metric "$w/sampled_hemi-R.32k.shape.gii" -roi-right "${ATLASROI[R]}"
+    install_file "$tmp" "$out"
+}
+
 # volume_on_atlas_grid VOLUME TAG WORKDIR : sets VOL_ON_GRID to a series on the
 # exact grid of Atlas_ROIs.2 (wb_command refuses any other volume space).
 volume_on_atlas_grid() {
@@ -447,6 +476,7 @@ run_complete() {   # RUN
     local pre="$FDIR/$1" strat
     [[ -s "${pre}_space-fsLR_den-91k_desc-preproc_bold.dtseries.nii" \
         && -s "${pre}_space-fsLR_den-91k_desc-preproc_tsnr.dscalar.nii" \
+        && -s "${pre}_space-fsLR_den-91k_desc-sampled_mask.dscalar.nii" \
         && -s "${pre}_desc-surfqc.json" ]] || return 1
     for strat in "${STRATEGIES[@]}"; do
         [[ -s "${pre}_space-fsLR_den-91k_desc-${strat}_bold.dtseries.nii" ]] || return 1
@@ -490,6 +520,7 @@ process_run() {   # RUN
     make_goodvoxels "$bold_t1" "$w"
 
     make_dtseries "$bold_t1" "$bold_tpl" preproc "$dt_pre" "$w" "$subdiv" "$tr" yes
+    make_sampled_mask "${pre}_space-fsLR_den-91k_desc-sampled_mask.dscalar.nii" "$w"
     tmp="$w/preproc_tsnr.dscalar.nii"
     wb -cifti-reduce "$dt_pre" TSNR "$tmp"
     install_file "$tmp" "$tsnr"

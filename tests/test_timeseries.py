@@ -332,6 +332,15 @@ def make_dtseries(path: Path, data: np.ndarray, vertices: list[int], with_voxels
     return path
 
 
+def make_dscalar(path: Path, values: list[float], vertices: list[int], with_voxels: bool = False) -> Path:
+    """One map on the grayordinates of dense_axis(vertices, with_voxels)."""
+    scalar_axis = nib.cifti2.cifti2_axes.ScalarAxis(["sampled"])
+    img = nib.Cifti2Image(np.array([values], dtype=np.float32), header=(scalar_axis, dense_axis(vertices, with_voxels)))
+    img.nifti_header.set_intent("ConnDenseScalar")
+    nib.save(img, str(path))
+    return path
+
+
 def make_dlabel(path: Path, keys: dict[int, int], table: dict[int, str], with_voxels: bool = False,
                 voxel_keys: tuple[int, int] = (0, 0)) -> Path:
     """keys: vertex -> label key, defined on every vertex (0 = unlabeled '???')."""
@@ -423,6 +432,32 @@ class CiftiCoverageTest(TempDirCase):
         self.assertEqual(list(fc.columns), self.ORDER)
         self.assertTrue(np.isfinite(fc.to_numpy()[1, 2]))
 
+    def test_unsampled_grayordinates_do_not_count(self) -> None:
+        # vertices 0 and 1 of P_a only hold a neighbour's copy (surface dilation):
+        # they must neither count as covered nor enter the parcel mean
+        mask = make_dscalar(self.tmp / "m.dscalar.nii", [0.0, 0.0] + [1.0] * 12, self.VERTICES, with_voxels=True)
+        prefix = self.tmp / "out"
+        rc = self.run_cifti(prefix, "--dtseries", str(self.dtseries), "--sampled-mask", str(mask), "--min-coverage", "0.5")
+        self.assertEqual(rc, 0)
+        coverage = read_tsv(f"{prefix}_coverage.tsv").set_index("name")
+        self.assertEqual(int(coverage.loc["P_a", "valid_voxels"]), 2)
+        self.assertAlmostEqual(float(coverage.loc["P_a", "coverage_fraction"]), 0.5)
+        series = read_tsv(f"{prefix}_timeseries.tsv")
+        np.testing.assert_allclose(series["P_a"].to_numpy(), self.dense[:, 2:4].mean(axis=1), rtol=1e-5)
+        info = json.loads(Path(f"{prefix}_timeseries.json").read_text(encoding="utf-8"))
+        self.assertIn("P_a", info["recomputed_rois"])
+        self.assertEqual(info["unsampled_grayordinates"], 2)
+        # a stricter coverage threshold turns the half-sampled parcel into n/a
+        prefix = self.tmp / "out2"
+        rc = self.run_cifti(prefix, "--dtseries", str(self.dtseries), "--sampled-mask", str(mask), "--min-coverage", "0.6")
+        self.assertEqual(rc, 0)
+        self.assertTrue(read_tsv(f"{prefix}_timeseries.tsv")["P_a"].isna().all())
+
+    def test_sampled_mask_on_other_grayordinates_is_an_error(self) -> None:
+        mask = make_dscalar(self.tmp / "m.dscalar.nii", [1.0] * 10, list(range(10)))   # no voxels, fewer vertices
+        rc = self.run_cifti(self.tmp / "out", "--dtseries", str(self.dtseries), "--sampled-mask", str(mask))
+        self.assertEqual(rc, 1)
+
     def test_no_connectivity_for_the_preproc_series(self) -> None:
         prefix = self.tmp / "sub-1_task-rest_space-fsLR_atlas-X_desc-preproc"
         self.assertEqual(self.run_cifti(prefix, "--dtseries", str(self.dtseries), "--no-connectivity"), 0)
@@ -445,6 +480,70 @@ class CiftiCoverageTest(TempDirCase):
         rc = timeseries.main(["cifti", "--ptseries", str(self.ptseries), "--dtseries", str(self.dtseries),
                               "--out-prefix", str(self.tmp / "o2")])
         self.assertEqual(rc, 1)
+
+
+class CiftiCanonicalNamesTest(TempDirCase):
+    """The volumetric label table and the dlabel of one Schaefer release can name
+    the same parcel differently (CBIG renamed e.g. Default_PCC_1 -> Default_pCunPCC_1
+    without changing keys or boundaries). Surface columns must then carry the
+    label-table names, matched by atlas label key, so that the volume and surface
+    streams share ROI identities; a key whose hemisphere or network differs is
+    never renamed."""
+
+    DLABEL = {1: "7Networks_LH_Vis_1", 2: "7Networks_LH_Default_pCunPCC_1", 3: "7Networks_RH_Default_pCunPCC_1"}
+    LABELS = {1: ("7Networks_LH_Vis_1", "Vis"), 2: ("7Networks_LH_Default_PCC_1", "Default"),
+              3: ("7Networks_RH_Default_PCC_1", "Default")}
+
+    def setUp(self) -> None:
+        super().setUp()
+        rng = np.random.default_rng(5)
+        self.dense = rng.normal(1000.0, 10.0, size=(25, 12))
+        keys = {v: 1 for v in range(0, 4)} | {v: 2 for v in range(4, 8)} | {v: 3 for v in range(8, 12)}
+        self.dlabel = make_dlabel(self.tmp / "a.dlabel.nii", keys, self.DLABEL)
+        self.dtseries = make_dtseries(self.tmp / "b.dtseries.nii", self.dense, list(range(12)))
+        means = np.column_stack([self.dense[:, 4 * k:4 * k + 4].mean(axis=1) for k in range(3)])
+        self.ptseries = make_ptseries(self.tmp / "c.ptseries.nii", means, [self.DLABEL[k] for k in (1, 2, 3)])
+
+    def write_labels(self, labels: dict[int, tuple[str, str]]) -> Path:
+        path = self.tmp / "labels.tsv"
+        rows = "".join(f"{k}\t{name}\t{net}\n" for k, (name, net) in labels.items())
+        path.write_text("index\tname\tnetwork\n" + rows, encoding="utf-8")
+        return path
+
+    def run_cifti(self, labels: Path, prefix: Path) -> int:
+        return timeseries.main(["cifti", "--ptseries", str(self.ptseries), "--dlabel", str(self.dlabel),
+                                "--dtseries", str(self.dtseries), "--labels", str(labels), "--out-prefix", str(prefix)])
+
+    def test_label_table_names_by_key(self) -> None:
+        prefix = self.tmp / "out"
+        self.assertEqual(self.run_cifti(self.write_labels(self.LABELS), prefix), 0)
+        expected = [self.LABELS[k][0] for k in (1, 2, 3)]
+        self.assertEqual(list(read_tsv(f"{prefix}_timeseries.tsv").columns), expected)
+        self.assertEqual(list(read_tsv(f"{prefix}_connectivity.tsv").columns), expected)
+        self.assertEqual(read_tsv(f"{prefix}_coverage.tsv")["name"].tolist(), expected)
+        info = json.loads(Path(f"{prefix}_timeseries.json").read_text(encoding="utf-8"))
+        self.assertEqual(info["roi_names"], expected)
+        self.assertEqual(info["roi_names_source"], "label table, matched by atlas label key")
+        self.assertEqual(info["renamed_from_dlabel"], {"7Networks_LH_Default_PCC_1": "7Networks_LH_Default_pCunPCC_1",
+                                                       "7Networks_RH_Default_PCC_1": "7Networks_RH_Default_pCunPCC_1"})
+        np.testing.assert_allclose(read_tsv(f"{prefix}_timeseries.tsv")[expected[1]].to_numpy(),
+                                   self.dense[:, 4:8].mean(axis=1), rtol=1e-5)
+
+    def test_hemisphere_or_network_conflict_keeps_dlabel_names(self) -> None:
+        for bad in ({**self.LABELS, 3: ("7Networks_LH_Default_PCC_2", "Default")},       # hemisphere differs
+                    {**self.LABELS, 2: ("7Networks_LH_Cont_PCC_1", "Cont")}):           # network differs
+            prefix = self.tmp / f"out{len(list(self.tmp.glob('out*')))}"
+            self.assertEqual(self.run_cifti(self.write_labels(bad), prefix), 0)
+            self.assertEqual(list(read_tsv(f"{prefix}_timeseries.tsv").columns), [self.DLABEL[k] for k in (1, 2, 3)])
+            info = json.loads(Path(f"{prefix}_timeseries.json").read_text(encoding="utf-8"))
+            self.assertEqual(info["roi_names_source"], "dlabel")
+            self.assertEqual(info["renamed_from_dlabel"], {})
+
+    def test_different_key_sets_keep_dlabel_names(self) -> None:
+        prefix = self.tmp / "out"
+        labels = {k: v for k, v in self.LABELS.items() if k != 3}
+        self.assertEqual(self.run_cifti(self.write_labels(labels), prefix), 0)
+        self.assertEqual(list(read_tsv(f"{prefix}_timeseries.tsv").columns), [self.DLABEL[k] for k in (1, 2, 3)])
 
 
 class CiftiTest(TempDirCase):

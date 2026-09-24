@@ -31,6 +31,7 @@ from fmriproc import timing
 from fmriproc.utils import read_json, write_json, write_tsv
 
 NIFTI1_HEADER_BYTES = 348
+AFNI_ECODE = 4               # NIfTI extension code of AFNI's own header
 MIN_VOLUMES_DEFAULT = 30
 SHORT_FOV_Z_MM = 110.0
 QS_FORM_TOLERANCE_MM = 0.1     # qform/sform disagreement (at the volume corners) worth reporting
@@ -184,14 +185,42 @@ def target_is_current(target: Path, header: nib.Nifti1Header, source: Path) -> b
         return False
 
 
-def copy_with_header(source: Path, target: Path, header: nib.Nifti1Header) -> None:
+def afni_extension_present(path: Path) -> bool:
+    """True when the image carries an AFNI header extension (ecode 4).
+
+    AFNI programs take TR, view (+orig/+tlrc) and orientation from that
+    extension instead of the NIfTI header, so a stale extension silently
+    overrides what ingest validated (ABIDEII-GU_1: AFNI reads TR 1 s, the
+    header says 2 s, and every AFNI-written intermediate inherits 1 s).
+    """
+    try:
+        extensions = nib.load(str(path)).header.extensions
+    except Exception:  # noqa: BLE001 - unreadable extensions: leave the file alone
+        return False
+    return any(ext.get_code() == AFNI_ECODE for ext in extensions)
+
+
+def drop_extensions(header: nib.Nifti1Header) -> None:
+    """Header of a copy without extensions: voxel data right after the extender."""
+    header["vox_offset"] = NIFTI1_HEADER_BYTES + 4
+
+
+def copy_with_header(source: Path, target: Path, header: nib.Nifti1Header, strip_extensions: bool = False) -> None:
     """Stream `source` to `target`, replacing only the NIfTI-1 header.
 
     Everything after byte 348 (extensions, voxel data, scaling) is copied
-    unchanged, so the data cannot be altered and memory use stays constant. A
-    truncated source is detected by counting the streamed bytes.
+    unchanged, so the data cannot be altered and memory use stays constant.
+    With `strip_extensions` the extensions are left out (`header` must then be
+    prepared with drop_extensions) and the voxel data are copied from the
+    source's vox_offset. A truncated source is detected by counting the
+    streamed bytes.
     """
     expected = expected_tail_bytes(header)
+    skip = 0
+    if strip_extensions:
+        if int(header["vox_offset"]) != NIFTI1_HEADER_BYTES + 4:
+            raise IngestError("internal error: a copy without extensions needs vox_offset 352")
+        skip = max(int(read_header(source)["vox_offset"]), NIFTI1_HEADER_BYTES + 4) - NIFTI1_HEADER_BYTES
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".tmp{os.getpid()}_{target.name}")
     copied = 0
@@ -199,6 +228,11 @@ def copy_with_header(source: Path, target: Path, header: nib.Nifti1Header) -> No
         with _open_image(source, "rb") as fin, _open_image(tmp, "wb") as fout:
             fin.read(NIFTI1_HEADER_BYTES)
             fout.write(header.binaryblock)
+            if strip_extensions:
+                if len(fin.read(skip)) < skip:
+                    raise IngestError(f"{source.name} is truncated inside its header extensions")
+                fout.write(bytes(4))                     # extender: no extensions follow
+                copied = 4
             while True:
                 chunk = fin.read(1 << 22)
                 if not chunk:
@@ -709,6 +743,10 @@ class T1Cache:
         changes, warnings = normalise_orientation(header)
         for message in warnings:
             warn(f"{cand.subject} T1w: {message}")
+        strip = afni_extension_present(cand.t1w)
+        if strip:
+            drop_extensions(header)
+            changes.append("AFNI NIfTI extension removed")
         if self.settings.layout == "bids" and not changes:
             return abspath(cand.t1w)
         name = cand.subject + (f"_ses-{cand.t1w_session}" if cand.t1w_session != "-" else "") + "_T1w.nii.gz"
@@ -717,7 +755,7 @@ class T1Cache:
             folder = folder / f"ses-{cand.t1w_session}"
         target = folder / "anat" / name
         if self.settings.overwrite or not target_is_current(target, header, cand.t1w):
-            copy_with_header(cand.t1w, target, header)
+            copy_with_header(cand.t1w, target, header, strip_extensions=strip)
             record_copy(cand.t1w, target)
             info(f"{cand.subject}: T1w -> {target}" + (f" [{'; '.join(changes)}]" if changes else ""))
         return abspath(target)
@@ -781,7 +819,7 @@ def build_sidecar(meta: dict[str, Any], filled: dict[str, Any], tr_used: float, 
 
 
 def write_rawdata_bold(cand: Candidate, settings: Settings, header: nib.Nifti1Header,
-                       source_header: nib.Nifti1Header, copy: bool) -> Path:
+                       source_header: nib.Nifti1Header, copy: bool, strip_extensions: bool = False) -> Path:
     """Normalised copy (`copy`) or a link to the untouched original; returns the rawdata path."""
     assert cand.bold is not None
     folder = settings.raw_dir / cand.subject
@@ -790,7 +828,7 @@ def write_rawdata_bold(cand: Candidate, settings: Settings, header: nib.Nifti1He
     if copy:
         target = folder / "func" / f"{cand.run_label}_bold.nii.gz"
         if settings.overwrite or not target_is_current(target, header, cand.bold):
-            copy_with_header(cand.bold, target, header)
+            copy_with_header(cand.bold, target, header, strip_extensions=strip_extensions)
             record_copy(cand.bold, target)
             info(f"{cand.run_label}: BOLD -> {target}")
     else:
@@ -859,16 +897,23 @@ def ingest_run(cand: Candidate, settings: Settings, t1_cache: T1Cache, row: dict
 
     t1_path = t1_cache.resolve(cand)
 
+    # A stale AFNI extension would override the validated header in every AFNI
+    # program downstream, so it forces a copy without extensions.
+    ext_changes: list[str] = []
+    if afni_extension_present(cand.bold):
+        drop_extensions(header)
+        ext_changes.append("AFNI NIfTI extension removed (AFNI reads TR/view from it, not from the header)")
+
     # Header edits that only restate the units do not justify copying a BIDS image.
-    needs_copy = settings.layout == "dpabi" or tr.essential_change or bool(orient_changes)
+    needs_copy = settings.layout == "dpabi" or tr.essential_change or bool(orient_changes) or bool(ext_changes)
     if needs_copy or inherited or filled:
-        target = write_rawdata_bold(cand, settings, header, source_header, needs_copy)
+        target = write_rawdata_bold(cand, settings, header, source_header, needs_copy, bool(ext_changes))
         write_json(target.with_name(nifti_stem(target.name) + ".json"),
                    build_sidecar(meta, filled, tr.tr_used, cand, decision))
         bold_path = abspath(target)
     else:
         bold_path = abspath(cand.bold)
-    changes = orient_changes + tr.changes if needs_copy else []
+    changes = orient_changes + tr.changes + ext_changes if needs_copy else []
 
     row.update(header_changes="; ".join(changes) or None)
     return {"subject": cand.subject, "session": cand.session, "task": cand.task, "run": cand.run,

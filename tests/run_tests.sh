@@ -6,8 +6,9 @@
 #   3. CRLF check       no '\r' in any script or configuration file
 #   4. bash unit tests  tests/test_common_sh.sh (lib/common.sh + run_pipeline.sh)
 #   5. python tests     python -m unittest discover -s tests -p 'test_*.py'
-#                       with PYTHONPATH=py, interpreter $PYTHON_BIN when it exists,
-#                       otherwise 'python'
+#                       with PYTHONPATH=py, interpreter $PYTHON_BIN when it exists, else the
+#                       PYTHON_BIN default of config/default.conf, else 'python'/'python3'
+#                       (the first one with the full stack wins)
 # usage: bash tests/run_tests.sh [--no-python] [--no-bash]   (exit 1 on any failure)
 # Host (Git Bash, python 3.11 with numpy/scipy/pandas/nibabel/nilearn/sklearn/
 # matplotlib/jinja2) or container: cd <repo> && bash tests/run_tests.sh
@@ -75,7 +76,8 @@ fi
 echo "== line endings"
 crlf=()
 while IFS= read -r f; do
-    if grep -q $'\r' "$f"; then crlf+=("$f"); fi
+    # tr, not grep: Git Bash's grep reads files in text mode and never sees '\r'
+    if [[ "$(tr -cd '\r' < "$f" | wc -c)" -gt 0 ]]; then crlf+=("$f"); fi
 done < <({ shell_files; conf_files; ls py/fmriproc/*.py tests/*.py 2>/dev/null; } | sort -u)
 if [[ ${#crlf[@]} -eq 0 ]]; then
     step_ok "no CRLF line endings"
@@ -103,15 +105,25 @@ fi
 # ----------------------------- 5. python unit tests ---------------------------
 if [[ "$RUN_PYTHON" == yes ]]; then
     echo "== python unittest"
-    PY=""
-    for candidate in "${PYTHON_BIN:-}" python python3; do
-        [[ -n "$candidate" ]] || continue
-        # 'python3' on Windows may be a Microsoft Store stub: it must at least import numpy
-        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import numpy' >/dev/null 2>&1; then
+    # The interpreter of the pipeline first: $PYTHON_BIN, else the default of config/default.conf.
+    # A bare 'python' may be another one (in the container: FSL's, without nilearn).
+    default_py="$(sed -n 's/^: "${PYTHON_BIN:=\([^}]*\)}".*/\1/p' "$REPO/config/default.conf" | head -n 1)"
+    PY="" PY_PARTIAL=""
+    for candidate in "${PYTHON_BIN:-}" "$default_py" python python3; do
+        [[ -n "$candidate" ]] && command -v "$candidate" >/dev/null 2>&1 || continue
+        if "$candidate" -c 'import numpy, scipy, pandas, nibabel, nilearn' >/dev/null 2>&1; then
             PY="$candidate"
             break
         fi
+        # 'python3' on Windows may be a Microsoft Store stub: it must at least import numpy
+        if [[ -z "$PY_PARTIAL" ]] && "$candidate" -c 'import numpy' >/dev/null 2>&1; then
+            PY_PARTIAL="$candidate"
+        fi
     done
+    if [[ -z "$PY" && -n "$PY_PARTIAL" ]]; then
+        PY="$PY_PARTIAL"
+        echo "note: $PY lacks part of numpy/scipy/pandas/nibabel/nilearn: the tests needing it are skipped"
+    fi
     if [[ -z "$PY" ]]; then
         step_fail "no usable python (PYTHON_BIN='${PYTHON_BIN:-}'): set PYTHON_BIN or install numpy/scipy/pandas/nibabel/nilearn"
     else

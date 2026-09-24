@@ -340,7 +340,9 @@ step_hmc() {
 # 5. slice timing (only with verified timing; fmriproc.timing decides)
 step_stc() {
     local decision
-    pyrun timing afni-tpattern --bold "$W/bold_dropped.nii.gz" --json "$SIDECAR" --stc "$STC" \
+    # The validated rawdata header is checked, not the AFNI-written float copy:
+    # AFNI writes the TR it believes, which a stale AFNI extension can falsify.
+    pyrun timing afni-tpattern --bold "$BOLD" --json "$SIDECAR" --stc "$STC" \
         --out-1d "$W/slice_timing.1D" --out-json "$W/timing.json"
     require_files "$W/timing.json"
     decision="$(json_get "$W/timing.json" stc skip)"

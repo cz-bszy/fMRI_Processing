@@ -273,7 +273,7 @@ stage_should_run() {
     if [[ $# -gt 0 && "$1" != --* ]]; then
         run="$1"; shift
     fi
-    local deps=() vars=() marker text v dep source_file
+    local deps=() vars=() marker text v value dep source_file
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dep) deps+=("$2"); shift 2 ;;
@@ -281,12 +281,16 @@ stage_should_run() {
             *) die "stage_should_run: unexpected argument $1" ;;
         esac
     done
+    # The hash depends on what the code contains, not on where it lives
+    # (repository, frozen copy in logs/code_<run>, another mount point): sources
+    # are keyed relative to the code root and $REPO_DIR is masked in values.
     text="version=$PIPELINE_VERSION"$'\n'"script=$(md5sum "$0" | cut -d' ' -f1)"
     while IFS= read -r source_file; do
-        text+=$'\n'"source:$source_file=$(md5sum "$source_file" | cut -d' ' -f1)"
+        text+=$'\n'"source:${source_file#"$REPO_DIR"/}=$(md5sum "$source_file" | cut -d' ' -f1)"
     done < <(_fp_stage_sources "$stage")
     for v in "${vars[@]}"; do
-        text+=$'\n'"$v=${!v-}"
+        value="${!v-}"
+        text+=$'\n'"$v=${value//"$REPO_DIR"/@REPO_DIR@}"
     done
     for dep in "${deps[@]}"; do
         text+=$'\n'"dep:$dep=$(cat "$WORK_DIR/$sub/.done/$dep.hash" 2>/dev/null || echo missing)"

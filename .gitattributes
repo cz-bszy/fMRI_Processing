@@ -4,11 +4,14 @@ FC_step* text eol=lf
 QC_nor text eol=lf
 
 # v2: everything bash reads must stay LF, whatever core.autocrlf says on Windows
+.gitattributes text eol=lf
+.gitignore text eol=lf
 run_pipeline.sh text eol=lf
 stages/* text eol=lf
 lib/* text eol=lf
 docker/*.sh text eol=lf
 docker/*.ps1 text eol=lf
+docker/Dockerfile* text eol=lf
 *.conf text eol=lf
 *.tsv text eol=lf
 *.txt text eol=lf

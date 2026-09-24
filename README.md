@@ -187,7 +187,7 @@ Docker 内存：Docker Desktop → Settings → Resources → Advanced → Memor
 
 **01 anat_recon** — `ANAT_MODE=freesurfer`：`recon-all -all -parallel -openmp $NTHREADS`，完成的判据是 `scripts/recon-all.done` + `surf/{lh,rh}.pial` + `mri/aseg.mgz`；存在 `scripts/IsRunning*` 时拒绝触碰；先探测 `FS_DIR` 能否建符号链接。`synth` 模式无事可做。
 
-**02 anat_prep** — T1w 参考（`nu.mgz` 或 N4 后的原图）、脑掩膜（`brainmask.mgz` 或 SynthStrip）、分割（aseg 或 `mri_synthseg --robust`）、在 1 mm 网格上腐蚀得到 WM/CSF/GM 掩膜、`antsRegistrationSyN[Quick].sh` brain-to-brain 到 1 mm 模板（固定 `ANTS_SEED`）、解剖 QC JSON（Euler 数、Dice、Jacobian 分位数、模板相关）。
+**02 anat_prep** — T1w 参考（`nu.mgz` 或 N4 后的原图）、脑掩膜（`brainmask.mgz` 或 SynthStrip）、分割（aseg 或 `mri_synthseg`，默认 `SYNTHSEG_FLAGS=--robust`；输入先裁剪到 SynthStrip 脑框 + 15 mm，内存约减半）、在 1 mm 网格上腐蚀得到 WM/CSF/GM 掩膜、`antsRegistrationSyN[Quick].sh` brain-to-brain 到 1 mm 模板（固定 `ANTS_SEED`）、解剖 QC JSON（Euler 数、Dice、Jacobian 分位数、模板相关）。
 
 **03 func_prep**（每 run）— float32 副本、丢弃前 `DropVolumes` 个 volume、非稳态检测；原始 QC（`3dToutcount`、`3dTqual`）；`3dDespike`；两遍 `mcflirt`（只保留矩阵/参数）；`3dTshift`（仅有 `SliceTiming` 时，`STC=auto|require|off`）；boldref N4 + EPI 掩膜；配准（`mri_coreg`→`bbregister` 或 FLIRT→FLIRT-BBR，位移/cost 超限即回退并记 `bbr_rejected`）；`antsApplyTransforms` 单次重采样到 T1w 网格（`FUNC_T1W_RES`）和模板网格（`MNI_RES`）；掩膜 = T1 脑掩膜 ∩ 膨胀的 EPI 支持 ∩ 时间最小值 > 0；一个全局缩放因子（T1w 空间脑内中位数 → `SCALE_TARGET`）；`desc-prep_info.json` 记录一切。
 
@@ -225,7 +225,7 @@ $OUT_DIR/
     <RUN>_space-<TPL>_res-<R>_{boldref,desc-brain_mask,desc-preproc_bold}
     <RUN>_desc-confounds_timeseries.tsv + .json  _desc-censor.1D
     <RUN>_desc-<S>_regressors.1D + _denoise.json  _space-<TPL>_res-<R>_desc-<S>_bold  [_desc-<S>sm<F>_bold]
-    <RUN>_space-fsLR_den-91k_desc-{preproc,<S>}_bold.dtseries.nii  _desc-preproc_tsnr.dscalar.nii  _desc-surfqc.json   (surface)
+    <RUN>_space-fsLR_den-91k_desc-{preproc,<S>}_bold.dtseries.nii  _desc-preproc_tsnr.dscalar.nii  _desc-sampled_mask.dscalar.nii  _desc-surfqc.json   (surface)
     <RUN>_space-<TPL>_atlas-<A>_desc-<S>_{timeseries,coverage,connectivity}.tsv + .json  _desc-preproc_timeseries.tsv
     <RUN>_space-fsLR_atlas-<A>_desc-{<S>,preproc}_...   (surface)
     <RUN>_desc-validation.{tsv,json}  [_desc-streamcompare.tsv]  _desc-qc_metrics.json  _atlas-<A>_desc-<S>_roiqc.tsv
@@ -344,6 +344,8 @@ afni_nominal_dof = N_retained − design_columns
 - 彻底重来：删除 `work/sub-X`（命名卷内：`-Shell` 后 `rm -rf /out/work/sub-X`）或 `docker volume rm <prefix>_work`。`derivatives/` 的最终文件在阶段成功时才由临时名 `mv` 到位，中断不会留下似是而非的结果。
 - `FORCE=yes` 对 `00_ingest` 意味着重写图像副本；对 `01_anat_recon` 不会删除已有的 recon-all 目录（存在 `IsRunning*` 时拒绝）。
 
+**代码冻结**：每次运行开始时编排器把 `run_pipeline.sh`、`lib/`、`stages/`、`py/`、`config/`、`parcellations/` 复制到 `logs/code_<run_id>/`（约 5 MB，含 `code_manifest.md5` 与 `git_revision.txt`，数据集 conf 也一并复制），所有阶段都从这份副本执行。bash 是边读边执行脚本的，运行期间修改仓库里的脚本会让正在执行的阶段读到错位的内容而失败；冻结后修改只影响下一次运行，同时这份副本记录了产出结果的确切代码。`FREEZE_CODE=no` 关闭；旧的 `logs/code_*` 可以随时删除。
+
 ## 12. 测试
 
 ```bash
@@ -357,7 +359,7 @@ PYTHONPATH=py python -m unittest tests.test_validate -v
 
 ## 13. 故障排除
 
-**Docker 内存不足 / 进程被杀（exit 137）**：`docker info --format '{{.MemTotal}}'` 看 VM 实际内存；Hyper-V 后端在 Docker Desktop → Settings → Resources 调整（本机 8–12 GB 可行，20 GB 会导致 VM 起不来）。流水线在 `/proc/meminfo` 低于 `MIN_MEM_GB` 时拒绝重阶段；`mri_synthseg --robust`、`antsRegistrationSyN.sh` 和 recon-all 是内存大户，`N_JOBS` 应满足 `N_JOBS × MIN_MEM_GB ≤ VM 内存`。冒烟 conf 已把 `MIN_MEM_GB` 设为 6、`NTHREADS` 设为 4。
+**Docker 内存不足 / 进程被杀（exit 137）**：`docker info --format '{{.MemTotal}}'` 看 VM 实际内存；Hyper-V 后端在 Docker Desktop → Settings → Resources 调整（本机 8–12 GB 可行，20 GB 会导致 VM 起不来）。流水线在 `/proc/meminfo` 低于 `MIN_MEM_GB` 时拒绝重阶段；`mri_synthseg --robust`、`antsRegistrationSyN.sh` 和 recon-all 是内存大户（synth 模式已先把 T1 裁剪到脑框；12 GB 以下仍不够时设 `SYNTHSEG_FLAGS=`，即不带 `--robust`），`N_JOBS` 应满足 `N_JOBS × MIN_MEM_GB ≤ VM 内存`。冒烟 conf 已把 `MIN_MEM_GB` 设为 6、`NTHREADS` 设为 4。
 
 **NTFS bind mount 与符号链接**：`E:\` 目录挂进容器是 9p/drvfs 类文件系统，小文件 I/O 慢 5–20 倍且不能建符号链接，recon-all 会在数小时后失败。阶段 01 会先探测并 `die`；`run_pipeline.sh` 预检对 `work/`、`freesurfer/` 落在此类文件系统上发出警告。解决办法就是启动脚本的命名卷；需要看 FreeSurfer 结果时用 `-ExportFreesurfer`（`tar -h` 解引用链接、排除 `fsaverage`）。`docker volume ls`/`docker volume rm` 管理卷；每个数据集用不同 `-VolumePrefix`。
 
@@ -389,7 +391,9 @@ PYTHONPATH=py python -m unittest tests.test_validate -v
 - v2.1 尚未在真实数据上端到端验证。2026-09-22 本地 Docker Desktop 启动日志显示 `dockerInference` 端点初始化失败、后台退出；不能据此断言镜像丢失或内存不足。未重置 Docker 数据或修改服务器。
 - 原有未提交源代码的本地恢复副本：`archive/snapshots/2026-09-22_pipeline_upgrade/source.zip`（894782 字节）。未包含原始影像；本地副本可恢复，外部备份状态未验证。
 
-## 15. 本地升级验证记录（2026-09-22）
+## 15. 本地升级验证记录
+
+### 15.1 2026-09-22：合成测试与导入
 
 本轮升级验证以本地 `refactor/v2` 工作树为基线；本节记录本地测试状态，发布版本以 Git 提交为准。旧源恢复副本、运行日志和影像数据仅保留在本机，不随代码发布。原始影像只读，未连接 BSCC 或其他服务器，也未更改共享 Python 环境。
 
@@ -399,3 +403,16 @@ PYTHONPATH=py python -m unittest tests.test_validate -v
 - 实际数据只执行 stage 00：`abide_smoke_subjects.txt` 两人导入到 `E:/ASD/fmriproc_local_test/rawdata`，2 个有效 run、0 错误。GU 为 64×64×43×152、TR=2 s，记录 43 个 SliceTiming 和 DropVolumes=2；NYU2 为 64×80×34×180、TR=2 s，无 SliceTiming、DropVolumes=4，记录 102 mm 短 z-FOV。此处是元数据决策，尚未执行 STC 或删点。源/目标 BOLD 形状和 TR、四份影像复制身份检查通过。完整命令及检查在 `E:/ASD/fmriproc_local_test/logs/ingest.log`。
 - `docker/Dockerfile.clean` 由真实 Neurodocker 2.1.2 经 `docker/generate_runtime.sh` 生成；生成时的工具依赖仅在临时目录解包，已清理。10 个 RUN shell 片段及关键 POSIX 路径检查通过。该干净环境是候选升级，AFNI/Workbench 的真实下载地址、版本和 SHA256 需在构建机显式提供；详见 `docker/README.md`。
 - 尚未完成：Docker 镜像 build、SIF 转换/实际挂载、真实 AFNI 联合设计对照、完整两人预处理、解剖/配准/表面目视 QC，以及真实运行时间和内存测量。它们不能由上述合成测试代替。后续应从当前源与这两个导入样本继续，不将原 ADNI pilot 记录当作此次 ABIDE v2.1 的验收结果。
+
+### 15.2 2026-09-24：两名被试端到端测试
+
+在 Windows 11 + Docker Desktop（VM 16 CPU / 11.7 GiB）上用现有镜像 `zhaochang07/myubuntu:neuro-v2` 完成。上面 15.1 列为未完成的完整两人预处理、目视 QC、运行时间和内存测量已在本轮完成。
+
+- **自动化测试**：`bash tests/run_tests.sh` 在主机和镜像内均全部通过。bash 检查 155 项；Python 单元测试 366 个，镜像内 0 跳过，主机上 8 个需要 Linux bash 的测试跳过。
+- **端到端**：`abide_smoke.conf`（synth，4 种去噪策略）和 `abide_local_fs.conf`（recon-all + surface）在 sub-0028744（GU_1）、sub-0029150（NYU_2）上所有阶段 ok。synth 每人约 6 min；FreeSurfer 每人约 90 min，其中 recon-all 74–80 min。容器内存峰值 7.0 GiB（SynthSeg，已裁剪），所以 12 GiB 的 VM 上保持 `N_JOBS=1`。
+- **QC**：4 个 run 没有 fail，唯一的 warn 是 GU_1 的 36p 只剩 14 个自由度。FD 均值 0.13–0.17 mm，删帧 ≤ 2%，GM tSNR 50–55，配准 Dice 0.94–0.96，标准化 Dice 0.97–0.98。
+- **Volume 与 surface**（n = 2，只能描述）：两流 FC 相关 0.85–0.88。surface 的分半信度、同伦对比和 ROI tSNR 略低，头动耦合相同。
+- **去噪后 FD–DVARS 为负**（−0.19 ~ −0.46）：用 numpy 重建 3dTproject 投影做对照，负值来自头动回归量在高运动帧的高杠杆，相当于软删帧；同样自由度的随机回归量不会产生负值。报告和 `docs/STEPS_zh.md` 的说明已改正。
+- **本轮修复**：AFNI NIfTI 扩展导致 GU_1 的 STC 被静默跳过；surface ROI 覆盖率被 10 mm 膨胀虚高（新增 `desc-sampled_mask`）；CIFTI parcel 名称按 label key 对齐；`mris_convert -c` 的输出名；SynthSeg 内存（裁剪与 `SYNTHSEG_FLAGS`）；运行时冻结代码（`FREEZE_CODE`）与位置无关的阶段 hash；group_qc 在空指标时崩溃；测试脚本的 locale、CRLF 检查和解释器选择。
+- **完整报告**（逐阶段耗时、QC 表、策略与流比较、对照实验）在本机 `E:\ASD\fmriproc_out\TEST_REPORT.md`，与影像结果一起保留在本机，不随代码发布。
+- **尚未完成**：更大样本（`abide_test.conf` 或服务器批量）上的组水平 QC-FC 与流比较；NYU_2 的 slice 顺序确认；`docker/Dockerfile.clean` 干净镜像的构建与 SIF 转换。

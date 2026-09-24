@@ -32,6 +32,7 @@ WMBBR_LABELS=(2 41 7 46 16 77 251 252 253 254 255)
 
 MIN_WM_VOX_1MM=1000
 MIN_CSF_VOX_1MM=50
+SYNTHSEG_PAD_MM=15    # margin around the brain box handed to SynthSeg
 
 SEG=""              # label volume on a 1 mm grid (aseg.mgz | SynthSeg output)
 SEG_ON_T1_GRID=yes  # no = masks must be resampled to the T1 grid (synth mode)
@@ -157,6 +158,34 @@ prep_freesurfer() {
     run mri_convert -rt nearest "$mri/aseg.mgz" "$W/dseg.nii.gz"
 }
 
+# crop_to_mask IMG MASK PAD_MM OUT : crop IMG to the bounding box of MASK
+# (same grid) plus PAD_MM on every side. fslroi only moves the origin, so
+# world coordinates - and everything later resampled with them - are unchanged.
+crop_to_mask() {
+    local img="$1" mask="$2" pad_mm="$3" out="$4" i dim pix pad lo hi
+    local box=() args=()
+    if is_yes "$DRY_RUN"; then
+        run fslroi "$img" "$out" 0 -1 0 -1 0 -1
+        return 0
+    fi
+    read -r -a box <<< "$(fslstats "$mask" -w)"   # xmin xsize ymin ysize zmin zsize tmin tsize
+    if [[ ${#box[@]} -lt 6 || "${box[1]}" -le 0 || "${box[3]}" -le 0 || "${box[5]}" -le 0 ]]; then
+        die "brain mask $mask is empty: skull stripping failed"
+    fi
+    for i in 0 1 2; do
+        dim="$(fslval "$img" "dim$((i + 1))" | tr -d ' ')"
+        pix="$(fslval "$img" "pixdim$((i + 1))" | tr -d ' ')"
+        pad="$(awk -v mm="$pad_mm" -v d="$pix" 'BEGIN { v = mm / d; printf "%d", (v > int(v)) ? int(v) + 1 : v }')"
+        lo=$(( box[2 * i] - pad ))
+        hi=$(( box[2 * i] + box[2 * i + 1] + pad ))
+        if [[ "$lo" -lt 0 ]]; then lo=0; fi
+        if [[ "$hi" -gt "$dim" ]]; then hi="$dim"; fi
+        args+=("$lo" "$(( hi - lo ))")
+    done
+    log INFO "SynthSeg input: brain box + ${pad_mm} mm = ${args[1]}x${args[3]}x${args[5]} voxels"
+    run fslroi "$img" "$out" "${args[@]}"
+}
+
 prep_synth() {
     local t1
     t1="$(subject_t1w "$SUB" || true)"
@@ -170,8 +199,14 @@ prep_synth() {
     # labels and masks are brought to the T1 grid.
     SEG="$W/synthseg_1mm.nii.gz"
     SEG_ON_T1_GRID=no
-    run mri_synthseg --i "$W/T1w.nii.gz" --o "$SEG" --robust --threads "$NTHREADS" --cpu \
-        --vol "$W/synthseg_volumes.csv" --qc "$W/synthseg_qc.csv"
+    # SynthSeg segments the whole field of view it is given: a head FOV padded
+    # to 192x256x256 exhausts 12 GB of RAM with --robust. The brain box plus a
+    # margin keeps the brain and its surroundings at ~40% of the voxels.
+    crop_to_mask "$W/T1w.nii.gz" "$W/brain_mask.nii.gz" "$SYNTHSEG_PAD_MM" "$W/T1w_synthseg_input.nii.gz"
+    local flags=()
+    read -r -a flags <<< "$SYNTHSEG_FLAGS"
+    run mri_synthseg --i "$W/T1w_synthseg_input.nii.gz" --o "$SEG" ${flags[@]+"${flags[@]}"} \
+        --threads "$NTHREADS" --cpu --vol "$W/synthseg_volumes.csv" --qc "$W/synthseg_qc.csv"
     run antsApplyTransforms -d 3 -i "$SEG" -r "$W/T1w.nii.gz" -o "$W/dseg.nii.gz" \
         -n GenericLabel -t identity -u short
 }
@@ -329,8 +364,11 @@ if [[ "$ANAT_MODE" == freesurfer ]]; then
     # a rebuilt reconstruction (new 01 marker) invalidates everything derived from it
     DEPS=(--dep 01_anat_recon)
 fi
-if ! stage_should_run "$STAGE" "$SUB" ${DEPS[@]+"${DEPS[@]}"} -- \
-        ANAT_MODE WM_ERODE CSF_ERODE TEMPLATE_NAME NORM_QUALITY ANTS_SEED; then
+HASH_VARS=(ANAT_MODE WM_ERODE CSF_ERODE TEMPLATE_NAME NORM_QUALITY ANTS_SEED)
+if [[ "$ANAT_MODE" == synth ]]; then
+    HASH_VARS+=(SYNTHSEG_FLAGS)
+fi
+if ! stage_should_run "$STAGE" "$SUB" ${DEPS[@]+"${DEPS[@]}"} -- "${HASH_VARS[@]}"; then
     if outputs_complete; then
         exit 0
     fi
@@ -341,7 +379,7 @@ require_cmds mri_binarize fslmaths fslstats antsApplyTransforms CreateJacobianDe
 if [[ "$ANAT_MODE" == freesurfer ]]; then
     require_cmds mri_convert mris_euler_number
 else
-    require_cmds N4BiasFieldCorrection mri_synthstrip mri_synthseg
+    require_cmds N4BiasFieldCorrection mri_synthstrip mri_synthseg fslroi fslval
 fi
 check_license
 is_yes "$DRY_RUN" || fp_check_mem

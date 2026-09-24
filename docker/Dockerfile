@@ -15,6 +15,11 @@ RUN for tool in recon-all fslmaths fslstats mri_binarize antsRegistration antsAp
     lta_diff lta_convert rmsdiff parallel; do command -v "$tool" || exit 1; done && \
     /opt/micromamba/envs/neuro/bin/python -c 'import numpy, scipy, pandas, nibabel, nilearn, sklearn, matplotlib, jinja2, templateflow'
 RUN mkdir -p /opt/fmriproc /data /out /config && chmod 755 /opt/fmriproc /data /out /config
+# AFNI lives in /root/abin, but /root is drwx------ in the base image: Singularity/
+# Apptainer run as the calling (non-root) user, and every 3d* program would be
+# "not found". Open /root and prove the toolchain works for an unprivileged user.
+RUN chmod 755 /root && \
+    su -s /bin/bash nobody -c 'HOME=/tmp bash -lc "command -v 3dTproject 3dTshift 3dDespike recon-all mri_synthseg antsApplyTransforms wb_command >/dev/null && 3dTstat -help >/dev/null"'
 ENV PYTHON_BIN=/opt/micromamba/envs/neuro/bin/python \
     PYTHONDONTWRITEBYTECODE=1 \
     MPLBACKEND=Agg \

@@ -436,6 +436,45 @@ preflight() {
     fi
 }
 
+# A run executes a frozen copy of the code (logs/code_<run>): bash reads scripts
+# incrementally, so editing the repository during a long run would otherwise
+# corrupt the stage that is executing and mix code versions between stages. The
+# copy, its md5 manifest and the git revision document what produced the results.
+freeze_code() {
+    local dest="$LOG_DIR/code_${FP_RUN_ID}" item rel
+    if is_yes "$DRY_RUN" || ! is_yes "${FREEZE_CODE:-yes}"; then
+        return 0
+    fi
+    mkdir -p "$dest"
+    cp "$SELF" "$dest/run_pipeline.sh"
+    for item in lib py config parcellations; do
+        if [[ -d "$REPO_DIR/$item" ]]; then
+            cp -R "$REPO_DIR/$item" "$dest/$item"
+        fi
+    done
+    cp -R "$STAGE_DIR" "$dest/stages"          # the stage directory in use (tests: fake stages)
+    find "$dest" -name __pycache__ -type d -prune -exec rm -rf {} +
+    (cd "$dest" && find . -type f ! -name code_manifest.md5 -print0 | sort -z | xargs -0 md5sum) > "$dest/code_manifest.md5"
+    if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse HEAD > "$dest/git_revision.txt" 2>/dev/null; then
+        git -C "$REPO_DIR" status --porcelain --untracked-files=no 2>/dev/null | sed 's/^/modified: /' >> "$dest/git_revision.txt" || true
+    else
+        rm -f "$dest/git_revision.txt"
+    fi
+    # the dataset conf is frozen as well: same relative path inside the
+    # repository, otherwise a copy next to the code
+    case "$FMRIPROC_CONFIG" in
+        "$REPO_DIR"/*) rel="${FMRIPROC_CONFIG#"$REPO_DIR"/}" ;;
+        *) rel="config/external/$(basename "$FMRIPROC_CONFIG")"
+           mkdir -p "$dest/config/external"
+           cp "$FMRIPROC_CONFIG" "$dest/$rel" ;;
+    esac
+    FMRIPROC_CONFIG="$dest/$rel"
+    SELF="$dest/run_pipeline.sh"
+    STAGE_DIR="$dest/stages"
+    export FMRIPROC_CONFIG FMRIPROC_STAGE_DIR="$STAGE_DIR"
+    log INFO "code frozen for this run: $dest"
+}
+
 write_tool_versions() {
     local out="$LOG_DIR/tool_versions.json" tmp="$LOG_DIR/.tool_versions.$$.json"
     if is_yes "$DRY_RUN"; then
@@ -697,6 +736,7 @@ orchestrate() {
     log INFO "N_JOBS=$N_JOBS NTHREADS=$NTHREADS FORCE=$FORCE DRY_RUN=$DRY_RUN SKIP_EXISTING=$SKIP_EXISTING"
 
     preflight
+    freeze_code
     write_tool_versions
 
     if stage_selected ingest; then

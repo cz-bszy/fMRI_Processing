@@ -215,6 +215,17 @@ class GroupReportTest(TempDirCase):
         self.assertTrue((empty / "group" / "group_report.html").is_file())
         self.assertEqual(len(read_tsv(empty / "group" / "group_qc.tsv")), 0)
 
+    def test_group_without_metrics_with_configured_names(self) -> None:
+        # stage 09 always passes the configured strategies/atlases, also when every
+        # subject failed upstream: QC-FC must then report nothing instead of crashing
+        empty = self.tmp / "empty_derivatives2"
+        empty.mkdir()
+        rc = group_report.main(["--deriv-dir", str(empty), "--template", TPL, "--strategies", "wmcsf24 wmcsf24gsr",
+                                "--atlases", "Schaefer2018_100Parcels_7Networks"])
+        self.assertEqual(rc, 0)
+        self.assertTrue((empty / "group" / "group_report.html").is_file())
+        self.assertFalse(list((empty / "group").glob("qcfc_*.tsv")))
+
 
 class GroupHelpersTest(unittest.TestCase):
     def test_robust_z_and_outliers(self) -> None:

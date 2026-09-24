@@ -506,6 +506,72 @@ class HeaderOddities(TreeCase):
         self.assertNotIn("sub-02", manifest.index)
 
 
+AFNI_XML = (b'<?xml version="1.0" ?>\n<AFNI_attributes self_idcode="XYZ">\n'
+            b'<AFNI_atr atr_name="TAXIS_FLOATS" ni_type="float" ni_dimen="5">0 1 0 0 0</AFNI_atr>\n'
+            b'</AFNI_attributes>\n')
+
+
+def make_afni_image(path: Path, shape: tuple[int, ...], tr: float = 2.0) -> np.ndarray:
+    """int16 image with an AFNI extension (ecode 4) claiming TR 1 s, like ABIDEII-GU_1."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.random.default_rng(7).integers(0, 1000, size=shape).astype(np.int16)
+    img = nib.Nifti1Image(data, AFFINE)
+    img.set_qform(AFFINE, code=1)
+    img.set_sform(AFFINE, code=1)
+    if len(shape) == 4:
+        img.header.set_xyzt_units("mm", "sec")
+        img.header["pixdim"][4] = tr
+    img.header.extensions.append(nib.nifti1.Nifti1Extension(4, AFNI_XML))
+    nib.save(img, str(path))
+    return data
+
+
+class AfniExtensionRegression(TreeCase):
+    """AFNI reads TR/view from an AFNI extension instead of the NIfTI header, so a
+    stale one (ABIDEII-GU_1: TR 1 s against a 2 s header) made stage 03 skip
+    verified slice timing. The rawdata copies must not carry it."""
+
+    def assert_clean_copy(self, path: Path, data: np.ndarray) -> None:
+        self.assertEqual(int(raw_header(path)["vox_offset"]), 352)
+        img = nib.load(str(path))
+        self.assertEqual(len(img.header.extensions), 0)
+        np.testing.assert_array_equal(np.asanyarray(img.dataobj), data)
+
+    def test_dpabi_bold_and_t1_lose_the_extension(self) -> None:
+        bold = make_afni_image(self.input / "SITE_A" / "FunImg" / "sub-0001" / "rest.nii.gz", (6, 6, 5, 32))
+        t1 = make_afni_image(self.input / "SITE_A" / "T1Img" / "sub-0001" / "anat.nii.gz", (8, 8, 8))
+        self.assertTrue(ingest.afni_extension_present(self.input / "SITE_A" / "FunImg" / "sub-0001" / "rest.nii.gz"))
+        code, out = run_ingest("--input-dir", str(self.input), "--layout", "dpabi", "--raw-dir", str(self.raw),
+                               "--acq-table", str(self.table), "--task", "rest")
+        self.assertEqual(code, 0, out)
+        row = self.manifest().loc["sub-0001"]
+        self.assert_clean_copy(Path(row["bold"]), bold)
+        self.assert_clean_copy(Path(row["t1w"]), t1)
+        self.assertAlmostEqual(float(raw_header(Path(row["bold"]))["pixdim"][4]), 2.0)
+        self.assertIn("AFNI NIfTI extension removed", self.report().loc["sub-0001", "header_changes"])
+        self.assertEqual(self.report().loc["sub-0001", "stc_decision"], "apply")
+
+    def test_bids_image_with_extension_is_copied_not_linked(self) -> None:
+        root = self.input
+        bold = make_afni_image(root / "sub-01" / "func" / "sub-01_task-rest_bold.nii.gz", (6, 6, 5, 32))
+        (root / "sub-01" / "func" / "sub-01_task-rest_bold.json").write_text(
+            json.dumps({"RepetitionTime": 2.0}), encoding="utf-8")
+        make_image(root / "sub-01" / "anat" / "sub-01_T1w.nii.gz", (8, 8, 8))
+        code, out = run_ingest("--input-dir", str(root), "--layout", "bids", "--raw-dir", str(self.raw),
+                               "--task", "rest")
+        self.assertEqual(code, 0, out)
+        target = Path(self.manifest().loc["sub-01", "bold"])
+        self.assertTrue(str(target).startswith(str(self.raw)), target)
+        self.assertFalse(target.is_symlink())
+        self.assert_clean_copy(target, bold)
+        # rerun: the copy is current, nothing is rewritten
+        before = target.stat().st_mtime_ns
+        code, out = run_ingest("--input-dir", str(root), "--layout", "bids", "--raw-dir", str(self.raw),
+                               "--task", "rest")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(target.stat().st_mtime_ns, before)
+
+
 class SmallHelpers(unittest.TestCase):
     def test_time_units_rewrite_keeps_valid_spatial_code(self) -> None:
         header = nib.Nifti1Header()

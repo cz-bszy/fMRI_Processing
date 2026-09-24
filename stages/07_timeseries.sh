@@ -154,9 +154,12 @@ volume_series() {
 # cifti_series RUN DESC NAME DLABEL LABELS CENSOR WORKDIR [extra args]
 #   DESC = a denoising strategy, or "preproc" for the pre-denoise dense series.
 cifti_series() {
-    local run="$1" strat="$2" name="$3" dlabel="$4" labels="$5" censor="$6" work="$7" dt pt tmp
+    local run="$1" strat="$2" name="$3" dlabel="$4" labels="$5" censor="$6" work="$7" dt pt tmp sampled
     shift 7
     dt="$(func_dir "$SUB")/${run}_space-fsLR_den-91k_desc-${strat}_bold.dtseries.nii"
+    # grayordinates filled in by the surface dilation are no coverage (stage 06)
+    sampled="$(func_dir "$SUB")/${run}_space-fsLR_den-91k_desc-sampled_mask.dscalar.nii"
+    [[ -s "$sampled" ]] || sampled=none
     check_inputs "$dt"
     pt="$work/${name}_desc-${strat}.ptseries.nii"
     tmp="$work/.tmp$$_${name}_desc-${strat}.ptseries.nii"
@@ -173,6 +176,7 @@ cifti_series() {
     # --dtseries: the coverage rule of the volume stream (principle 8) also holds
     # for parcels that are partly outside the field of view of the EPI.
     pyrun timeseries cifti --ptseries "$pt" --dlabel "$dlabel" --dtseries "$dt" --labels "$labels" \
+        --sampled-mask "$sampled" \
         --censor "$censor" --censor-mode "$CENSOR_MODE" --min-coverage "$MIN_ROI_COVERAGE" \
         --atlas-name "$name" --strategy "$strat" \
         --out-prefix "$(func_dir "$SUB")/${run}_space-fsLR_atlas-${name}_desc-${strat}" "$@"
