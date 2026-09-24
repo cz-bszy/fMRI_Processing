@@ -111,7 +111,11 @@ subject_main() {
 
 group_main() {
     # No skip logic: the step takes seconds and its inputs are every subject's tables.
-    pyrun compare_streams --deriv-dir "$DERIV_DIR" --manifest "$MANIFEST" --out-dir "$DERIV_DIR/group"
+    # The comparisons use the runs kept by the inclusion criteria (EXCLUDE_*).
+    local inclusion=()
+    mapfile -t inclusion < <(inclusion_args)
+    pyrun compare_streams --deriv-dir "$DERIV_DIR" --manifest "$MANIFEST" --out-dir "$DERIV_DIR/group" \
+        "${inclusion[@]}"
     log OK "$STAGE --group finished: $DERIV_DIR/group/validation_report.html"
 }
 

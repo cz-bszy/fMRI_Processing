@@ -1,6 +1,8 @@
 """Tests of fmriproc.confounds (stage 04) on tiny synthetic data."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -276,6 +278,43 @@ class TestCensor(unittest.TestCase):
         censor = confounds.censor_vector(np.zeros(4), np.array([0.0, np.nan, np.nan, np.nan]), 0.5, False, 1.5)
         self.assertTrue(np.all(censor == 1))
 
+    def test_frames_after(self) -> None:
+        censor = confounds.censor_vector(self.FD, self.DV, 0.5, False, 0.0, censor_next=2)
+        np.testing.assert_array_equal(censor, [1, 1, 0, 0, 0, 0, 0, 0, 1])
+        # with prev as well, Power et al. 2014 style (1 before, 2 after)
+        censor = confounds.censor_vector(self.FD, self.DV, 0.5, True, 0.0, censor_next=2)
+        np.testing.assert_array_equal(censor, [1, 0, 0, 0, 0, 0, 0, 0, 1])
+        # frames after the end of the run are ignored; next extends FD only, not DVARS
+        censor = confounds.censor_vector(np.array([0.0, 0.1, 0.9]), np.zeros(3), 0.5, False, 0.0, censor_next=5)
+        np.testing.assert_array_equal(censor, [1, 1, 0])
+        censor = confounds.censor_vector(self.FD, self.DV, 0.0, False, 2.0, censor_next=2)
+        np.testing.assert_array_equal(censor, [1, 1, 1, 1, 1, 1, 1, 0, 1])
+
+    def test_minimum_segment(self) -> None:
+        # kept stretches: 0-1 (2 frames), 3-4 (2), 6-8 (3)
+        censor = confounds.censor_vector(self.FD, self.DV, 0.5, False, 0.0, min_segment=3)
+        np.testing.assert_array_equal(censor, [0, 0, 0, 0, 0, 0, 1, 1, 1])
+        censor = confounds.censor_vector(self.FD, self.DV, 0.5, False, 0.0, min_segment=4)
+        self.assertTrue(np.all(censor == 0))
+        # a run without censored frames is never shortened
+        censor = confounds.censor_vector(np.zeros(4), np.zeros(4), 0.5, False, 0.0, min_segment=10)
+        self.assertTrue(np.all(censor == 1))
+        # 0 and 1 switch the rule off
+        for value in (0, 1):
+            censor = confounds.censor_vector(self.FD, self.DV, 0.5, False, 0.0, min_segment=value)
+            np.testing.assert_array_equal(censor, [1, 1, 0, 1, 1, 0, 1, 1, 1])
+
+    def test_short_segments_helper(self) -> None:
+        keep = np.array([1, 0, 1, 1, 0, 1, 1, 1, 0, 1], dtype=bool)
+        np.testing.assert_array_equal(confounds.short_segments(keep, 3),
+                                      [1, 0, 1, 1, 0, 0, 0, 0, 0, 1])
+
+    def test_negative_options_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            confounds.censor_vector(self.FD, self.DV, 0.5, False, 0.0, censor_next=-1)
+        with self.assertRaises(ValueError):
+            confounds.censor_vector(self.FD, self.DV, 0.5, False, 0.0, min_segment=-2)
+
 
 class TestCli(unittest.TestCase):
     """The whole module on a 6x6x5x60 series."""
@@ -418,6 +457,24 @@ class TestCli(unittest.TestCase):
     def test_no_censoring(self) -> None:
         self.assertEqual(confounds.main(self._argv(**{"--censor-fd": "0"})), 0)
         self.assertEqual(set(self.paths["censor"].read_text(encoding="ascii").split()), {"1"})
+
+    def test_frames_after_and_minimum_segment_options(self) -> None:
+        self.assertEqual(confounds.main(self._argv(**{"--censor-next": "2", "--censor-min-segment": "5"})), 0)
+        meta = json.loads(self.paths["json"].read_text(encoding="utf-8"))
+        censor = read_tsv(self.paths["tsv"])["censor"].to_numpy()
+        self.assertEqual((meta["censor"]["next"], meta["censor"]["min_segment"]), (2, 5))
+        self.assertTrue(np.all(censor[30:34] == 0))           # the step at 30 and back at 31, plus 2 after
+        self.assertEqual(meta["censor"]["n_censored"], int((censor == 0).sum()))
+        # the defaults record the rules as off
+        self.assertEqual(confounds.main(self._argv()), 0)
+        meta = json.loads(self.paths["json"].read_text(encoding="utf-8"))
+        self.assertEqual((meta["censor"]["next"], meta["censor"]["min_segment"]), (0, 0))
+
+    def test_bad_option_values_exit_with_usage_error(self) -> None:
+        for option, value in (("--censor-next", "-1"), ("--censor-min-segment", "2.5")):
+            with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(io.StringIO()):
+                confounds.main(self._argv(**{option: value}))
+            self.assertEqual(caught.exception.code, 2)
 
     def test_empty_tissue_mask_gives_na(self) -> None:
         nib.save(nib.Nifti1Image(np.zeros(SHAPE, dtype=np.uint8), AFFINE), str(self.paths["csf"]))

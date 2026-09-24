@@ -7,6 +7,8 @@ Collects every ``<RUN>_desc-qc_metrics.json`` and writes into ``derivatives/grou
 
 * ``group_qc.tsv``       one row per run (subject, run, group/site from the manifest, every
                          flat metric, the flags, robust z-scores and outlier flags), worst runs first
+* ``inclusion.tsv``      the inclusion decision of every run, overall and per strategy, with
+                         the reasons (fmriproc.inclusion; nothing is deleted)
 * ``qcfc_<S>_<A>.tsv``   edge-wise QC-FC (Pearson r between mean FD and Fisher-z FC across subject means)
 * ``qcfc_summary.tsv``   % edges with p < 0.05 (uncorrected), median |r|, distance dependence
 * ``figures/*.png``      site-wise distributions, QC-FC figures
@@ -14,8 +16,9 @@ Collects every ``<RUN>_desc-qc_metrics.json`` and writes into ``derivatives/grou
 
 Robust z = 0.6745 (x - median) / MAD, within the site when it has at least
 ``--min-site-n`` runs, else across all runs; |z| > 3 is flagged.
-QC-FC averages Fisher-z FC and FD within subject before correlation. All available
-runs are included without automatic QC exclusion; site confounding remains possible.
+QC-FC averages Fisher-z FC and FD within subject before correlation, over the runs
+that the inclusion criteria keep for that strategy; site confounding remains possible.
+With --phenotype the report also compares exclusions and head motion between groups.
 """
 from __future__ import annotations
 
@@ -40,6 +43,7 @@ from jinja2 import BaseLoader, Environment, select_autoescape  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from scipy import ndimage, stats  # noqa: E402
 
+from fmriproc import inclusion as inc  # noqa: E402
 from fmriproc import utils  # noqa: E402
 from fmriproc.qc_metrics import FLAG_RANK, THRESHOLD_OPTIONS, THRESHOLDS, read_json_safe  # noqa: E402
 from fmriproc.report import fmt  # noqa: E402
@@ -58,8 +62,8 @@ DIST_METRICS = [
     ("tsnr_gm_median", "tSNR GM, pre-denoise"), ("dvars_std_mean", "standardised DVARS"), ("gcor", "GCOR"),
     ("coreg_dice", "coregistration Dice"), ("norm_dice", "normalisation Dice"), ("dropout_fraction", "dropout fraction"),
 ]
-ID_COLUMNS = ["subject", "session", "run", "group", "overall_flag", "n_fail", "n_warn", "n_outliers", "outlier_metrics",
-              "z_scope"]
+ID_COLUMNS = ["subject", "session", "run", "group", "pheno_group", "overall_flag", "included", "n_fail", "n_warn",
+              "n_outliers", "outlier_metrics", "z_scope"]
 
 NOTES = {
     "table": "每个 run 一行，按问题严重程度排序（overall fail 在前，其次 warn 数量和 outlier 数量）。z_* 为稳健 z 分数 "
@@ -68,8 +72,14 @@ NOTES = {
     "dist": "各 site 的指标分布（箱线图 + 每个 run 一个点，点的颜色为该 run 的 overall flag；黄 / 红虚线为 QC_* 的 warn / fail 阈值）。"
             "site 之间 tSNR、FD 的系统差异在多中心数据中很常见，后续统计分析需要把 site 作为协变量或做 harmonisation。",
     "qcfc": "QC-FC 使用独立被试：同人各 run 的 Fisher-z FC 与 FD 先分别取均值，再作相关。"
+            "只用纳入表中该策略为 yes 的 run（n_runs_excluded 为被剔除的 run 数）。"
             "表中同时保留原始 p 与边 family 内 BH q。距离相关仅描述，边之间不独立。"
-            "不按 QC flag 自动剔除；站点与样本构成可能混杂结果，不能仅按指标高低判定策略优劣。",
+            "站点与样本构成可能混杂结果，不能仅按指标高低判定策略优劣。",
+    "inclusion": "剔除标准事先写在 conf 里（EXCLUDE_*），对所有 run 和所有组用同一套。这里不删除任何数据："
+                 "决定写在 inclusion.tsv，组水平统计（QC-FC、stream 与策略比较）只用纳入的 run。"
+                 "剩余自由度按策略判断，所以一个 run 可能在某个策略下被剔除、在另一个策略下保留。"
+                 "临床样本中头动常与诊断和年龄相关，剔除越严，剩下的样本越可能偏向头动小、症状轻的被试："
+                 "请报告各组的剔除人数，比较剩余被试的平均 FD，并在组分析中把平均 FD 作为协变量。",
     "qcfc_missing": "QC-FC 需要足够多的独立被试（QCFC_MIN_SUBJECTS）；当前不足，已跳过。",
 }
 
@@ -115,6 +125,27 @@ footer { color:var(--muted); font-size:12px; text-align:center; padding:12px; }
 </div>
 {% if threshold_rows %}<p class="missing">flag thresholds (QC_*): {% for name, t in threshold_rows %}{{ name }} warn {{ t.warn | fmt }} / fail {{ t.fail | fmt }}{{ '; ' if not loop.last }}{% endfor %}</p>{% endif %}
 {% if validation_link %}<p>Stage-10 validation report: <a href="{{ validation_link }}">{{ validation_link }}</a></p>{% endif %}
+</section>
+
+<section><h2>Inclusion 纳入与剔除</h2><div class="note">{{ notes.inclusion }}</div>
+<p>criteria: {% if criteria %}{{ criteria | join('; ') }}{% else %}none (every run is included){% endif %}</p>
+<div class="tiles">
+  <div class="tile"><b>{{ inc.runs_included }}</b><span>runs included</span></div>
+  <div class="tile"><b>{{ inc.runs_excluded }}</b><span>runs excluded</span></div>
+  <div class="tile"><b>{{ inc.subjects_included }} / {{ inc.subjects_total }}</b><span>subjects with an included run</span></div>
+</div>
+{% if strategy_rows %}<table><tr><th>strategy</th><th>runs included</th><th>runs excluded</th></tr>
+{% for row in strategy_rows %}<tr><td>{{ row.strategy }}</td><td>{{ row.included }}</td><td>{{ row.excluded }}</td></tr>{% endfor %}</table>{% endif %}
+{% if excluded_rows %}<h3>runs with an exclusion 有剔除原因的 run（整个 run 或某个策略）</h3><div class="scroll"><table><tr><th>subject</th><th>run</th><th>site</th><th>pheno_group</th><th>reasons</th></tr>
+{% for row in excluded_rows %}<tr><td><a href="../{{ row.subject }}.html">{{ row.subject }}</a></td><td>{{ row.run }}</td><td>{{ row.group }}</td><td>{{ row.pheno_group }}</td><td style="text-align:left;white-space:normal">{{ row.reasons }}</td></tr>{% endfor %}</table></div>
+{% else %}<p class="missing">no run is excluded</p>{% endif %}
+{% if pheno_rows %}<h3>by phenotype group 按组比较（{{ pheno_source }}）</h3>
+<div class="scroll"><table><tr>{% for c in pheno_columns %}<th>{{ c }}</th>{% endfor %}</tr>
+{% for row in pheno_rows %}<tr>{% for c in pheno_columns %}<td>{{ row[c] | fmt }}</td>{% endfor %}</tr>{% endfor %}</table></div>
+{% if pheno_tests %}<p>{{ pheno_tests.groups }}: Mann-Whitney p (mean FD of the included subjects) = {{ pheno_tests.mannwhitney_p_fd_included | fmt }};
+Fisher exact p (subjects without an included run) = {{ pheno_tests.fisher_p_subjects_excluded | fmt }}</p>
+{% else %}<p class="missing">group tests need exactly two groups with at least {{ min_group }} subjects each</p>{% endif %}
+{% endif %}
 </section>
 
 <section><h2>Runs sorted by severity 按严重程度排序</h2><div class="note">{{ notes.table }}</div>
@@ -537,8 +568,8 @@ def names_from(table: pd.DataFrame, column: str, given: str) -> list[str]:
 
 
 def html_table(table: pd.DataFrame, strategies: list[str], atlases: list[str]) -> dict[str, Any]:
-    columns = ["subject", "run", "group", "overall_flag", "n_fail", "n_warn", "outlier_metrics", "fd_mean", "pct_censored",
-               "minutes_retained", "tsnr_gm_median", "coreg_dice", "norm_dice"]
+    columns = ["subject", "run", "group", "pheno_group", "overall_flag", "included", "n_fail", "n_warn", "outlier_metrics",
+               "fd_mean", "pct_censored", "minutes_retained", "tsnr_gm_median", "coreg_dice", "norm_dice"]
     columns += [f"{s}.dof_remaining" for s in strategies]
     if atlases:
         columns += [f"{s}.{atlases[0]}.roi_tsnr_median" for s in strategies]
@@ -553,21 +584,74 @@ def html_table(table: pd.DataFrame, strategies: list[str], atlases: list[str]) -
     return {"columns": columns, "rows": rows}
 
 
+def load_phenotype(args: argparse.Namespace) -> dict[str, str] | None:
+    """None without --phenotype; a missing file or column is an error (it was configured)."""
+    if not args.phenotype:
+        return None
+    path = Path(args.phenotype)
+    if not path.is_file():
+        raise ValueError(f"phenotype table not found: {path}")
+    return inc.read_phenotype(path, args.phenotype_id_column, args.phenotype_group_column,
+                              inc.parse_labels(args.phenotype_labels))
+
+
+def inclusion_view(decision: pd.DataFrame, strategies: list[str]) -> dict[str, Any]:
+    """Template variables of the inclusion section."""
+    view: dict[str, Any] = {"inc": {"runs_included": 0, "runs_excluded": 0, "subjects_included": 0, "subjects_total": 0},
+                            "strategy_rows": [], "excluded_rows": [], "pheno_rows": [], "pheno_columns": [],
+                            "pheno_tests": {}}
+    if decision.empty:
+        return view
+    kept = decision["included"] == "yes"
+    view["inc"] = {"runs_included": int(kept.sum()), "runs_excluded": int((~kept).sum()),
+                   "subjects_included": int(decision.loc[kept, "subject"].nunique()),
+                   "subjects_total": int(decision["subject"].nunique())}
+    for strategy in strategies:
+        column = f"included_{strategy}"
+        if column in decision.columns:
+            n_yes = int((decision[column] == "yes").sum())
+            view["strategy_rows"].append({"strategy": strategy, "included": n_yes, "excluded": len(decision) - n_yes})
+    flagged = decision[decision["reasons"] != "-"]
+    view["excluded_rows"] = flagged[["subject", "run", "group", "pheno_group", "reasons"]].to_dict("records")
+    pheno, tests = inc.motion_by_group(decision)
+    if not pheno.empty:
+        view["pheno_columns"] = list(pheno.columns)
+        view["pheno_rows"] = pheno.astype(object).where(pheno.notna(), None).to_dict("records")
+        view["pheno_tests"] = tests
+    return view
+
+
 def run(args: argparse.Namespace) -> int:
     deriv_dir = Path(args.deriv_dir)
     out_dir = Path(args.out_dir) if args.out_dir else deriv_dir / "group"
     fig_dir = out_dir / "figures"
     manifest = read_manifest(Path(args.manifest) if args.manifest else None)
+    try:
+        phenotype = load_phenotype(args)
+    except ValueError as err:
+        LOG.error("%s", err)
+        return 2
     table = collect_metrics(deriv_dir, manifest)
     if table.empty:
         LOG.warning("no *_desc-qc_metrics.json under %s: nothing to summarise", deriv_dir)
         table = pd.DataFrame(columns=["subject", "session", "run", "group", "overall_flag", "n_fail", "n_warn"])
+    if phenotype is not None:
+        table = inc.attach_phenotype(table, phenotype)
+        unmatched = int((table["pheno_group"] == utils.NA).sum())
+        if unmatched:
+            LOG.warning("%d run(s) have no row in the phenotype table %s", unmatched, args.phenotype)
+    strategies = names_from(table, "strategies", args.strategies)
+    atlases = names_from(table, "atlases", args.atlases)
+    criteria = inc.criteria_from_args(args)
+    decision = inc.decide(table, criteria, strategies)
+    if not table.empty:
+        table = table.merge(decision[["run", "included"]], on="run", how="left")
     table = sort_by_severity(add_outliers(table, args.min_site_n))
     out_dir.mkdir(parents=True, exist_ok=True)
     utils.write_tsv(out_dir / "group_qc.tsv", table)
-
-    strategies = names_from(table, "strategies", args.strategies)
-    atlases = names_from(table, "atlases", args.atlases)
+    utils.write_tsv(out_dir / "inclusion.tsv", decision)
+    LOG.info("inclusion: %d of %d run(s) included (%s)", int((decision["included"] == "yes").sum()) if len(decision) else 0,
+             len(decision), "; ".join(criteria.describe()) or "no criteria")
     template = args.template or (str(table["template"].dropna().iloc[0]) if "template" in table and table["template"].notna().any() else "")
     volumes = parse_pairs(args.atlas_volume)
     for atlas in atlases:
@@ -590,7 +674,10 @@ def run(args: argparse.Namespace) -> int:
     for atlas in atlases:
         per_strategy: dict[str, pd.DataFrame] = {}
         for strategy in strategies:
-            edges, summary = qcfc(deriv_dir, table, template, strategy, atlas, volumes.get(atlas), args.qcfc_min_subjects)
+            keep = inc.included_runs(decision, strategy)
+            chosen = table[table["run"].astype(str).isin(keep)] if len(table) else table
+            edges, summary = qcfc(deriv_dir, chosen, template, strategy, atlas, volumes.get(atlas), args.qcfc_min_subjects)
+            summary["n_runs_excluded"] = int(len(table) - len(chosen))
             available = max(available, int(summary["n_subjects"]))
             if edges is None:
                 continue
@@ -617,6 +704,9 @@ def run(args: argparse.Namespace) -> int:
         qcfc_available=available, qcfc_min=args.qcfc_min_subjects,
         threshold_rows=[(name, {"warn": spec[1], "fail": spec[2]}) for name, spec in thresholds.items()],
         validation_link="validation_report.html" if (out_dir / "validation_report.html").is_file() else None,
+        criteria=criteria.describe(), min_group=inc.MIN_GROUP_SUBJECTS,
+        pheno_source=f"{Path(args.phenotype).name}: {args.phenotype_group_column}" if args.phenotype else "",
+        **inclusion_view(decision, strategies),
     )
     utils._atomic_write(out_dir / "group_report.html", html)
     LOG.info("group QC: %d runs -> %s", len(table), out_dir / "group_report.html")
@@ -638,6 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="atlas label volume in template space (custom atlases; wins over --atlas-dir); repeatable")
     parser.add_argument("--qcfc-min-subjects", type=int, default=10)
     parser.add_argument("--min-site-n", type=int, default=5, help="runs per site needed for within-site z-scores")
+    inc.add_arguments(parser)
     for name, (_, warn, fail) in THRESHOLDS.items():
         stem = THRESHOLD_OPTIONS[name]
         parser.add_argument(f"--qc-{stem}-warn", type=float, default=warn, help=f"{name}: warn threshold (lines in the plots)")

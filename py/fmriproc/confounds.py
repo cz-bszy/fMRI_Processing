@@ -165,15 +165,41 @@ def compute_dvars(series: np.ndarray, variance_tol: float = 1e-7) -> tuple[np.nd
     return dvars, std_dvars
 
 
+def short_segments(keep: np.ndarray, min_length: int) -> np.ndarray:
+    """True for kept frames inside a stretch of fewer than min_length consecutive kept frames."""
+    keep = np.asarray(keep, dtype=bool)
+    out = np.zeros(keep.size, dtype=bool)
+    start = None
+    for index, kept in enumerate(np.r_[keep, False]):
+        if kept and start is None:
+            start = index
+        elif not kept and start is not None:
+            if index - start < min_length:
+                out[start:index] = True
+            start = None
+    return out
+
+
 def censor_vector(
     fd: np.ndarray,
     std_dvars: np.ndarray,
     fd_threshold: float,
     censor_prev: bool,
     dvars_threshold: float,
+    censor_next: int = 0,
+    min_segment: int = 0,
 ) -> np.ndarray:
-    """1 = keep, 0 = censored. A threshold <= 0 switches that criterion off."""
+    """1 = keep, 0 = censored. A threshold <= 0 switches that criterion off.
+
+    censor_prev: also the frame before a high-FD frame; censor_next: also that many
+    frames after it (spin history; Power et al. 2014 used 2). Both extend the FD
+    criterion only. min_segment: kept stretches shorter than this many frames are
+    censored as well (Power et al. 2014 used 5); applied last, and only when
+    something is censored at all.
+    """
     fd = np.asarray(fd, dtype=np.float64)
+    if censor_next < 0 or min_segment < 0:
+        raise ValueError(f"censor_next and min_segment must not be negative: {censor_next}, {min_segment}")
     bad = np.zeros(fd.size, dtype=bool)
     if fd_threshold > 0:
         bad_fd = fd > fd_threshold
@@ -181,9 +207,13 @@ def censor_vector(
         if censor_prev:
             # FD[t] is the movement between t-1 and t, so t-1 is affected as well
             bad[:-1] |= bad_fd[1:]
+        for shift in range(1, min(int(censor_next), fd.size - 1) + 1):
+            bad[shift:] |= bad_fd[:-shift]
     if dvars_threshold > 0:
         with np.errstate(invalid="ignore"):
             bad |= np.asarray(std_dvars, dtype=np.float64) > dvars_threshold
+    if min_segment > 1 and bad.any():
+        bad |= short_segments(~bad, int(min_segment))
     return (~bad).astype(np.int64)
 
 
@@ -241,6 +271,8 @@ def build_confounds(
     censor_fd: float,
     censor_prev: bool,
     censor_dvars: float,
+    censor_next: int = 0,
+    censor_min_segment: int = 0,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """series: (T, V) over the union of the three masks; in_*: boolean columns selectors."""
     n_t = series.shape[0]
@@ -316,9 +348,11 @@ def build_confounds(
         for key in expanded:
             meta[key] = {"Description": f"head-motion {base} (mcflirt, estimated before STC)" + _expansion_text(key, name), "Units": unit}
 
-    censor = censor_vector(fd, std_dvars, censor_fd, censor_prev, censor_dvars)
+    censor = censor_vector(fd, std_dvars, censor_fd, censor_prev, censor_dvars,
+                           censor_next=censor_next, min_segment=censor_min_segment)
     columns["censor"] = censor
-    meta["censor"] = _censor_summary(censor, tr, censor_fd, censor_prev, censor_dvars)
+    meta["censor"] = _censor_summary(censor, tr, censor_fd, censor_prev, censor_dvars,
+                                     censor_next, censor_min_segment)
     meta["acompcor"] = {
         "n_wm_voxels": acompcor_meta.pop("n_wm_voxels"),
         "n_csf_voxels": acompcor_meta.pop("n_csf_voxels"),
@@ -339,13 +373,16 @@ def _expansion_text(key: str, name: str) -> str:
     }[suffix]
 
 
-def _censor_summary(censor: np.ndarray, tr: float, fd_thr: float, prev: bool, dvars_thr: float) -> dict[str, Any]:
+def _censor_summary(censor: np.ndarray, tr: float, fd_thr: float, prev: bool, dvars_thr: float,
+                    next_frames: int = 0, min_segment: int = 0) -> dict[str, Any]:
     n_t = int(censor.size)
     n_censored = int(np.sum(censor == 0))
     return {
         "Description": "1 = frame kept, 0 = frame censored",
         "fd_threshold": fd_thr,
         "prev": bool(prev),
+        "next": int(next_frames),
+        "min_segment": int(min_segment),
         "dvars_threshold": dvars_thr,
         "n_censored": n_censored,
         "n_volumes": n_t,
@@ -392,6 +429,7 @@ def run(args: argparse.Namespace) -> None:
         series, in_brain, in_wm, in_csf, motion, relrms, outliers,
         tr=args.tr, acompcor_n=args.acompcor_n, highpass_sec=args.highpass_sec,
         censor_fd=args.censor_fd, censor_prev=args.censor_prev, censor_dvars=args.censor_dvars,
+        censor_next=args.censor_next, censor_min_segment=args.censor_min_segment,
     )
     censor = frame["censor"].to_numpy()
     _atomic_write(Path(args.out_censor), "".join(f"{int(v)}\n" for v in censor))
@@ -415,6 +453,16 @@ def _yes_no(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"expected yes or no: {value}")
 
 
+def _non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number >= 0: {value}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a whole number >= 0: {value}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bold", required=True, type=Path, help="space-T1w desc-preproc BOLD (unsmoothed, scaled)")
@@ -430,6 +478,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--censor-fd", type=float, default=0.5, help="mm; 0 = off")
     parser.add_argument("--censor-prev", type=_yes_no, default=False, metavar="yes|no")
     parser.add_argument("--censor-dvars", type=float, default=0.0, help="standardised DVARS; 0 = off")
+    parser.add_argument("--censor-next", type=_non_negative_int, default=0,
+                        help="also censor this many frames after a high-FD frame; 0 = off")
+    parser.add_argument("--censor-min-segment", type=_non_negative_int, default=0,
+                        help="censor kept stretches shorter than this many frames; 0 = off")
     parser.add_argument("--out-tsv", required=True, type=Path)
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--out-censor", required=True, type=Path)

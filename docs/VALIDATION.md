@@ -38,7 +38,9 @@ Per run (`derivatives/sub-X/func/`):
 
 Group (`derivatives/group/`, `10_validate.sh --group`):
 
-* `validation_long.tsv` — 所有 run 的 long 表, 前置 `subject run_label group` (site 来自 manifest), 并追加 `fc_typicality` 行。
+* `validation_long.tsv` — 所有 run 的 long 表, 前置 `subject run_label group` (site 来自 manifest), 并追加 `fc_typicality` 行;
+  `included` 列为该 run × strategy 是否通过纳入标准 (`EXCLUDE_*`, 见 README 9.1; 没有 stage-08 指标时为 `n/a` 并保留)。
+  下面的组级比较只用纳入的 run。
 * `stream_comparison.tsv` — 每个 strategy × atlas × metric: `direction n median_volume median_surface median_diff
   n_surface_higher n_volume_higher wilcoxon_p significant better median_value`。
 * `strategy_comparison.tsv` — 每个 stream × atlas × metric × strategy: `n median q25 q75 best`。
@@ -355,7 +357,7 @@ FC 差异通常很小 (r > 0.95); 如果 IA 与 IA2 的差异小于"做 STC 与�
 | --- | --- |
 | `<RUN>_desc-validation.tsv` | `stream strategy atlas metric value` |
 | `<RUN>_desc-streamcompare.tsv` | `strategy atlas scope roi metric volume surface value` |
-| `group/validation_long.tsv` | `subject run_label group stream strategy atlas metric value` |
+| `group/validation_long.tsv` | `subject run_label group stream strategy atlas metric value included` |
 | `group/stream_comparison.tsv` | `strategy atlas metric direction n median_volume median_surface median_diff n_surface_higher n_volume_higher wilcoxon_p significant better median_value` |
 | `group/strategy_comparison.tsv` | `stream atlas metric direction strategy n median q25 q75 best` |
 | `group/fc_typicality.tsv` | `subject run_label group stream strategy atlas n_runs fc_typicality` |
@@ -385,11 +387,13 @@ confounding; it is not a causal estimate of motion artifact.
 `split_half_r` measures within-run first/second-half FC consistency, not test-retest
 reliability. Report the original retained duration and DOF alongside this value.
 
-`dof_remaining` is the algebraic residual dimension (`fit_rows - design_rank`),
-not an effective independent sample size. NTRP can have more fitted rows because
-it interpolates censored frames; this does not restore observed information.
-Retained observations, retained duration and censor fraction remain separate QC
-quantities. AFNI model feasibility is a distinct prerequisite from algebraic DOF.
+`dof_remaining` is censor-aware: retained frames minus the numerical rank of the
+joint design on the retained rows. It is not an effective independent sample size.
+NTRP also fits the interpolated censored frames; its larger algebraic count
+(`algebraic_dof = fit_rows - design_rank`) is recorded separately and does not
+restore observed information. Retained observations, retained duration and censor
+fraction remain separate QC quantities. AFNI model feasibility is a distinct
+prerequisite.
 
 Stage 08 requires the explicit stage-04 censor vector, including when every frame
 is retained. Missing, unreadable, nonbinary or mismatched censor vectors make

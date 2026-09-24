@@ -158,13 +158,66 @@ class GroupReportTest(TempDirCase):
         self.manifest = synth.write_manifest(self.tmp, [(s, r, g) for s, r, g, _ in self.ENTRIES])
         self.out_dir = self.deriv / "group"
 
-    def run_group(self, min_subjects: int) -> str:
+    # the synthetic runs are 2 minutes long: the default 4-minute criterion would exclude every run
+    KEEP_SHORT_RUNS = ("--exclude-min-retained-min", "0")
+
+    def run_group(self, min_subjects: int, *extra: str, expect: int = 0) -> str:
         rc = group_report.main(["--deriv-dir", str(self.deriv), "--manifest", str(self.manifest), "--out-dir", str(self.out_dir),
                                 "--template", TPL, "--strategies", " ".join(STRATEGIES), "--atlases", ATLAS,
                                 "--atlas-dir", str(self.atlas_dir), "--qcfc-min-subjects", str(min_subjects),
-                                "--qc-fd-mean-warn", "0.15", "--qc-fd-mean-fail", "0.25"])
-        self.assertEqual(rc, 0)
-        return (self.out_dir / "group_report.html").read_text(encoding="utf-8")
+                                "--qc-fd-mean-warn", "0.15", "--qc-fd-mean-fail", "0.25",
+                                *(extra or self.KEEP_SHORT_RUNS)])
+        self.assertEqual(rc, expect)
+        path = self.out_dir / "group_report.html"
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+    def test_default_criteria_exclude_short_runs(self) -> None:
+        html = self.run_group(3, "--exclude-fd-mean", "0.5")          # every other criterion at its default
+        decision = read_tsv(self.out_dir / "inclusion.tsv")
+        self.assertEqual(len(decision), 4)
+        self.assertTrue((decision["included"] == "no").all())
+        self.assertTrue(decision["reasons"].str.contains("retained 1.9 min < 4 min").all())
+        for strategy in STRATEGIES:
+            self.assertTrue((decision[f"included_{strategy}"] == "no").all())
+        self.assertFalse(list(self.out_dir.glob("qcfc_*.tsv")))      # QC-FC over included runs only: none
+        self.assertIn("runs excluded", html)
+        self.assertIn("&lt; 4 min retained after censoring", html)
+        self.assertEqual(read_tsv(self.out_dir / "group_qc.tsv")["included"].tolist(), ["no"] * 4)
+
+    def test_dof_criterion_is_judged_per_strategy(self) -> None:
+        # the synthetic DOF is 22 for the first strategy and 18 for the second
+        self.run_group(3, *self.KEEP_SHORT_RUNS, "--exclude-min-dof", "20")
+        decision = read_tsv(self.out_dir / "inclusion.tsv")
+        self.assertTrue((decision["included"] == "yes").all())
+        self.assertTrue((decision[f"included_{STRATEGIES[0]}"] == "yes").all())
+        self.assertTrue((decision[f"included_{STRATEGIES[1]}"] == "no").all())
+        self.assertTrue(decision["reasons"].str.contains(f"{STRATEGIES[1]}: DOF 18 < 20").all())
+        self.assertTrue((self.out_dir / f"qcfc_{STRATEGIES[0]}_{ATLAS}.tsv").is_file())
+        self.assertFalse((self.out_dir / f"qcfc_{STRATEGIES[1]}_{ATLAS}.tsv").exists())
+        summary = read_tsv(self.out_dir / "qcfc_summary.tsv")
+        self.assertEqual(summary["strategy"].tolist(), [STRATEGIES[0]])
+        self.assertEqual(int(summary["n_runs_excluded"].iloc[0]), 0)
+
+    def test_motion_criterion_and_phenotype_groups(self) -> None:
+        pheno = self.tmp / "phenotypic.csv"
+        pheno.write_text("SUB_ID,DX_GROUP\n1,1\n2,2\n3,2\n", encoding="utf-8")
+        html = self.run_group(3, *self.KEEP_SHORT_RUNS, "--exclude-fd-mean", "0.28", "--phenotype", str(pheno),
+                              "--phenotype-id-column", "SUB_ID", "--phenotype-group-column", "DX_GROUP",
+                              "--phenotype-labels", "1=ASD 2=TD")
+        decision = read_tsv(self.out_dir / "inclusion.tsv").set_index("run")
+        self.assertEqual(decision["pheno_group"].to_dict(), {r: {"sub-01": "ASD"}.get(s, "TD") for s, r, _, _ in self.ENTRIES})
+        excluded = decision.index[decision["included"] == "no"].tolist()
+        self.assertEqual(excluded, ["sub-03_task-rest_run-1"])         # FD level 0.30 plus censored spikes
+        self.assertIn("mean FD", decision.at["sub-03_task-rest_run-1", "reasons"])
+        self.assertIn("by phenotype group", html)
+        self.assertIn("group tests need exactly two groups", html)     # 1 and 2 subjects per group
+        self.assertIn("pheno_group", read_tsv(self.out_dir / "group_qc.tsv").columns)
+
+    def test_configured_phenotype_must_exist(self) -> None:
+        self.run_group(3, *self.KEEP_SHORT_RUNS, "--phenotype", str(self.tmp / "missing.csv"), expect=2)
+        pheno = self.tmp / "phenotypic.tsv"
+        pheno.write_text("participant_id\tdiagnosis\nsub-01\tASD\n", encoding="utf-8")
+        self.run_group(3, *self.KEEP_SHORT_RUNS, "--phenotype", str(pheno), expect=2)   # no column 'group'
 
     def test_group_table_qcfc_and_html(self) -> None:
         html = self.run_group(min_subjects=3)

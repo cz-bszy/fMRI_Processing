@@ -1,10 +1,10 @@
-# fMRI_Processing v2.1
+# fMRI_Processing v2.2
 
 面向低质量传统数据（TR 2–3 s、3–4 mm 体素、无 fieldmap、多数无 JSON sidecar：ABIDE、ADNI、DPABI 布局队列）的静息态 fMRI 预处理流水线。bash 阶段脚本 + 一个小型 Python 包（`py/fmriproc`），在容器 `zhaochang07/myubuntu:neuro-v2` 内运行。
 
 接口契约是 `docs/DESIGN.md`（文件名、目录、JSON 键、处理顺序、`lib/common.sh` API）；验证指标见 `docs/VALIDATION.md`，surface 分支见 `docs/SURFACE.md`，Docker/Singularity 的构建与运行见 `docker/README.md`。
 
-本轮升级限定当前 ABIDE 单回波静息态流程，所有测试在本地进行。v2.1 修复了 NTRP 拟合行与 DOF 定义、aCompCor DCT 基、具名 ROI 对齐、缺失 QC 的状态及重复 run 的伪重复；去噪输入中心化按 run × space 复用。实现通过合成测试不等于真实数据或跨软件版本验证，末尾记录当前验证边界。
+本轮升级限定当前 ABIDE 单回波静息态流程，所有测试在本地进行。v2.1 修复了 NTRP 拟合行与 DOF 定义、aCompCor DCT 基、具名 ROI 对齐、缺失 QC 的状态及重复 run 的伪重复；去噪输入中心化按 run × space 复用。实现通过合成测试不等于真实数据或跨软件版本验证，末尾记录当前验证边界。v2.2 在两名 ABIDE 被试上完成了端到端测试并修复了其中发现的问题；剩余自由度只数保留帧，新增删帧选项和组水平的纳入标准（§9.1）。版本变化见 `CHANGELOG.md`。
 
 ---
 
@@ -231,7 +231,7 @@ $OUT_DIR/
     <RUN>_desc-validation.{tsv,json}  [_desc-streamcompare.tsv]  _desc-qc_metrics.json  _atlas-<A>_desc-<S>_roiqc.tsv
   derivatives/sub-X/figures/                报告用 PNG
   derivatives/sub-X.html                    每被试 QC 报告
-  derivatives/group/  group_qc.tsv group_report.html qcfc_*.tsv qcfc_summary.tsv
+  derivatives/group/  group_qc.tsv inclusion.tsv group_report.html qcfc_*.tsv qcfc_summary.tsv
                       validation_long.tsv stream_comparison.tsv strategy_comparison.tsv fc_typicality.tsv
                       stream_comparison.png validation_report.html
   logs/sub-X/<stage>.log  logs/pipeline_<ts>.log  logs/status_<ts>.tsv  logs/tool_versions.json
@@ -308,13 +308,16 @@ $OUT_DIR/
 **DOF 记账**（`_denoise.json`）：
 
 ```
-dof_remaining = fit_rows − numerical_joint_design_rank
+dof_remaining    = N_retained − rank(joint design on the retained rows)   # 与 MIN_DOF 比较，删帧计入
+algebraic_dof    = fit_rows − rank(joint design)
 fit_rows = N                    # NTRP: 先插值，再拟合全时间轴
-fit_rows = N_retained            # ZERO/KILL: 只拟合保留行
+fit_rows = N_retained            # ZERO/KILL: 只拟合保留行，此时两者相等
 afni_nominal_dof = N_retained − design_columns
 ```
 
 设计包含 polynomial、AFNI Fourier stopband 和 nuisance 的联合列空间；aCompCor 保留 PCA 预滤波使用的全部 DCT，不能按频率假设它已被 Fourier 覆盖。秩阈值按 float32 设计精度记录。这里是代数残余维度，**不是有效样本量，也不是 AFNI 正则化平滑矩阵的有效自由度**。NTRP 插值不能恢复独立观测信息。AFNI 另要求至少 9 个保留观测且 nominal columns 少于保留观测；不满足会提前报错，不能用较低的联合秩绕过。
+v2.2 起 `dof_remaining` 只数保留帧：NTRP 的插值行参与拟合，但不提供观测信息，v2.1 把它们也算进去，
+每删一帧就多算一个自由度（例：GU_1 报告 24，实际 21）。`algebraic_dof` 仍记录拟合行的代数维度。
 
 以下仅是删帧前的 nominal 列数预算近似，用于说明短扫描限制，不是新 `dof_remaining` 的实测结果：
 
@@ -325,6 +328,48 @@ afni_nominal_dof = N_retained − design_columns
 | 296（300−4） | ≈ 189 | ≈ 78 | ≈ 68 | |
 
 默认仍为 `wmcsf24`/`wmcsf24gsr`、`CENSOR_FD=0.5`、`CENSOR_MODE=NTRP`。方法选择应基于扫描时长、噪声和目标 estimand，不能为通过 DOF 检查而自动切换滤波或删帧阈值。`dof_remaining < MIN_DOF` 标记为低 DOF；AFNI nominal gate 不满足则停止该策略。NTRP 输出保留时间轴，FC/QC 仍按显式 censor 向量使用原始保留观测；KILL 输出变短，按原始时间索引对齐。
+
+### 9.1 删帧与被试纳入
+
+FD 按时间点计算，删帧删的是时间点（stage 04 的 censor 向量）：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `CENSOR_FD` | 0.5 | FD（Power）超过此值的时间点被删除 |
+| `CENSOR_PREV` | no | 同时删除前一帧 |
+| `CENSOR_NEXT` | 0 | 同时删除之后 N 帧（Power 2014 用 2） |
+| `CENSOR_MIN_SEGMENT` | 0 | 连续保留段短于 N 帧的也删除（Power 2014 用 5），最后执行 |
+| `CENSOR_DVARS` | 0 | 标准化 DVARS 阈值 |
+
+短扫描加带通时，每删一帧就少一个自由度。在 2026-09-24 测试的两名 ABIDE 被试上（150/176 帧，TR 2 s，wmcsf24）：
+
+| 规则 | GU_1 删帧 / 实际自由度（带通 / 高通） | NYU_2 删帧 / 实际自由度（带通 / 高通） |
+|---|---|---|
+| FD > 0.5 mm（默认） | 2% / 21 / 112 | 0.6% / 33 / 140 |
+| FD > 0.3 mm | 8% / 12 / 103 | 4% / 27 / 134 |
+| FD > 0.2 mm | 25% / −13 / 78 | 18% / 3 / 110 |
+| Power 2014 全套（0.2 mm，前 1 后 2，短段 < 5） | 63% / −71 / 20 | 49% / −53 / 54 |
+
+所以带通为默认时保持 FD > 0.5 mm；更严格的删帧要配合高通（`FILTER_MODE=highpass`），并作为敏感性分析。
+滤波方式对整个数据集只能选一种，不能按被试切换。
+
+被试（run）纳入由 stage 09 与 10 `--group` 判断（`fmriproc/inclusion.py`）。不删除任何数据：决定和原因写在
+`derivatives/group/inclusion.tsv`，组水平统计（QC-FC、stream 与策略比较）只用纳入的 run，`validation_long.tsv` 保留所有 run 并标 `included`。
+
+| 变量 | 默认 | 剔除条件（0 = 关闭） |
+|---|---|---|
+| `EXCLUDE_FD_MEAN` | 0.5 | 平均 FD > 0.5 mm（Parkes 2018：宽松 0.55，严格 0.25） |
+| `EXCLUDE_FD_MAX` | 5 | 任一时间点 FD > 5 mm |
+| `EXCLUDE_PCT_FD_GT02` | 0 | FD > 0.2 mm 的时间点比例（Parkes 2018 严格：20%） |
+| `EXCLUDE_MIN_RETAINED_MIN` | 4 | 删帧后保留不足 4 分钟 |
+| `EXCLUDE_MIN_DOF` | 15 | 实际自由度不足，按策略分别判断 |
+| `EXCLUDE_QC_FAIL` | yes | run 级 QC flag 为 fail 或 incomplete（配准、标准化、tSNR、Euler holes、删帧比例） |
+
+- **标准要在看结果之前写定**，所有组用同一套；更严格的标准只做敏感性分析。
+- **严格标准对 TR 2 s 数据很苛刻。** GU_1 平均 FD 只有 0.17 mm，却有 25% 的时间点超过 0.2 mm，会被"超过 20%"的标准剔除。
+- **临床样本的头动常与诊断和年龄相关。** 剔除越严，剩下的样本越偏向头动小、症状轻的被试。设置 `PHENOTYPE_TSV` 后组报告会按组比较剔除人数和剩余被试的平均 FD（Mann-Whitney、Fisher 精确检验）。ABIDE 表型文件：`PHENOTYPE_ID_COLUMN=SUB_ID`、`PHENOTYPE_GROUP_COLUMN=DX_GROUP`、`PHENOTYPE_LABELS="1=ASD 2=TD"`。测试集自带的 `dpabi_parameters_by_subject.csv`（`SUB_ID`，`group` = ASD/TDC）在数据目录中存在时，三个 ABIDE conf 会自动使用它。组分析中把平均 FD 作为协变量。
+- **DPABI 相关文献多用 Jenkinson FD。** 它的数值比这里的 Power FD 小，两种阈值不能混用。
+- **TR 3 s 的数据帧间隔更长，FD 通常更大。** 可以在该数据集的 conf 里单独设阈值。
 
 ## 10. Surface 分支注意事项
 
@@ -388,7 +433,7 @@ PYTHONPATH=py python -m unittest tests.test_validate -v
 - surface 分支要求 freesurfer 模式与 `MNI_RES=2`；儿童/老年脑用成人模板与 recon-all 默认参数，`holes_total`、`norm_dice` 要单独审。
 - DPABI 布局要求每个被试文件夹恰好一个 NIfTI；少于 30 个 volume 的 run 被拒绝；QC-FC 需要 ≥ 10 名被试，stream 比较的检验需要 ≥ 6 名有配对结果的被试。
 - 没有 ICA-AROMA/tedana 之类的数据驱动去噪，没有 GPU 加速；单被试内部只靠 `NTHREADS`，短 run 的 DOF 预算见 §9。
-- v2.1 尚未在真实数据上端到端验证。2026-09-22 本地 Docker Desktop 启动日志显示 `dockerInference` 端点初始化失败、后台退出；不能据此断言镜像丢失或内存不足。未重置 Docker 数据或修改服务器。
+- v2.2 只在两名 ABIDE 被试上做过端到端验证（§15.2）；多站点大样本、ADNI（TR 3 s）和组水平统计尚未验证。2026-09-22 Docker Desktop 无法启动是残留的 AF_UNIX socket 造成的，处理方法见 `docker/README.md`，不需要重置 Docker 数据。
 - 原有未提交源代码的本地恢复副本：`archive/snapshots/2026-09-22_pipeline_upgrade/source.zip`（894782 字节）。未包含原始影像；本地副本可恢复，外部备份状态未验证。
 
 ## 15. 本地升级验证记录
@@ -404,15 +449,16 @@ PYTHONPATH=py python -m unittest tests.test_validate -v
 - `docker/Dockerfile.clean` 由真实 Neurodocker 2.1.2 经 `docker/generate_runtime.sh` 生成；生成时的工具依赖仅在临时目录解包，已清理。10 个 RUN shell 片段及关键 POSIX 路径检查通过。该干净环境是候选升级，AFNI/Workbench 的真实下载地址、版本和 SHA256 需在构建机显式提供；详见 `docker/README.md`。
 - 尚未完成：Docker 镜像 build、SIF 转换/实际挂载、真实 AFNI 联合设计对照、完整两人预处理、解剖/配准/表面目视 QC，以及真实运行时间和内存测量。它们不能由上述合成测试代替。后续应从当前源与这两个导入样本继续，不将原 ADNI pilot 记录当作此次 ABIDE v2.1 的验收结果。
 
-### 15.2 2026-09-24：两名被试端到端测试
+### 15.2 2026-09-24：两名被试端到端测试（v2.2）
 
 在 Windows 11 + Docker Desktop（VM 16 CPU / 11.7 GiB）上用现有镜像 `zhaochang07/myubuntu:neuro-v2` 完成。上面 15.1 列为未完成的完整两人预处理、目视 QC、运行时间和内存测量已在本轮完成。
 
-- **自动化测试**：`bash tests/run_tests.sh` 在主机和镜像内均全部通过。bash 检查 155 项；Python 单元测试 366 个，镜像内 0 跳过，主机上 8 个需要 Linux bash 的测试跳过。
-- **端到端**：`abide_smoke.conf`（synth，4 种去噪策略）和 `abide_local_fs.conf`（recon-all + surface）在 sub-0028744（GU_1）、sub-0029150（NYU_2）上所有阶段 ok。synth 每人约 6 min；FreeSurfer 每人约 90 min，其中 recon-all 74–80 min。容器内存峰值 7.0 GiB（SynthSeg，已裁剪），所以 12 GiB 的 VM 上保持 `N_JOBS=1`。
-- **QC**：4 个 run 没有 fail，唯一的 warn 是 GU_1 的 36p 只剩 14 个自由度。FD 均值 0.13–0.17 mm，删帧 ≤ 2%，GM tSNR 50–55，配准 Dice 0.94–0.96，标准化 Dice 0.97–0.98。
+- **自动化测试**：`bash tests/run_tests.sh` 在主机和镜像内均全部通过。bash 检查 160 项；Python 单元测试 394 个，镜像内 0 跳过，主机上 8 个需要 Linux bash 的测试跳过。
+- **端到端**：`abide_smoke.conf`（synth，4 种去噪策略）和 `abide_local_fs.conf`（recon-all + surface）在 sub-0028744（GU_1，TDC）、sub-0029150（NYU_2，ASD）上所有阶段 ok。v2.2 最终代码下两套配置都完整重跑（版本号进入阶段 hash，全部重算；已完成的 recon-all 被沿用）：synth 11.1 min，FreeSurfer 25.8 min，退出码均为 0。首次运行时 recon-all 每人 74–80 min。容器内存峰值 7.0–7.8 GiB（SynthSeg，已裁剪；每 15 s 采样一次，真实峰值可能略高），FreeSurfer 配置单人不超过 2 GiB（recon-all 除外），所以 12 GiB 的 VM 上保持 `N_JOBS=1`。
+- **QC**：4 个 run 没有 fail，唯一的 warn 是 GU_1 的 36p 剩余自由度 11（按保留帧计算）。FD 均值 0.13–0.17 mm，删帧 ≤ 2%，GM tSNR 50–55，配准 Dice 0.94–0.96，标准化 Dice 0.97–0.98。
+- **纳入标准**（默认 `EXCLUDE_*`）：两人都被纳入；GU_1 的 36p 因自由度 11 < 15 只在该策略下被剔除，不进入组水平比较。测试集的 `dpabi_parameters_by_subject.csv`（带 BOM，`SUB_ID` 为数字）与被试名匹配成功，组报告列出 ASD 与 TDC 两组。
 - **Volume 与 surface**（n = 2，只能描述）：两流 FC 相关 0.85–0.88。surface 的分半信度、同伦对比和 ROI tSNR 略低，头动耦合相同。
 - **去噪后 FD–DVARS 为负**（−0.19 ~ −0.46）：用 numpy 重建 3dTproject 投影做对照，负值来自头动回归量在高运动帧的高杠杆，相当于软删帧；同样自由度的随机回归量不会产生负值。报告和 `docs/STEPS_zh.md` 的说明已改正。
-- **本轮修复**：AFNI NIfTI 扩展导致 GU_1 的 STC 被静默跳过；surface ROI 覆盖率被 10 mm 膨胀虚高（新增 `desc-sampled_mask`）；CIFTI parcel 名称按 label key 对齐；`mris_convert -c` 的输出名；SynthSeg 内存（裁剪与 `SYNTHSEG_FLAGS`）；运行时冻结代码（`FREEZE_CODE`）与位置无关的阶段 hash；group_qc 在空指标时崩溃；测试脚本的 locale、CRLF 检查和解释器选择。
-- **完整报告**（逐阶段耗时、QC 表、策略与流比较、对照实验）在本机 `E:\ASD\fmriproc_out\TEST_REPORT.md`，与影像结果一起保留在本机，不随代码发布。
-- **尚未完成**：更大样本（`abide_test.conf` 或服务器批量）上的组水平 QC-FC 与流比较；NYU_2 的 slice 顺序确认；`docker/Dockerfile.clean` 干净镜像的构建与 SIF 转换。
+- **本轮修复与新增**：见 `CHANGELOG.md` 的 2.2.0。
+- **完整报告**（逐阶段耗时、QC 表、策略与流比较、纳入表、对照实验）在本机 `E:\ASD\fmriproc_out\TEST_REPORT.md`，与影像结果一起保留在本机，不随代码发布。
+- **尚未完成**：更大样本（`abide_test.conf` 或服务器批量）上的组水平 QC-FC、流比较和 ASD/TDC 头动比较；NYU_2 的 slice 顺序确认；`docker/Dockerfile.clean` 干净镜像的构建与 SIF 转换。

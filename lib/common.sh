@@ -4,7 +4,7 @@
 # API documented in docs/DESIGN.md section 8.
 # =============================================================================
 
-PIPELINE_VERSION="2.1.0"
+PIPELINE_VERSION="2.2.0"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FP_LOGFILE="${FP_LOGFILE:-}"
 FP_STAGE_HASH=""
@@ -129,6 +129,8 @@ fp_init() {
     case "$ANAT_MODE" in freesurfer|synth) ;; *) die "ANAT_MODE must be freesurfer or synth: $ANAT_MODE" ;; esac
     case "$STC" in auto|require|off) ;; *) die "STC must be auto, require or off: $STC" ;; esac
     case "$FILTER_MODE" in bandpass|highpass|none) ;; *) die "FILTER_MODE must be bandpass, highpass or none" ;; esac
+    [[ "$CENSOR_NEXT" =~ ^[0-9]+$ ]] || die "CENSOR_NEXT must be a whole number >= 0: $CENSOR_NEXT"
+    [[ "$CENSOR_MIN_SEGMENT" =~ ^[0-9]+$ ]] || die "CENSOR_MIN_SEGMENT must be a whole number >= 0: $CENSOR_MIN_SEGMENT"
     case "$MNI_RES" in 1|2|3|4) ;; *) die "MNI_RES must be 1, 2, 3 or 4: $MNI_RES" ;; esac
     if is_yes "$SURFACE"; then
         [[ "$ANAT_MODE" == freesurfer ]] || die "SURFACE=yes needs ANAT_MODE=freesurfer"
@@ -351,6 +353,19 @@ bold_json() {
 pyrun() {
     local module="$1"; shift
     run "$PYTHON_BIN" -m "fmriproc.$module" "$@"
+}
+
+# inclusion_args : the --exclude-* and --phenotype-* options of the group steps
+# (stages 09 and 10 --group, fmriproc.inclusion), one per line for mapfile
+inclusion_args() {
+    printf -- '%s\n' \
+        --exclude-fd-mean "$EXCLUDE_FD_MEAN" --exclude-fd-max "$EXCLUDE_FD_MAX" \
+        --exclude-pct-fd-gt02 "$EXCLUDE_PCT_FD_GT02" --exclude-min-retained-min "$EXCLUDE_MIN_RETAINED_MIN" \
+        --exclude-min-dof "$EXCLUDE_MIN_DOF" --exclude-qc-fail "$EXCLUDE_QC_FAIL"
+    if [[ -n "${PHENOTYPE_TSV:-}" ]]; then
+        printf -- '%s\n' --phenotype "$PHENOTYPE_TSV" --phenotype-id-column "$PHENOTYPE_ID_COLUMN" \
+            --phenotype-group-column "$PHENOTYPE_GROUP_COLUMN" --phenotype-labels "$PHENOTYPE_LABELS"
+    fi
 }
 
 # json_get FILE KEY [DEFAULT] : scalar value (true/false printed as yes/no)

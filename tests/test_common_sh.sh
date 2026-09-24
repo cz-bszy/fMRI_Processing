@@ -131,6 +131,19 @@ test_fp_init_validation() {
     check_status "SURFACE=yes needs ANAT_MODE=freesurfer" 1 env SURFACE=yes ANAT_MODE=synth bash -c "source '$COMMON'; fp_init -c '$conf'"
     check_status "SURFACE=yes needs MNI_RES=2" 1 env SURFACE=yes MNI_RES=3 bash -c "source '$COMMON'; fp_init -c '$conf'"
     check_status "SURFACE=yes with freesurfer and 2 mm is accepted" 0 env SURFACE=yes MNI_RES=2 bash -c "source '$COMMON'; fp_init -c '$conf'"
+    check_status "CENSOR_NEXT must be a whole number" 1 env CENSOR_NEXT=-1 bash -c "source '$COMMON'; fp_init -c '$conf'"
+    check_status "CENSOR_MIN_SEGMENT must be a whole number" 1 env CENSOR_MIN_SEGMENT=2.5 bash -c "source '$COMMON'; fp_init -c '$conf'"
+    check_status "CENSOR_NEXT=2 CENSOR_MIN_SEGMENT=5 are accepted" 0 env CENSOR_NEXT=2 CENSOR_MIN_SEGMENT=5 bash -c "source '$COMMON'; fp_init -c '$conf'"
+    local args
+    args="$(in_common 'fp_init -c "$1"; inclusion_args | tr "\n" " "' "$conf")"
+    check_eq "inclusion_args: defaults, no phenotype options" \
+        "--exclude-fd-mean 0.5 --exclude-fd-max 5 --exclude-pct-fd-gt02 0 --exclude-min-retained-min 4 --exclude-min-dof 15 --exclude-qc-fail yes " \
+        "$args"
+    args="$(PHENOTYPE_TSV=/data/pheno.csv PHENOTYPE_ID_COLUMN=SUB_ID PHENOTYPE_LABELS="1=ASD 2=TD" \
+        in_common 'fp_init -c "$1"; inclusion_args | tail -n 8 | tr "\n" "|"' "$conf")"
+    check_eq "inclusion_args: phenotype options, labels kept as one argument" \
+        "--phenotype|/data/pheno.csv|--phenotype-id-column|SUB_ID|--phenotype-group-column|group|--phenotype-labels|1=ASD 2=TD|" \
+        "$args"
 }
 
 test_run_and_require() {

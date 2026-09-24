@@ -1,4 +1,4 @@
-# fMRI_Processing v2.1 — design contract
+# fMRI_Processing v2.2 — design contract
 
 This file is the **interface contract** between all scripts. If code and this
 file disagree, fix one of them in the same commit.
@@ -86,7 +86,7 @@ derivatives/sub-X/anat/                    final anat files (see 6)
 derivatives/sub-X/func/                    final func files (see 6)
 derivatives/sub-X/figures/                 PNG/SVG used by the report
 derivatives/sub-X.html                     per-subject QC report
-derivatives/group/                         group_qc.tsv, group_report.html, qcfc_*.tsv
+derivatives/group/                         group_qc.tsv, inclusion.tsv, group_report.html, qcfc_*.tsv
 logs/sub-X/<stage>.log                     per-subject, per-stage log (no ANSI codes)
 logs/pipeline_<timestamp>.log
 logs/code_<run_id>/                        frozen copy of the code the run executed (FREEZE_CODE)
@@ -248,7 +248,8 @@ column names), WM/CSF/global means (+ derivative, power2, derivative1_power2),
 aCompCor (`w_comp_cor_00..`, `c_comp_cor_00..`; DCT 128 s high-pass before PCA;
 fixed `ACOMPCOR_N` each), cosines, FD (Power, 50 mm) and Jenkinson relative RMS,
 DVARS + standardised DVARS, outlier fraction, censor vector (`CENSOR_FD`,
-optional `CENSOR_PREV`, `CENSOR_DVARS`).
+optional `CENSOR_PREV`, `CENSOR_NEXT` frames after, `CENSOR_DVARS`, and last
+`CENSOR_MIN_SEGMENT`: kept stretches shorter than this are censored too).
 
 **05 denoise** — mean-centre data once per run and space, reuse that uncompressed
 work input across strategies. For each `S`: select columns →
@@ -258,8 +259,11 @@ the T1w-space BOLD when `SURFACE=yes`). Degrees-of-freedom accounting in
 `_denoise.json`; `dof_remaining < MIN_DOF` is flagged (not fatal). NTRP uses
 all fit rows after interpolation; ZERO/KILL use retained rows. aCompCor includes
 all DCT bases used before PCA, since Fourier stop bands do not exactly span them.
-`dof_remaining = fit_rows - numerical joint-design rank` is an algebraic
-dimension, not effective sample size or regularized-smoother DOF. AFNI separately
+`dof_remaining = retained frames - numerical rank of the joint design on the
+retained rows` is censor-aware and is what `MIN_DOF` checks; it is not effective
+sample size or regularized-smoother DOF. `algebraic_dof = fit_rows - design_rank`
+is recorded as well: equal for ZERO/KILL, larger for NTRP, whose interpolated
+rows add fitted rows but no observed information. AFNI separately
 requires >=9 retained observations and fewer nominal columns than retained rows;
 that failure stops the strategy regardless of numerical rank. Optional
 `3dBlurInMask -FWHM $SMOOTH_FWHM` copy.
@@ -380,6 +384,21 @@ z-score outlier flags within `group` (site), distributions per site, QC-FC
 (edge-wise correlation of FC with mean FD, % significant, median |r|,
 distance dependence) per strategy and atlas when ≥ `QCFC_MIN_SUBJECTS` runs.
 
+Run inclusion (`fmriproc/inclusion.py`, stages 09 and 10 `--group`): every run is
+judged against pre-specified criteria from its `_desc-qc_metrics.json`: mean FD
+> `EXCLUDE_FD_MEAN`, any frame FD > `EXCLUDE_FD_MAX`, % frames with FD > 0.2 mm >
+`EXCLUDE_PCT_FD_GT02`, retained minutes < `EXCLUDE_MIN_RETAINED_MIN`, a run-level
+QC flag `fail`/`incomplete` (`EXCLUDE_QC_FAIL`; mean FD has its own criterion),
+and per strategy the censor-aware `dof_remaining` < `EXCLUDE_MIN_DOF` (0 = off).
+Nothing is deleted. `inclusion.tsv` holds `included`, `included_<S>`, `dof_<S>` and
+the reasons; QC-FC and the stage-10 group comparisons use the included runs of each
+strategy, `validation_long.tsv` keeps every run with an `included` column (`n/a`
+when a run has no QC metrics: not judged, kept). An optional phenotype table
+(`PHENOTYPE_TSV`, id and group columns, value labels; `sub-` and leading zeros of
+ids are ignored) adds `pheno_group`; the report then compares, per group, subjects
+without an included run (Fisher exact) and the mean FD of the included subjects
+(Mann-Whitney), when exactly two groups have ≥ 3 subjects.
+
 ## 10. Cross-stage file and JSON contracts
 
 Work files that cross stage boundaries (everything else in `work/` is private):
@@ -415,6 +434,8 @@ dof_bandpass_cost, dof_remaining, low_dof (bool), smooth_fwhm, inputs (object)`.
 v2.1 adds `retained_observations, fit_rows, design_columns, design_rank,
 design_rank_tolerance, algebraic_dof, dof_definition, afni_nominal_dof,
 afni_model_feasible`; see stage 05 above. Model feasibility is distinct from rank.
+v2.2 adds `design_rank_retained`; `dof_remaining` counts the retained frames only
+(retained frames minus `design_rank_retained`), `algebraic_dof` keeps the fit-row count.
 
 Python modules are CLI programs (`argparse`, `main()` returning an exit code,
 `if __name__ == "__main__": sys.exit(main())`), take explicit file paths and
@@ -486,7 +507,8 @@ exist and unique ROI names can be aligned): `fc_similarity` (Pearson r between t
 streams), and the paired difference surface - volume of every metric above; per-ROI
 table with `roi_tsnr` of both streams.
 
-Group level (`derivatives/group/`): `validation_long.tsv` (all runs),
+Group level (`derivatives/group/`): `validation_long.tsv` (all runs, `included` column;
+the statistics below use the included runs, see section 9),
 `stream_comparison.tsv` (per strategy x atlas x metric: n, median volume, median
 surface, median paired difference, Wilcoxon signed-rank p and BH q within each
 strategy x atlas metric family). Repeated paired runs are averaged within subject

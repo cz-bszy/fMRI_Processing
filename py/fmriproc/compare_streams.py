@@ -6,12 +6,15 @@
 Reads every ``*_desc-validation.tsv`` / ``*_desc-streamcompare.tsv`` (stage 10,
 per run) and every ``*_connectivity.tsv`` (stage 07) below ``--deriv-dir`` and writes
 
-    validation_long.tsv      all runs, long format (+ subject, run_label, group)
+    validation_long.tsv      all runs, long format (+ subject, run_label, group, included)
     fc_typicality.tsv        r(run FC, leave-one-out group-mean FC) per stream x strategy x atlas
     stream_comparison.tsv    per strategy x atlas x metric: paired volume-vs-surface statistics
     strategy_comparison.tsv  per stream x atlas x metric: median per denoising strategy
     stream_comparison.png    paired dot plots, colour = site
     validation_report.html   self-contained report (Chinese, technical terms in English)
+
+The comparisons use the runs that the inclusion criteria (fmriproc.inclusion,
+--exclude-* options) keep for each strategy; validation_long.tsv keeps every run.
 """
 from __future__ import annotations
 
@@ -57,6 +60,7 @@ OTHER_COLOR = "#8a8a84"
 INK, INK_MUTED, GRID = "#1a1a19", "#5f5e58", "#e4e3de"
 
 LONG_COLUMNS = ["subject", "run_label", "group", "stream", "strategy", "atlas", "metric", "value"]
+OUTPUT_LONG_COLUMNS = LONG_COLUMNS + ["included"]
 PAIR_COLUMNS = ["subject", "run_label", "group", "strategy", "atlas", "metric", "volume", "surface"]
 
 
@@ -615,7 +619,7 @@ def strategy_wide(table: pd.DataFrame, stream: str, atlas: str) -> pd.DataFrame:
 
 def build_report(
     long: pd.DataFrame, comparison: pd.DataFrame, strategies: pd.DataFrame, typicality: pd.DataFrame,
-    figure_png: Path | None, qcfc_files: list[str],
+    figure_png: Path | None, qcfc_files: list[str], excluded: list[tuple[str, str]] | None = None,
 ) -> str:
     esc = html.escape
     parts = ['<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">',
@@ -630,6 +634,13 @@ def build_report(
         f"strategies: {esc(', '.join(dict.fromkeys(long['strategy'])) if not long.empty else NA)}; "
         f"atlases: {esc(', '.join(dict.fromkeys(long['atlas'])) if not long.empty else NA)}; sites: {esc(', '.join(sites) or NA)}</p>"
     )
+    if excluded:
+        listed = ", ".join(f"{run} ({strategy})" for run, strategy in excluded[:20])
+        more = f" … 共 {len(excluded)} 个" if len(excluded) > 20 else ""
+        parts.append(f'<p class="note">按纳入标准 (EXCLUDE_*) 排除的 run × strategy 不进入第 2、3 节的统计: '
+                     f"{esc(listed)}{esc(more)}。原因见 inclusion.tsv 与 group_report.html。</p>")
+    else:
+        parts.append('<p class="note">没有 run 被纳入标准 (EXCLUDE_*) 排除。</p>')
     parts.append("<h2>1. 如何解读 (interpretation rules)</h2><ul>")
     parts.extend(f"<li>{esc(rule)}</li>" for rule in INTERPRETATION)
     parts.append("</ul>")
@@ -681,6 +692,31 @@ def build_report(
     return "\n".join(parts)
 
 
+def inclusion_lookup(deriv_dir: Path, manifest_path: str, args: argparse.Namespace,
+                     strategies: list[str]) -> dict[tuple[str, str], str]:
+    """(run_label, strategy) -> 'yes' / 'no' from the stage-08 metrics (fmriproc.inclusion)."""
+    from fmriproc import inclusion
+    from fmriproc.group_report import collect_metrics, read_manifest
+
+    table = collect_metrics(deriv_dir, read_manifest(Path(manifest_path) if manifest_path else None))
+    if table.empty:
+        return {}
+    decision = inclusion.decide(table, inclusion.criteria_from_args(args), strategies)
+    out = {}
+    for row in decision.to_dict("records"):
+        for strategy in strategies:
+            out[(str(row["run"]), strategy)] = row.get(f"included_{strategy}", row["included"])
+    return out
+
+
+def mark_included(frame: pd.DataFrame, lookup: dict[tuple[str, str], str]) -> pd.Series:
+    """'yes' / 'no' per row; 'n/a' when the run has no QC metrics (then it is kept)."""
+    if frame.empty:
+        return pd.Series([], dtype=str)
+    return pd.Series([lookup.get((str(run), str(strategy)), NA)
+                      for run, strategy in zip(frame["run_label"], frame["strategy"])], index=frame.index)
+
+
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".tmp_{path.name}")
@@ -697,6 +733,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deriv-dir", required=True, help="$OUT_DIR/derivatives")
     parser.add_argument("--manifest", default="", help="rawdata/manifest.tsv (site/group of every run)")
     parser.add_argument("--out-dir", required=True, help="derivatives/group")
+    from fmriproc.inclusion import add_arguments
+    add_arguments(parser)      # the phenotype options are accepted but only used by stage 09
     return parser
 
 
@@ -717,11 +755,22 @@ def main(argv: list[str] | None = None) -> int:
         extra = typicality.rename(columns={"fc_typicality": "value"}).assign(metric="fc_typicality")
         long = pd.concat([long, extra[LONG_COLUMNS]], ignore_index=True)
     compare_pairs, single = gather_streamcompare(deriv_dir, manifest)
-    pairs = build_pairs(long, compare_pairs)
-    comparison = stream_comparison(pairs, single)
-    strategies = strategy_comparison(long)
 
-    write_tsv(out_dir / "validation_long.tsv", long)
+    # the group statistics use the included runs only; validation_long.tsv keeps every run
+    lookup = inclusion_lookup(deriv_dir, args.manifest, args, list(dict.fromkeys(long["strategy"])))
+    long["included"] = mark_included(long, lookup)
+    unknown = long.loc[long["included"] == NA, "run_label"].nunique()
+    if unknown:
+        log(f"WARNING: {unknown} run(s) without QC metrics (stage 08): inclusion not evaluated, kept")
+    use = long[long["included"] != "no"]
+    kept_pairs = compare_pairs[mark_included(compare_pairs, lookup) != "no"] if not compare_pairs.empty else compare_pairs
+    kept_single = single[mark_included(single, lookup) != "no"] if not single.empty else single
+    excluded = sorted({(r, s) for r, s, i in zip(long["run_label"], long["strategy"], long["included"]) if i == "no"})
+    pairs = build_pairs(use[LONG_COLUMNS], kept_pairs)
+    comparison = stream_comparison(pairs, kept_single)
+    strategies = strategy_comparison(use[LONG_COLUMNS])
+
+    write_tsv(out_dir / "validation_long.tsv", long[OUTPUT_LONG_COLUMNS])
     write_tsv(out_dir / "fc_typicality.tsv", typicality)
     write_tsv(out_dir / "stream_comparison.tsv", comparison)
     write_tsv(out_dir / "strategy_comparison.tsv", strategies)
@@ -731,7 +780,7 @@ def main(argv: list[str] | None = None) -> int:
         figure.unlink()      # belongs to an earlier configuration with a surface stream
     qcfc = sorted(p.name for p in out_dir.glob("qcfc_*.tsv"))
     write_text(out_dir / "validation_report.html",
-               build_report(long, comparison, strategies, typicality, figure if has_figure else None, qcfc))
+               build_report(long, comparison, strategies, typicality, figure if has_figure else None, qcfc, excluded))
     log(f"{long['run_label'].nunique()} run(s); {pairs['run_label'].nunique() if not pairs.empty else 0} with both streams; "
         f"outputs in {out_dir}")
     return 0

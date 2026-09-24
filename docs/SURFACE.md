@@ -330,8 +330,10 @@ confounding; it is not a causal estimate of motion artifact.
 `split_half_r` measures within-run first/second-half FC consistency, not test-retest
 reliability. Report the original retained duration and DOF alongside this value.
 
-`dof_remaining` is the algebraic residual dimension (`fit_rows - design_rank`),
-not an effective independent sample size. NTRP can have more fitted rows because
-it interpolates censored frames; this does not restore observed information.
-Retained observations, retained duration and censor fraction remain separate QC
-quantities. AFNI model feasibility is a distinct prerequisite from algebraic DOF.
+`dof_remaining` is censor-aware: retained frames minus the numerical rank of the
+joint design on the retained rows. It is not an effective independent sample size.
+NTRP also fits the interpolated censored frames; its larger algebraic count
+(`algebraic_dof = fit_rows - design_rank`) is recorded separately and does not
+restore observed information. Retained observations, retained duration and censor
+fraction remain separate QC quantities. AFNI model feasibility is a distinct
+prerequisite.

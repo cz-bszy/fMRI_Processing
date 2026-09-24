@@ -1,4 +1,4 @@
-# 各阶段的作用与注意事项（fMRI_Processing v2.1）
+# 各阶段的作用与注意事项（fMRI_Processing v2.2）
 
 本文件逐阶段说明：**为什么要做这一步、实际执行了什么、关键参数、在低质量老数据
 （TR 2–3 s、3–4 mm 体素、无场图、无 JSON）上常见的问题、怎么检查结果、输出文件**。
@@ -122,7 +122,7 @@ $RECON_FLAGS`（任一维 FOV > 256 mm 时自动加 `-cw256`）。完成判据�
 
 **注意事项**
 - **内存**：整颅视野的 `SynthSeg --robust` 在 12 GB 的 Docker VM 里 OOM
-  （TensorFlow `ResourceExhaustedError`）；裁剪后实测峰值约 7.0 GB、23 s 完成。
+  （TensorFlow `ResourceExhaustedError`）；裁剪后两次实测峰值 7.0 与 7.8 GiB（每 15 s 采样），SynthSeg 约 23 s 完成。
   内存更小时设 `SYNTHSEG_FLAGS=`（不带 `--robust`）。
 - 儿童/萎缩脑的侧脑室很小，腐蚀后 CSF 掩膜可能只剩几十个体素（GU_1 儿童：1 mm 网格
   1899 体素，BOLD 网格 46 体素）；CSF 信号因此噪声大，但不会混入灰质。
@@ -192,12 +192,15 @@ EPI→T1 图中蓝色白质轮廓应与 EPI 灰白质交界吻合，红色轮廓
 WM、CSF、全局信号及其展开；aCompCor（WM、CSF 各 `ACOMPCOR_N`=5 个主成分，PCA 前
 先做 `HIGHPASS_SEC`=128 s 的 DCT 高通）；cosine 基；FD（Power，50 mm 半径）与
 Jenkinson RMS；DVARS 与 standardized DVARS；离群比例；censor 向量
-（FD > `CENSOR_FD`=0.5 mm，可选 `CENSOR_PREV`、`CENSOR_DVARS`）。
+（FD > `CENSOR_FD`=0.5 mm；可选 `CENSOR_PREV` 前一帧、`CENSOR_NEXT` 之后 N 帧、
+`CENSOR_DVARS`，最后 `CENSOR_MIN_SEGMENT` 把短于 N 帧的保留段也删掉）。
 
 **注意事项**
 - FD 阈值与 TR 有关：同样的运动在 TR 3 s 下 FD 更大；儿童/ASD 组头动更大，
   censoring 比例本身就是需要在组间报告的协变量。
 - 被 censor 的帧不能进入时间滤波；阶段 05 在同一次投影里处理（见下）。
+- 每删一帧就少一个自由度。带通时 FD > 0.2 mm 会让 150 帧的 run 自由度变成负数，
+  所以带通为默认时保持 0.5 mm；更严格的删帧要配合高通，并作为敏感性分析（README 9.1 有实测表）。
 
 **怎么检查**：报告的 Motion 部分：`fd_mean`（warn 0.2 / fail 0.5 mm）、
 `pct_censored`（warn 20 / fail 50 %）、`minutes_retained`（< `MIN_RETAINED_MIN`=4 min 标记）、
@@ -224,8 +227,9 @@ DCT 余弦项（`cosine_XX`，150 帧时 4 个）：成分是在余弦去除之�
 余弦；有限长度的 DCT 与 3dTproject 的傅里叶阻带基并不相同，所以不算重复（设计矩阵满秩）。
 
 **注意事项：自由度预算**
-- TR 2 s 时 0.01–0.1 Hz 带通本身就消耗约 N × 0.64 个自由度。实测 150 帧 run：
-  `wmcsf24` 26 个回归量 → 剩余 **24**；176 帧 → 34。`36p` 或加大 censoring 后，
+- TR 2 s 时 0.01–0.1 Hz 带通本身就消耗约 N × 0.64 个自由度。实测 150 帧、删 3 帧的 run：
+  `wmcsf24` 26 个回归量 → 剩余 **21**；176 帧、删 1 帧 → 33。剩余自由度只数保留帧
+  （NTRP 的插值帧参与拟合但不提供信息；v2.1 曾把它们算进去）。`36p` 或加大 censoring 后，
   150 帧以下的 run 很容易低于 `MIN_DOF`=15（只标记，不中止），此时 FC 估计不稳定。
   短 run 可改 `FILTER_MODE=highpass` 或用回归量更少的策略。
 - GSR 取舍：GSR 对全局运动/呼吸伪影最有效，但改变 FC 分布（产生负相关），两类结果
@@ -301,6 +305,7 @@ tSNR 单独升高不算证据（过度去噪也会让它升高），所以同时
 split-half FC 可靠性、network / homotopic / DMN contrast、低频功率比、FD–FC 耦合、
 残余全局信号、NaN ROI 数、保留帧与剩余自由度；两条流都存在时逐 parcel 配对比较与
 FC 相似度；组级为配对差值、Wilcoxon（≥ 6 名被试）、BH 校正、FC typicality（≥ 4 个 run）。
+组级比较只用纳入的 run（见 09 的纳入标准）；`validation_long.tsv` 保留全部 run 并标 `included`。
 
 **实测（2 名被试，只能描述）**：Schaefer-100 上 split-half r 约 0.54（两种策略相近）；
 network contrast 0.98（wmcsf24）/ 1.05（wmcsf24gsr）；FD–FC 耦合 0.22 / 0.26。
@@ -335,8 +340,14 @@ coreg Dice 0.90/0.80；norm Dice 0.93/0.88；表面孔洞 100/200。实测两例
 |z| > 3 标记）；站点分布图；QC-FC（边的 FC 与平均 FD 的相关、显著边比例、
 中位 |r|、距离依赖）需 ≥ `QCFC_MIN_SUBJECTS`（10）名被试；`group_report.html`。
 
-**注意事项**：ASD 与对照、儿童与成人的头动系统性不同；QC-FC 与 censoring 比例应作为
-组分析的协变量或匹配依据。
+**纳入与剔除**：按 conf 中事先写定的 `EXCLUDE_*` 标准判断每个 run（平均 FD、最大 FD、
+FD > 0.2 mm 的比例、保留分钟数、按策略的剩余自由度、run 级 QC fail），写入
+`inclusion.tsv`（`included`、`included_<S>` 和原因）。不删除任何数据；QC-FC 与阶段 10 的
+组级比较只用纳入的 run。报告的"纳入与剔除"一节列出被剔除的 run 与原因。
+设置 `PHENOTYPE_TSV` 后按组（例如诊断）比较剔除人数和剩余被试的平均 FD。
+
+**注意事项**：ASD 与对照、儿童与成人的头动系统性不同；剔除越严，剩下的 ASD 样本越偏向
+头动小、症状轻的被试。报告各组剔除人数，比较剩余被试的平均 FD，并把平均 FD 作为组分析的协变量。
 
 ---
 
@@ -348,7 +359,8 @@ coreg Dice 0.90/0.80；norm Dice 0.93/0.88；表面孔洞 100/200。实测两例
 4. 标记为 warn/fail 的被试的 `derivatives/sub-X.html`：先看配准图，再看 Motion 与 Carpet。
 5. `derivatives/group/validation_report.html`：策略与 volume/surface 比较（被试足够多时）。
 6. QC-FC（`qcfc_*.tsv`）：选定策略后残余运动对 FC 的影响。
-7. 决定排除标准（例如 FD 均值、保留分钟数、DOF、关键 ROI 覆盖率），并在文章中报告。
+7. `derivatives/group/inclusion.tsv` 与组报告的"纳入与剔除"一节：确认剔除原因；标准写在 conf
+   的 `EXCLUDE_*` 里，要在看结果前定好，并在文章中报告（含各组剔除人数）。
 
 ## 本次本地测试中发现并修复的问题
 
@@ -360,6 +372,12 @@ coreg Dice 0.90/0.80；norm Dice 0.93/0.88；表面孔洞 100/200。实测两例
 | 运行期间修改仓库脚本 | 正在执行的阶段读到错位内容而失败 | 每次运行冻结代码到 `logs/code_<run_id>/` |
 | Windows 下 CRLF 检查失效 | 18 个文件带 CRLF 未被发现 | 改用 `tr` 计数；已恢复为 LF |
 | 测试在 UTF-8 locale 下误判 | 容器中 3 个 bash 测试失败 | `LC_ALL=C sort` |
+| surface 覆盖率被膨胀虚高 | FOV 外的 parcel 在 surface 流里也有"数据" | 阶段 06 输出 `desc-sampled_mask`，阶段 07 不计入 |
+| CBIG dlabel 与 label 表有 19 个名称不同 | 阶段 10 报 ROI identities differ | 按 label key 对齐名称，要求半球与网络一致 |
+| `mris_convert -c` 改写输出名 | 阶段 06 找不到 thickness 文件 | 先写 FreeSurfer 风格文件名再移动 |
+| NTRP 下剩余自由度把删掉的帧也算进去 | 高头动 run 的 DOF 警告失灵 | `dof_remaining` 只数保留帧；另记 `algebraic_dof` |
+| 去噪后 FD–DVARS 为负的解释不准确 | 可能误导策略选择 | 对照实验：来自头动回归量在高运动帧的高杠杆；说明已改写 |
+| 容器内测试用了 FSL 自带的 Python | 缺 nilearn，1 个测试被跳过 | 测试优先用 `PYTHON_BIN` 或 conf 默认值 |
 
 ## v1 → v2 每一步的变化
 

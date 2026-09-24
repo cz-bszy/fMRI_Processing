@@ -4,7 +4,8 @@ Picks the strategy's columns from the stage-04 confounds table, centres and
 scales them in float64 (the column space is unchanged, the conditioning of the
 3dTproject projection improves), drops constant and duplicate columns, and
 reports joint-design rank and the separate AFNI nominal-column gate.
-The algebraic residual dimension is not an effective sample size.
+dof_remaining counts the retained frames only (censor-aware); it is not an
+effective sample size.
 
 Exit codes: 0 ok (low DOF is only flagged), 1 bad input, 2 unknown strategy.
 """
@@ -253,30 +254,48 @@ def design_accounting(matrix: np.ndarray, keep: np.ndarray, censor_mode: str,
     (max(shape)*eps32*smax), not interpreted as independent sample size.
     AFNI uses a ridge-like SVD inverse, so this algebraic dimension is also
     not the effective degrees of freedom of its regularized smoother.
+
+    dof_remaining (flagged against min_dof) is censor-aware: retained frames
+    minus the rank of the design on the retained rows. With ZERO/KILL it equals
+    algebraic_dof. NTRP also fits the interpolated censored rows, so its
+    algebraic count (fit rows minus rank) overstates what the retained data
+    support by up to the number of censored frames.
     """
     design = joint_design(matrix, polort, tr, filter_mode, band_low, band_high)
     fit = design if censor_mode == "NTRP" else design[keep]
-    norms = np.linalg.norm(fit.astype(np.float64), axis=0)
-    scaled = fit[:, norms > 0].astype(np.float64) / norms[norms > 0]
-    singular = np.linalg.svd(scaled, compute_uv=False)
-    tol = max(fit.shape) * np.finfo(np.float32).eps * (float(singular[0]) if singular.size else 0.0)
-    rank = int(np.sum(singular > tol))
-    remaining = int(len(fit) - rank)
+    rank, tol = _numerical_rank(fit)
+    retained_rank = rank if censor_mode != "NTRP" else _numerical_rank(design[keep])[0]
+    algebraic = int(len(fit) - rank)
     retained = int(keep.sum())
+    remaining = retained - retained_rank
     nominal_dof = retained - design.shape[1]
     return {
         "n_volumes": len(matrix), "n_censored": int((~keep).sum()), "n_retained": retained,
         "retained_observations": retained, "fit_rows": len(fit),
         "design_columns": design.shape[1], "design_rank": rank,
+        "design_rank_retained": retained_rank,
         "design_rank_tolerance": tol,
         "design_rank_method": "unit-L2 columns; SVD tolerance max(shape)*float32_eps*smax",
-        "algebraic_dof": remaining, "dof_remaining": remaining,
-        "dof_definition": "fit_rows minus numerical joint-design rank; not effective sample size or regularized-smoother DOF",
+        "algebraic_dof": algebraic, "dof_remaining": remaining,
+        "dof_definition": ("retained frames minus the numerical rank of the joint design on the retained rows "
+                           "(censor-aware; equals algebraic_dof = fit_rows - design_rank for ZERO/KILL; NTRP also "
+                           "fits the interpolated rows); not effective sample size or regularized-smoother DOF"),
         "afni_nominal_dof": nominal_dof,
         "afni_model_feasible": bool(retained >= 9 and nominal_dof > 0),
         "dof_bandpass_cost": bandpass_cost(len(matrix), tr, filter_mode, band_low, band_high),
         "low_dof": bool(remaining < min_dof),
     }
+
+
+def _numerical_rank(matrix: np.ndarray) -> tuple[int, float]:
+    """Rank after unit-L2 column scaling with the float32 SVD tolerance of design_accounting."""
+    norms = np.linalg.norm(matrix.astype(np.float64), axis=0)
+    scaled = matrix[:, norms > 0].astype(np.float64) / norms[norms > 0]
+    if scaled.size == 0:
+        return 0, 0.0
+    singular = np.linalg.svd(scaled, compute_uv=False)
+    tol = max(matrix.shape) * np.finfo(np.float32).eps * (float(singular[0]) if singular.size else 0.0)
+    return int(np.sum(singular > tol)), tol
 
 
 def dof_accounting(
@@ -392,7 +411,7 @@ def run(args: argparse.Namespace) -> None:
                          f"and {dof['n_retained']} retained observations (mode={args.censor_mode}). "
                          "Joint rank does not override AFNI's pre-SVD gate.")
     if dof["low_dof"]:
-        _warn(f"{args.strategy}: {dof['dof_remaining']} algebraic residual degrees of freedom "
+        _warn(f"{args.strategy}: {dof['dof_remaining']} residual degrees of freedom on the retained frames "
               f"(< {args.min_dof:g}); this is not effective sample size", notes)
 
     if args.filter_mode == "bandpass":

@@ -46,7 +46,7 @@ process_run() {   # RUN
     pre="$fdir/$run_id"
 
     if ! stage_should_run 04_confounds "$SUB" "$run_id" --dep "03_func_prep__$run_id" -- \
-            ACOMPCOR_N HIGHPASS_SEC CENSOR_FD CENSOR_PREV CENSOR_DVARS; then
+            ACOMPCOR_N HIGHPASS_SEC CENSOR_FD CENSOR_PREV CENSOR_NEXT CENSOR_MIN_SEGMENT CENSOR_DVARS; then
         return 0
     fi
 
@@ -69,7 +69,7 @@ process_run() {   # RUN
         rm -f "$WORK_DIR/$SUB/.done/04_confounds__${run_id}.hash"
     fi
     tr="$(run_tr "$prep" "$bold")"
-    log INFO "$run_id: TR=$tr aCompCor=$ACOMPCOR_N highpass=${HIGHPASS_SEC}s censor FD>$CENSOR_FD prev=$CENSOR_PREV std_dvars>$CENSOR_DVARS"
+    log INFO "$run_id: TR=$tr aCompCor=$ACOMPCOR_N highpass=${HIGHPASS_SEC}s censor FD>$CENSOR_FD prev=$CENSOR_PREV next=$CENSOR_NEXT min_segment=$CENSOR_MIN_SEGMENT std_dvars>$CENSOR_DVARS"
 
     local censor_prev=no
     if is_yes "$CENSOR_PREV"; then
@@ -85,6 +85,7 @@ process_run() {   # RUN
         --motion-par "$par" --relrms "$relrms" --outliers "$outliers" \
         --tr "$tr" --acompcor-n "$ACOMPCOR_N" --highpass-sec "$HIGHPASS_SEC" \
         --censor-fd "$CENSOR_FD" --censor-prev "$censor_prev" --censor-dvars "$CENSOR_DVARS" \
+        --censor-next "$CENSOR_NEXT" --censor-min-segment "$CENSOR_MIN_SEGMENT" \
         --out-tsv "$out_tsv" --out-json "$out_json" --out-censor "$out_censor"
 
     if ! is_yes "$DRY_RUN"; then

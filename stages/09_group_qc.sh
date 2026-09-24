@@ -3,6 +3,7 @@
 # stages/09_group_qc.sh [-c conf]
 # Dataset level, no subject argument, run once after every subject's 08_qc:
 #   derivatives/group/group_qc.tsv         one row per run, robust-z outlier flags
+#   derivatives/group/inclusion.tsv        inclusion decision per run and strategy (EXCLUDE_*)
 #   derivatives/group/qcfc_<S>_<A>.tsv     edge-wise QC-FC when >= QCFC_MIN_SUBJECTS runs
 #   derivatives/group/qcfc_summary.tsv
 #   derivatives/group/group_report.html
@@ -45,9 +46,10 @@ custom_atlas_args() {
 }
 
 main() {
-    local out_dir="$DERIV_DIR/group" atlas_list extra=()
+    local out_dir="$DERIV_DIR/group" atlas_list extra=() inclusion=()
     atlas_list="$(atlas_names)"
     mapfile -t extra < <(custom_atlas_args)
+    mapfile -t inclusion < <(inclusion_args)
     mkdir -p "$out_dir"
     log INFO "group QC over $DERIV_DIR (strategies: ${DENOISE_STRATEGIES:-none}; atlases: ${atlas_list:-none}; QC-FC needs >= $QCFC_MIN_SUBJECTS runs)"
 
@@ -61,10 +63,10 @@ main() {
         --qc-coreg-dice-warn "$QC_COREG_DICE_WARN" --qc-coreg-dice-fail "$QC_COREG_DICE_FAIL" \
         --qc-norm-dice-warn "$QC_NORM_DICE_WARN" --qc-norm-dice-fail "$QC_NORM_DICE_FAIL" \
         --qc-euler-holes-warn "$QC_EULER_HOLES_WARN" --qc-euler-holes-fail "$QC_EULER_HOLES_FAIL" \
-        "${extra[@]+"${extra[@]}"}"
+        "${inclusion[@]}" "${extra[@]+"${extra[@]}"}"
 
     if ! is_yes "${DRY_RUN:-no}"; then
-        require_files "$out_dir/group_qc.tsv" "$out_dir/group_report.html"
+        require_files "$out_dir/group_qc.tsv" "$out_dir/inclusion.tsv" "$out_dir/group_report.html"
     fi
     log OK "$STAGE finished -> $out_dir/group_report.html"
 }

@@ -303,6 +303,22 @@ class TestJointDesign(unittest.TestCase):
         self.assertTrue(np.all(np.abs(design[keep]) > 0))
         self.assertEqual(np.linalg.matrix_rank(design[keep]), 1)
 
+    def test_ntrp_dof_counts_retained_frames_only(self):
+        rng = np.random.default_rng(3)
+        matrix = rng.standard_normal((150, 26))
+        keep = np.ones(150, bool); keep[[20, 21, 60, 90, 91, 92, 140]] = False
+        ntrp = strategies.design_accounting(matrix, keep, "NTRP", 2, 2.0, "bandpass", .01, .1, 15)
+        kill = strategies.design_accounting(matrix, keep, "KILL", 2, 2.0, "bandpass", .01, .1, 15)
+        # NTRP fits all 150 rows, but only the 143 retained frames carry data
+        self.assertEqual(ntrp["algebraic_dof"], 150 - ntrp["design_rank"])
+        self.assertEqual(ntrp["dof_remaining"], 143 - ntrp["design_rank_retained"])
+        self.assertEqual(ntrp["dof_remaining"], kill["dof_remaining"])
+        self.assertEqual(ntrp["algebraic_dof"] - ntrp["dof_remaining"], 7)
+        self.assertEqual(kill["algebraic_dof"], kill["dof_remaining"])
+        # the flag follows the censor-aware value: 150 - 7 - 3 - 26 - 97 = 17
+        self.assertEqual(ntrp["dof_remaining"], 17)
+        self.assertIs(strategies.design_accounting(matrix, keep, "NTRP", 2, 2.0, "bandpass", .01, .1, 18)["low_dof"], True)
+
     def test_afni_gate_uses_nominal_count_even_for_ntrp(self):
         t = np.linspace(-1, 1, 20)
         matrix = np.column_stack([t]*8)
@@ -396,7 +412,9 @@ class TestCli(unittest.TestCase):
     def test_low_dof_is_flagged_not_fatal(self) -> None:
         self.assertEqual(quiet(strategies.main, self._argv("36p", "--min-dof", "20")), 0)
         info = json.loads(self.out_json.read_text(encoding="utf-8"))
-        self.assertEqual(info["dof_remaining"], info["fit_rows"] - info["design_rank"])
+        self.assertEqual(info["algebraic_dof"], info["fit_rows"] - info["design_rank"])
+        self.assertEqual(info["dof_remaining"], info["retained_observations"] - info["design_rank_retained"])
+        self.assertEqual(info["algebraic_dof"] - info["dof_remaining"], 5)   # the 5 censored frames do not count
         self.assertEqual(info["afni_nominal_dof"], 145 - 36 - 3 - 97)
         self.assertIs(info["low_dof"], True)
         self.assertEqual(info["n_volumes_out"], N_T)           # NTRP keeps the length
@@ -408,12 +426,13 @@ class TestCli(unittest.TestCase):
         self.assertEqual(quiet(strategies.main, argv), 0)
         info = json.loads(self.out_json.read_text(encoding="utf-8"))
         self.assertEqual(info["band"], [0.01, None])
-        self.assertEqual(info["dof_remaining"], 150 - 8 - 3 - 7)
+        self.assertEqual(info["dof_remaining"], 145 - 8 - 3 - 7)          # NTRP: retained frames only
+        self.assertEqual(info["algebraic_dof"], 150 - 8 - 3 - 7)
         argv[argv.index("--filter-mode") + 1] = "none"
         self.assertEqual(quiet(strategies.main, argv), 0)
         info = json.loads(self.out_json.read_text(encoding="utf-8"))
         self.assertEqual(info["band"], [None, None])
-        self.assertEqual(info["dof_remaining"], 150 - 8 - 3)
+        self.assertEqual(info["dof_remaining"], 145 - 8 - 3)
 
     def test_precision_of_the_1d_file(self) -> None:
         self.assertEqual(quiet(strategies.main, self._argv("legacy9gsr")), 0)

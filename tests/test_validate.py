@@ -721,7 +721,8 @@ class GroupCliTest(TempDirCase):
         self.assertEqual(compare_streams.main(["--deriv-dir", str(deriv), "--manifest", str(manifest), "--out-dir", str(out)]), 0)
 
         long = read_tsv(out / "validation_long.tsv")
-        self.assertEqual(list(long.columns), compare_streams.LONG_COLUMNS)
+        self.assertEqual(list(long.columns), compare_streams.OUTPUT_LONG_COLUMNS)
+        self.assertTrue(long["included"].isna().all())         # no stage-08 metrics: n/a (not judged, kept)
         self.assertEqual(long["run_label"].nunique(), 8)
         self.assertEqual(set(long["group"]), {"NYU", "UM_1"})
         self.assertIn("fc_typicality", set(long["metric"]))
@@ -759,6 +760,54 @@ class GroupCliTest(TempDirCase):
         self.assertIn("fd_fc_coupling", report)
         self.assertIn("split_half_r", report)
         self.assertNotIn("<script", report)
+
+    @staticmethod
+    def write_qc_metrics(deriv: Path, fd_means: dict[str, float], dof: dict[str, float] | None = None) -> None:
+        """Minimal stage-08 metrics: what fmriproc.inclusion reads."""
+        for sub, fd_mean in fd_means.items():
+            run = f"{sub}_task-rest"
+            metrics = {"subject": sub, "run": run, "fd_mean": fd_mean, "fd_max": 1.0, "fd_pct_gt_02": 10.0,
+                       "minutes_retained": 5.5, "overall_flag": "pass", "flags": {"fd_mean": "pass"},
+                       "strategies": "wmcsf24 wmcsf24gsr"}
+            for strategy, value in (dof or {"wmcsf24": 30.0, "wmcsf24gsr": 29.0}).items():
+                metrics[f"{strategy}.dof_remaining"] = value
+            path = deriv / sub / "func" / f"{run}_desc-qc_metrics.json"
+            path.write_text(json.dumps(metrics), encoding="utf-8")
+
+    def test_excluded_runs_leave_the_group_statistics(self) -> None:
+        deriv, manifest = self.build_tree()
+        subjects = [f"sub-{k + 1:04d}" for k in range(len(self.SITES))]
+        self.write_qc_metrics(deriv, {s: (0.9 if s == "sub-0001" else 0.1) for s in subjects})
+        out = deriv / "group"
+        self.assertEqual(compare_streams.main(["--deriv-dir", str(deriv), "--manifest", str(manifest),
+                                               "--out-dir", str(out)]), 0)
+        long = read_tsv(out / "validation_long.tsv")
+        self.assertEqual(long["run_label"].nunique(), 8)                      # every run stays in the long table
+        self.assertEqual(set(long.loc[long["run_label"] == "sub-0001_task-rest", "included"]), {"no"})
+        self.assertEqual(set(long.loc[long["run_label"] != "sub-0001_task-rest", "included"]), {"yes"})
+        comparison = read_tsv(out / "stream_comparison.tsv")
+        self.assertTrue((comparison.loc[comparison["metric"] == "split_half_r", "n"] == 7).all())
+        strategies = read_tsv(out / "strategy_comparison.tsv")
+        self.assertTrue((strategies.loc[strategies["metric"] == "split_half_r", "n"] == 7).all())
+        report = (out / "validation_report.html").read_text(encoding="utf-8")
+        self.assertIn("sub-0001_task-rest (wmcsf24)", report)
+        # criterion off: back to 8 runs
+        self.assertEqual(compare_streams.main(["--deriv-dir", str(deriv), "--manifest", str(manifest), "--out-dir", str(out),
+                                               "--exclude-fd-mean", "0"]), 0)
+        comparison = read_tsv(out / "stream_comparison.tsv")
+        self.assertTrue((comparison.loc[comparison["metric"] == "split_half_r", "n"] == 8).all())
+
+    def test_dof_exclusion_is_per_strategy(self) -> None:
+        deriv, manifest = self.build_tree()
+        subjects = [f"sub-{k + 1:04d}" for k in range(len(self.SITES))]
+        self.write_qc_metrics(deriv, {s: 0.1 for s in subjects}, dof={"wmcsf24": 30.0, "wmcsf24gsr": 12.0})
+        out = deriv / "group"
+        self.assertEqual(compare_streams.main(["--deriv-dir", str(deriv), "--manifest", str(manifest),
+                                               "--out-dir", str(out)]), 0)
+        comparison = read_tsv(out / "stream_comparison.tsv")
+        self.assertEqual(set(comparison["strategy"]), {"wmcsf24"})           # every wmcsf24gsr run has DOF 12 < 15
+        long = read_tsv(out / "validation_long.tsv")
+        self.assertEqual(set(long.loc[long["strategy"] == "wmcsf24gsr", "included"]), {"no"})
 
     @staticmethod
     def paired_median(long: pd.DataFrame, metric: str) -> float:
